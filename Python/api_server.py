@@ -40,6 +40,22 @@ def _get_trade_review_summary():
         except Exception:
             pass
     return _trade_review_cache.get("summary", {})
+
+
+_calendar_cache = {"events": [], "updated_at": 0}
+
+def _get_economic_calendar_cached():
+    """Return cached economic calendar, refreshing if older than 30 minutes."""
+    global _calendar_cache
+    now = time.time()
+    if now - _calendar_cache.get("updated_at", 0) > 1800:  # 30 min cache
+        try:
+            from Python.trade_review import get_economic_calendar
+            events = get_economic_calendar(days_ahead=7)
+            _calendar_cache = {"events": events, "updated_at": now}
+        except Exception as e:
+            logger.debug(f"Calendar cache refresh failed: {e}")
+    return _calendar_cache.get("events", [])
 from typing import Any
 
 from bottle import Bottle, request, response, run as bottle_run
@@ -447,6 +463,7 @@ def api_status():
             "can_trade": can_trade,
         },
         "trade_review": _get_trade_review_summary(),
+        "economic_calendar": _get_economic_calendar_cached(),
     })
 
 

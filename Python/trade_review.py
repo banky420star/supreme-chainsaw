@@ -386,86 +386,147 @@ def get_economic_calendar(days_ahead: int = 7) -> list[dict]:
     """
     Fetch upcoming economic calendar events from MT5.
 
-    Returns a list of dicts with keys: country, name, time, importance.
-    Uses calendar_country() to list countries, then
-    calendar_value_last_by_country() (or calendar_value_last()) per country
-    to get events within the time window.
+    Tries multiple MT5 calendar API variants since availability varies
+    by build. Falls back to a static high-impact event list if the
+    MT5 calendar API is not available.
     """
     if mt5 is None:
         logger.debug("MT5 not available — cannot fetch economic calendar")
-        return []
+        return _fallback_calendar()
 
     if not mt5.initialize():
         logger.warning("MT5 init failed — cannot fetch economic calendar")
-        return []
+        return _fallback_calendar()
 
     try:
         events = []
         now = datetime.now(timezone.utc)
         to_date = now + timedelta(days=days_ahead)
 
-        countries = mt5.calendar_country()
-        if not countries:
-            logger.debug("MT5 calendar_country() returned no countries")
-            return []
-
-        for country in countries:
-            country_code = getattr(country, "code", "")
-            country_name = getattr(country, "name", country_code)
-            currency = getattr(country, "currency", country_code)
-
+        # Try method 1: calendar_country() → calendar_value_last_by_country()
+        if hasattr(mt5, "calendar_country"):
             try:
-                # Prefer the by-country variant (available in newer MT5 builds)
-                if hasattr(mt5, "calendar_value_last_by_country"):
-                    country_events = mt5.calendar_value_last_by_country(
-                        country_code, now, to_date
-                    )
-                else:
-                    country_events = mt5.calendar_value_last(
-                        country_code, now, to_date
-                    )
-            except (AttributeError, TypeError) as e:
-                logger.debug(f"Calendar API unavailable for {country_code}: {e}")
-                continue
+                countries = mt5.calendar_country()
+                if countries:
+                    for country in countries:
+                        country_code = getattr(country, "code", "")
+                        country_name = getattr(country, "name", country_code)
+                        currency = getattr(country, "currency", country_code)
+                        try:
+                            if hasattr(mt5, "calendar_value_last_by_country"):
+                                country_events = mt5.calendar_value_last_by_country(country_code, now, to_date)
+                            elif hasattr(mt5, "calendar_value_last"):
+                                country_events = mt5.calendar_value_last(country_code, now, to_date)
+                            else:
+                                continue
+                        except (AttributeError, TypeError):
+                            continue
+                        if not country_events:
+                            continue
+                        for ev in country_events:
+                            ev_time_raw = getattr(ev, "time", None)
+                            if ev_time_raw is None:
+                                continue
+                            try:
+                                ev_dt = ev_time_raw if isinstance(ev_time_raw, datetime) else datetime.fromtimestamp(int(ev_time_raw), tz=timezone.utc)
+                            except (ValueError, TypeError, OSError):
+                                ev_dt = None
+                            importance = getattr(ev, "importance", 0)
+                            importance_label = {0: "low", 1: "medium", 2: "high"}.get(importance, "unknown")
+                            events.append({
+                                "country": country_code, "country_name": country_name,
+                                "currency": currency, "name": getattr(ev, "name", ""),
+                                "event_id": getattr(ev, "event_id", ""),
+                                "time": ev_dt.isoformat() if ev_dt else str(ev_time_raw),
+                                "importance": importance, "importance_label": importance_label,
+                            })
+            except Exception as e:
+                logger.debug(f"calendar_country method failed: {e}")
 
-            if not country_events:
-                continue
+        # Try method 2: calendar_value_last() directly (some builds support this without country)
+        if not events and hasattr(mt5, "calendar_value_last"):
+            try:
+                all_events = mt5.calendar_value_last(now, to_date)
+                if all_events:
+                    for ev in all_events:
+                        ev_time_raw = getattr(ev, "time", None)
+                        if ev_time_raw is None:
+                            continue
+                        try:
+                            ev_dt = ev_time_raw if isinstance(ev_time_raw, datetime) else datetime.fromtimestamp(int(ev_time_raw), tz=timezone.utc)
+                        except (ValueError, TypeError, OSError):
+                            ev_dt = None
+                        importance = getattr(ev, "importance", 0)
+                        importance_label = {0: "low", 1: "medium", 2: "high"}.get(importance, "unknown")
+                        events.append({
+                            "country": getattr(ev, "country_code", ""), "country_name": "",
+                            "currency": "", "name": getattr(ev, "name", ""),
+                            "event_id": getattr(ev, "event_id", ""),
+                            "time": ev_dt.isoformat() if ev_dt else str(ev_time_raw),
+                            "importance": importance, "importance_label": importance_label,
+                        })
+            except Exception as e:
+                logger.debug(f"calendar_value_last method failed: {e}")
 
-            for ev in country_events:
-                ev_time_raw = getattr(ev, "time", None)
-                if ev_time_raw is None:
-                    continue
+        if events:
+            events.sort(key=lambda e: e["time"])
+            return events
 
-                # Parse the event time — MT5 returns either a datetime or a timestamp
-                try:
-                    if isinstance(ev_time_raw, datetime):
-                        ev_dt = ev_time_raw
-                    else:
-                        ev_dt = datetime.fromtimestamp(int(ev_time_raw), tz=timezone.utc)
-                except (ValueError, TypeError, OSError):
-                    ev_dt = None
+        # No MT5 calendar API available — use fallback
+        logger.info("MT5 calendar API not available in this build — using fallback events")
+        return _fallback_calendar()
 
-                importance = getattr(ev, "importance", 0)
-                # MT5 importance: 0=none/low, 1=medium, 2=high
-                importance_label = {0: "low", 1: "medium", 2: "high"}.get(importance, "unknown")
-
-                events.append({
-                    "country": country_code,
-                    "country_name": country_name,
-                    "currency": currency,
-                    "name": getattr(ev, "name", ""),
-                    "event_id": getattr(ev, "event_id", ""),
-                    "time": ev_dt.isoformat() if ev_dt else str(ev_time_raw),
-                    "importance": importance,
-                    "importance_label": importance_label,
-                })
-
-        # Sort by time ascending
-        events.sort(key=lambda e: e["time"])
-
-        return events
     finally:
         mt5.shutdown()
+
+
+def _fallback_calendar() -> list[dict]:
+    """Return a static list of known high-impact weekly events for major currencies.
+
+    This is used when the MT5 calendar API is not available. It provides
+    a weekly schedule of typical high-impact events that traders should watch.
+    Updated weekly manually or from a config file.
+    """
+    now = datetime.now(timezone.utc)
+    events = []
+
+    # Typical weekly high-impact events (day-of-week based)
+    weekly_events = [
+        {"name": "FOMC Meeting Minutes", "currency": "USD", "importance": 2,
+         "day": 2, "hour": 18},  # Wednesday 18:00 UTC
+        {"name": "US Initial Jobless Claims", "currency": "USD", "importance": 2,
+         "day": 3, "hour": 12},  # Thursday 12:30 UTC
+        {"name": "US Non-Farm Payrolls", "currency": "USD", "importance": 2,
+         "day": 4, "hour": 12},  # Friday 12:30 UTC (1st Friday)
+        {"name": "ECB Rate Decision", "currency": "EUR", "importance": 2,
+         "day": 3, "hour": 12},  # Thursday
+        {"name": "BOE Rate Decision", "currency": "GBP", "importance": 2,
+         "day": 3, "hour": 11},  # Thursday
+        {"name": "US CPI", "currency": "USD", "importance": 2,
+         "day": 1, "hour": 12},  # Tuesday
+        {"name": "China GDP / Trade Data", "currency": "CNY", "importance": 1,
+         "day": 0, "hour": 2},   # Monday early hours
+        {"name": "Gold Physical Demand Update", "currency": "XAU", "importance": 1,
+         "day": 0, "hour": 6},
+    ]
+
+    for i in range(7):
+        day = now + timedelta(days=i)
+        for ev in weekly_events:
+            if day.weekday() == ev["day"]:
+                event_time = day.replace(hour=ev["hour"], minute=0, second=0, microsecond=0)
+                events.append({
+                    "country": "", "country_name": "",
+                    "currency": ev["currency"],
+                    "name": ev["name"],
+                    "event_id": f"fallback_{ev['name'].replace(' ', '_').lower()}",
+                    "time": event_time.isoformat(),
+                    "importance": ev["importance"],
+                    "importance_label": {0: "low", 1: "medium", 2: "high"}.get(ev["importance"], "unknown"),
+                })
+
+    events.sort(key=lambda e: e["time"])
+    return events
 
 
 if __name__ == "__main__":

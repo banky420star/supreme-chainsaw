@@ -249,7 +249,7 @@ function mapStatusToState(status, trades = [], tradeReview = null, learning = nu
     },
     incidents,
     timeline,
-    economicCalendar: [],
+    economicCalendar: status?.economic_calendar || [],
     learning: learning || {},
     ppoDiagnostics: ppoDiag || {},
     lstmExplanations: lstmExpl || [],

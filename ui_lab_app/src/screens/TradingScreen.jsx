@@ -233,45 +233,60 @@ export default function TradingScreen({ data, selectedSymbol }) {
       )}
 
       {/* Economic Calendar */}
-      <Panel title="Economic Events" subtitle="High-impact events" icon={Calendar}>
+      <Panel title="Economic Calendar" subtitle="Upcoming market-moving events" icon={Calendar}>
         {economicCalendar.length === 0 ? (
           <div className="empty-state">No upcoming economic events</div>
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {economicCalendar.slice(0, 5).map((event, i) => (
-              <div key={i} style={{
-                display: "flex", alignItems: "center", justifyContent: "space-between",
-                padding: "12px 16px", border: "1px solid rgba(255,255,255,0.05)",
-                borderRadius: 8, background: "rgba(255,255,255,0.02)", gap: 16,
-              }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-                  <div style={{
-                    width: 36, height: 36, borderRadius: 6, flexShrink: 0,
-                    display: "flex", alignItems: "center", justifyContent: "center",
-                    background: "rgba(255,255,255,0.06)", fontFamily: "var(--mono)",
-                    fontSize: "0.7rem", fontWeight: 700, color: "var(--text-muted)",
-                  }}>
-                    {event.currency || event.country}
-                  </div>
-                  <div>
-                    <div style={{ fontWeight: 600, fontSize: "0.92rem" }}>{event.name}</div>
-                    <div style={{ color: "var(--text-muted)", fontFamily: "var(--mono)", fontSize: "0.72rem", marginTop: 2 }}>
-                      {event.countryName || event.country}
+            {economicCalendar.map((event, i) => {
+              const importanceColors = { 0: "var(--accent-green)", 1: "var(--accent-amber)", 2: "var(--accent-red)" };
+              const dotColor = importanceColors[event.importance] || importanceColors[0];
+              const importanceLabels = { 0: "Low", 1: "Medium", 2: "High" };
+              const label = event.importance_label || importanceLabels[event.importance] || "Low";
+              const formattedTime = event.time
+                ? new Date(event.time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+                : "";
+
+              return (
+                <div key={i} style={{
+                  display: "flex", alignItems: "center", justifyContent: "space-between",
+                  padding: "12px 16px", border: "1px solid rgba(255,255,255,0.05)",
+                  borderRadius: 8, background: "rgba(255,255,255,0.02)", gap: 16,
+                }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                    <div style={{
+                      width: 36, height: 36, borderRadius: 6, flexShrink: 0,
+                      display: "flex", alignItems: "center", justifyContent: "center",
+                      background: "rgba(255,255,255,0.06)", fontFamily: "var(--mono)",
+                      fontSize: "0.7rem", fontWeight: 700, color: "var(--text-muted)",
+                    }}>
+                      {event.currency || event.country}
+                    </div>
+                    <div>
+                      <div style={{ fontWeight: 600, fontSize: "0.92rem" }}>{event.name}</div>
+                      {formattedTime && (
+                        <div style={{ color: "var(--text-muted)", fontFamily: "var(--mono)", fontSize: "0.72rem", marginTop: 2 }}>
+                          {formattedTime}
+                        </div>
+                      )}
                     </div>
                   </div>
-                </div>
-                <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-                  <div style={{ display: "flex", gap: 3 }}>
-                    {[0, 1, 2].map((j) => (
-                      <div key={j} style={{
-                        width: 6, height: j === 2 ? 16 : j === 1 ? 12 : 8,
-                        borderRadius: 2, background: j < (event.importance || 0) ? "var(--accent-green)" : "rgba(255,255,255,0.1)",
-                      }} />
-                    ))}
+                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <span style={{
+                      fontFamily: "var(--mono)", fontSize: "0.68rem", textTransform: "uppercase",
+                      letterSpacing: "0.06em", color: "var(--text-muted)",
+                    }}>
+                      {label}
+                    </span>
+                    <div style={{
+                      width: 10, height: 10, borderRadius: "50%", flexShrink: 0,
+                      background: dotColor,
+                      boxShadow: `0 0 6px ${dotColor}`,
+                    }} />
                   </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </Panel>
