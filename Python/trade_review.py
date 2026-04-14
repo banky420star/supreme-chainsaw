@@ -108,8 +108,11 @@ def gather_closed_trades(days_back: int = 7) -> list[dict]:
         mt5.shutdown()
 
 
-def load_decision_log(hours_back: int = 48) -> list[dict]:
-    """Load recent decisions from the JSONL log."""
+def load_decision_log(hours_back: int = 168) -> list[dict]:
+    """Load recent decisions from the JSONL log.
+
+    Default 168 hours (7 days) to match the trade review window.
+    """
     path = os.path.join(LOG_DIR, "decisions.jsonl")
     if not os.path.exists(path):
         return []
@@ -131,11 +134,19 @@ def load_decision_log(hours_back: int = 48) -> list[dict]:
 
 
 def match_trade_to_decision(trade: dict, decisions: list[dict]) -> dict | None:
-    """Find the decision that led to a trade by matching symbol and time proximity."""
+    """Find the decision that led to a trade by matching symbol and time proximity.
+
+    The decision was made BEFORE the trade was opened, so we look for
+    decisions for this symbol close to the trade's open time (not close time).
+    We search up to 24 hours before close to cover longer-held positions.
+    """
     symbol = trade["symbol"]
-    trade_time = trade["close_time"]
-    # The decision was made BEFORE the trade was opened, so look for
-    # decisions for this symbol close to the trade time
+    close_time_str = trade["close_time"]
+    try:
+        close_dt = datetime.fromisoformat(close_time_str)
+    except (ValueError, TypeError):
+        return None
+
     best = None
     best_dt_diff = float("inf")
 
@@ -147,8 +158,10 @@ def match_trade_to_decision(trade: dict, decisions: list[dict]) -> dict | None:
             continue
         try:
             dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            diff = abs((dt - datetime.fromisoformat(trade_time)).total_seconds())
-            if diff < best_dt_diff and diff < 3600:  # Within 1 hour
+            # Decision must be BEFORE the trade closed, and within 24 hours
+            # (covers trades held from minutes to hours)
+            diff = (close_dt - dt).total_seconds()
+            if 0 < diff < 86400 and diff < best_dt_diff:  # Within 24h before close
                 best = d
                 best_dt_diff = diff
         except (ValueError, TypeError):
@@ -313,40 +326,84 @@ def get_latest_review() -> dict | None:
 
 def get_economic_calendar(days_ahead: int = 7) -> list[dict]:
     """
-    Fetch economic calendar events from MT5.
-    Returns list of upcoming events that could impact trading.
+    Fetch upcoming economic calendar events from MT5.
+
+    Returns a list of dicts with keys: country, name, time, importance.
+    Uses calendar_country() to list countries, then
+    calendar_value_last_by_country() (or calendar_value_last()) per country
+    to get events within the time window.
     """
     if mt5 is None:
+        logger.debug("MT5 not available — cannot fetch economic calendar")
         return []
 
     if not mt5.initialize():
+        logger.warning("MT5 init failed — cannot fetch economic calendar")
         return []
 
     try:
-        # MT5 economic calendar API
         events = []
-        from_date = datetime.now()
-        to_date = from_date + timedelta(days=days_ahead)
+        now = datetime.now(timezone.utc)
+        to_date = now + timedelta(days=days_ahead)
 
-        try:
-            calendar = mt5.calendar_country()
-            if calendar:
-                for country in calendar[:10]:
-                    country_events = mt5.calendar_value_last(
-                        country.code, from_date, to_date
+        countries = mt5.calendar_country()
+        if not countries:
+            logger.debug("MT5 calendar_country() returned no countries")
+            return []
+
+        for country in countries:
+            country_code = getattr(country, "code", "")
+            country_name = getattr(country, "name", country_code)
+            currency = getattr(country, "currency", country_code)
+
+            try:
+                # Prefer the by-country variant (available in newer MT5 builds)
+                if hasattr(mt5, "calendar_value_last_by_country"):
+                    country_events = mt5.calendar_value_last_by_country(
+                        country_code, now, to_date
                     )
-                    if country_events:
-                        for ev in country_events[:20]:
-                            events.append({
-                                "country": country.code,
-                                "name": getattr(ev, "name", ""),
-                                "event_id": getattr(ev, "event_id", ""),
-                                "time": str(getattr(ev, "time", "")),
-                                "importance": getattr(ev, "importance", 0),
-                            })
-        except AttributeError:
-            # calendar_value_last may not exist in all MT5 versions
-            logger.debug("MT5 calendar API not available in this version")
+                else:
+                    country_events = mt5.calendar_value_last(
+                        country_code, now, to_date
+                    )
+            except (AttributeError, TypeError) as e:
+                logger.debug(f"Calendar API unavailable for {country_code}: {e}")
+                continue
+
+            if not country_events:
+                continue
+
+            for ev in country_events:
+                ev_time_raw = getattr(ev, "time", None)
+                if ev_time_raw is None:
+                    continue
+
+                # Parse the event time — MT5 returns either a datetime or a timestamp
+                try:
+                    if isinstance(ev_time_raw, datetime):
+                        ev_dt = ev_time_raw
+                    else:
+                        ev_dt = datetime.fromtimestamp(int(ev_time_raw), tz=timezone.utc)
+                except (ValueError, TypeError, OSError):
+                    ev_dt = None
+
+                importance = getattr(ev, "importance", 0)
+                # MT5 importance: 0=none/low, 1=medium, 2=high
+                importance_label = {0: "low", 1: "medium", 2: "high"}.get(importance, "unknown")
+
+                events.append({
+                    "country": country_code,
+                    "country_name": country_name,
+                    "currency": currency,
+                    "name": getattr(ev, "name", ""),
+                    "event_id": getattr(ev, "event_id", ""),
+                    "time": ev_dt.isoformat() if ev_dt else str(ev_time_raw),
+                    "importance": importance,
+                    "importance_label": importance_label,
+                })
+
+        # Sort by time ascending
+        events.sort(key=lambda e: e["time"])
 
         return events
     finally:

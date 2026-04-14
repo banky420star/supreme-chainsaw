@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { AlertTriangle, CandlestickChart, Shield, Wallet, Activity, ArrowRightLeft, Brain, Sparkles, TrendingUp, GitBranch, BarChart3, Target, TrendingDown } from "lucide-react";
+import { AlertTriangle, CandlestickChart, Shield, Wallet, Activity, ArrowRightLeft, Brain, Sparkles, TrendingUp, GitBranch, BarChart3, Target, TrendingDown, Calendar } from "lucide-react";
 import { Button, EventList, MetricTile, Panel, money, pct, LargeSparkline } from "../components/common";
 
 function dollars(value) { const n = Number(value || 0); return `$${n.toFixed(2)}`; }
@@ -242,6 +242,84 @@ export default function TradingWatchScreen({ system, selectedSymbol, onReplayJou
             </p>
           </div>
         </div>
+      </Panel>
+
+      <Panel title="Upcoming Economic Events" subtitle="High-impact events that may trigger news blackout" icon={Calendar}>
+        {(system.economicCalendar || []).length === 0 ? (
+          <div className="empty-state">No upcoming economic events detected.</div>
+        ) : (
+          <div className="narrative-list" style={{ gap: "10px" }}>
+            {[...(system.economicCalendar || [])]
+              .slice(0, 5)
+              .map((event, index) => {
+                const eventTs = new Date(event.time).getTime();
+                const diff = eventTs - Date.now();
+                const absDiff = Math.abs(diff);
+                const hours = Math.floor(absDiff / (60 * 60 * 1000));
+                const mins = Math.floor((absDiff % (60 * 60 * 1000)) / (60 * 1000));
+                const timeLabel = diff < 0
+                  ? `${hours}h ${mins}m ago`
+                  : hours > 0
+                    ? `in ${hours}h ${mins}m`
+                    : `in ${mins}m`;
+                const importanceBars = Array.from({ length: 3 }, (_, i) =>
+                  i < event.importance
+                    ? "var(--green)"
+                    : "rgba(255,255,255,0.12)"
+                );
+
+                return (
+                  <div key={index} style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    padding: "14px 18px",
+                    border: "1px solid rgba(255,255,255,0.05)",
+                    borderRadius: "8px",
+                    background: "rgba(255,255,255,0.02)",
+                    gap: "16px",
+                  }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: "14px", minWidth: 0 }}>
+                      <div style={{
+                        width: "36px", height: "36px", borderRadius: "6px", flexShrink: 0,
+                        display: "flex", alignItems: "center", justifyContent: "center",
+                        background: "rgba(255,255,255,0.06)", fontFamily: "var(--mono)",
+                        fontSize: "0.7rem", fontWeight: 700, color: "var(--muted)",
+                      }}>
+                        {event.currency || event.country}
+                      </div>
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ fontWeight: 600, fontSize: "0.95rem", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{event.name}</div>
+                        <div style={{ color: "var(--dim)", fontFamily: "var(--mono)", fontSize: "0.75rem", marginTop: "2px" }}>
+                          {event.countryName || event.country} · {new Date(event.time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                        </div>
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: "16px", flexShrink: 0 }}>
+                      <div style={{ display: "flex", gap: "3px", alignItems: "center" }} title={`Importance: ${event.importanceLabel || event.importance}`}>
+                        {importanceBars.map((color, i) => (
+                          <div key={i} style={{
+                            width: "6px",
+                            height: i === 2 ? "16px" : i === 1 ? "12px" : "8px",
+                            borderRadius: "2px",
+                            background: color,
+                          }} />
+                        ))}
+                      </div>
+                      <span style={{
+                        fontFamily: "var(--mono)",
+                        fontSize: "0.85rem",
+                        color: diff < 0 ? "var(--red)" : diff < 30 * 60 * 1000 ? "var(--amber)" : "var(--muted)",
+                        whiteSpace: "nowrap",
+                      }}>
+                        {timeLabel}
+                      </span>
+                    </div>
+                  </div>
+                );
+              })}
+          </div>
+        )}
       </Panel>
     </div>
   );

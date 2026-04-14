@@ -437,7 +437,14 @@ export function createInitialSystem() {
       },
       adaptationHistory: [],
       improvementRate: 0.0005
-    }
+    },
+    economicCalendar: [
+      { country: "US", name: "Non-Farm Payrolls", time: Date.now() + 45 * 60 * 1000, importance: 3 },
+      { country: "EU", name: "ECB Rate Decision", time: Date.now() + 2 * 60 * 60 * 1000, importance: 3 },
+      { country: "UK", name: "CPI Release", time: Date.now() + 5 * 60 * 60 * 1000, importance: 2 },
+      { country: "JP", name: "BOJ Policy Statement", time: Date.now() + 8 * 60 * 60 * 1000, importance: 3 },
+      { country: "AU", name: "Employment Change", time: Date.now() + 14 * 60 * 60 * 1000, importance: 2 },
+    ],
   };
 }
 
@@ -589,6 +596,11 @@ export function advanceMockSystem(current) {
         ? `Improved ${perpetualImprovements.adaptationHistory[perpetualImprovements.adaptationHistory.length - 1].phase} learning by ${(perpetualImprovements.adaptationHistory[perpetualImprovements.adaptationHistory.length - 1].learningAdjustment * 100).toFixed(1)}%`
         : "Initial learning cycle"}`,
     },
+    economicCalendar: (current.economicCalendar || []).map((event) => ({
+      ...event,
+      // Shift past events forward so they stay visible in demo
+      time: event.time < Date.now() + 10 * 60 * 1000 ? event.time + 24 * 60 * 60 * 1000 : event.time,
+    })),
     incidents: [
           { level: "info", title: "Phase update", message: `Active authority phase is now ${phase}.` },
       { level: floatingPnl >= 0 ? "pass" : "warn", title: "Live watch PnL", message: `Floating PnL ${floatingPnl >= 0 ? "+" : ""}${floatingPnl.toFixed(2)}` },

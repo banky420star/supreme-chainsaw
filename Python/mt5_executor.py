@@ -54,19 +54,114 @@ class MT5Executor:
                     shorts.append(p)
         return longs, shorts
 
+    def _check_news_blackout(self, symbol, minutes_before=5, minutes_after=5):
+        """Check if a high-impact economic event is within the blackout window.
+
+        Returns True if news blackout is active (trade should be skipped).
+        Uses the MT5 economic calendar API to find upcoming events.
+        """
+        if not self._is_live or _mt5 is None:
+            return False
+
+        try:
+            from datetime import datetime, timezone, timedelta
+            now = datetime.now(timezone.utc)
+            window_start = now - timedelta(minutes=minutes_after)
+            window_end = now + timedelta(minutes=minutes_before)
+
+            # Determine the currency pair's two currencies (e.g. EURUSD -> EUR, USD)
+            currencies = []
+            for i in range(0, len(symbol) - 2, 3):
+                currencies.append(symbol[i:i+3])
+            if len(currencies) == 0:
+                # Can't determine currencies — check all events as a safety net
+                currencies = None
+
+            countries = _mt5.calendar_country()
+            if not countries:
+                return False
+
+            for country in countries:
+                # Skip countries whose currency is not in the symbol
+                if currencies is not None:
+                    currency_code = getattr(country, "currency", "") or getattr(country, "code", "")
+                    if currency_code not in currencies:
+                        continue
+
+                try:
+                    events = _mt5.calendar_value_last_by_country(
+                        country.code, window_start, window_end
+                    )
+                except AttributeError:
+                    # Fallback: try calendar_value_last if _by_country variant missing
+                    try:
+                        events = _mt5.calendar_value_last(
+                            country.code, window_start, window_end
+                        )
+                    except (AttributeError, TypeError):
+                        continue
+
+                if not events:
+                    continue
+
+                for ev in events:
+                    importance = getattr(ev, "importance", 0)
+                    if importance >= 2:  # MT5: 0=low, 1=medium, 2=high
+                        event_name = getattr(ev, "name", "unknown")
+                        event_time = getattr(ev, "time", "")
+                        logger.warning(
+                            f"NEWS BLACKOUT ACTIVE: {event_name} ({country.code}) "
+                            f"importance={importance} time={event_time} — skipping {symbol}"
+                        )
+                        return True
+
+            return False
+
+        except Exception as e:
+            logger.warning(f"News blackout check failed for {symbol}: {e}")
+            return False
+
     def reconcile_exposure(self, symbol, target_exposure, max_lots, max_positions_per_symbol=5):
         """Multi-position executor: adds new positions up to max_positions_per_symbol.
 
         Each cycle, if the model says BUY and we have fewer than N long positions,
-        open a new 0.01 lot position. If SELL, open shorts. If opposite direction
+        open a new position. If SELL, open shorts. If opposite direction
         positions exist, close them first.
+
+        Reads per-symbol risk config from configs/{symbol}.yaml for max_lots,
+        SL/TP ATR multipliers, and position limits.
 
         Only adds ONE position per call to avoid rapid stacking.
         """
         if not self.risk.can_trade():
             return
 
+        # Skip trade if a high-impact news event is imminent or just released
+        if self._check_news_blackout(symbol):
+            logger.info(f"{symbol}: trade skipped — news blackout active")
+            return
+
+        # Load per-symbol risk config
+        sym_max_lots = max_lots
+        sym_max_positions = max_positions_per_symbol
+        try:
+            import yaml
+            config_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "configs", f"{symbol}.yaml"
+            )
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
+                    sym_cfg = yaml.safe_load(f)
+                risk_cfg = sym_cfg.get("risk", {})
+                sym_max_lots = risk_cfg.get("max_lots", max_lots)
+                sym_max_positions = risk_cfg.get("max_positions_per_symbol", max_positions_per_symbol)
+        except Exception:
+            pass
+
         min_lots = float(os.environ.get("AGI_MIN_LOTS", "0.01"))
+        # Cap lot size to per-symbol maximum
+        lot_size = min(min_lots, sym_max_lots)
 
         if not self._is_live:
             # Dry-run: just log the intended trade
@@ -93,8 +188,8 @@ class MT5Executor:
         if is_buy:
             # If we already have long positions, don't add more unless under the limit
             # and the existing positions are profitable (avoid doubling down on losers)
-            if n_longs >= max_positions_per_symbol:
-                logger.debug(f"{symbol}: max long positions reached ({n_longs}/{max_positions_per_symbol})")
+            if n_longs >= sym_max_positions:
+                logger.debug(f"{symbol}: max long positions reached ({n_longs}/{sym_max_positions})")
                 return
 
             # Close any opposing short positions first
@@ -103,12 +198,12 @@ class MT5Executor:
                 logger.info(f"Closed {n_shorts} short position(s) for {symbol}")
 
             # Open ONE new long position
-            self.open_position(symbol, _mt5.ORDER_TYPE_BUY, min_lots)
+            self.open_position(symbol, _mt5.ORDER_TYPE_BUY, lot_size)
             self.risk.record_trade()
-            logger.info(f"Opened long #{n_longs + 1}/{max_positions_per_symbol} for {symbol}")
+            logger.info(f"Opened long #{n_longs + 1}/{sym_max_positions} for {symbol} ({lot_size} lots)")
         else:
-            if n_shorts >= max_positions_per_symbol:
-                logger.debug(f"{symbol}: max short positions reached ({n_shorts}/{max_positions_per_symbol})")
+            if n_shorts >= sym_max_positions:
+                logger.debug(f"{symbol}: max short positions reached ({n_shorts}/{sym_max_positions})")
                 return
 
             # Close any opposing long positions first
@@ -117,9 +212,9 @@ class MT5Executor:
                 logger.info(f"Closed {n_longs} long position(s) for {symbol}")
 
             # Open ONE new short position
-            self.open_position(symbol, _mt5.ORDER_TYPE_SELL, min_lots)
+            self.open_position(symbol, _mt5.ORDER_TYPE_SELL, lot_size)
             self.risk.record_trade()
-            logger.info(f"Opened short #{n_shorts + 1}/{max_positions_per_symbol} for {symbol}")
+            logger.info(f"Opened short #{n_shorts + 1}/{sym_max_positions} for {symbol} ({lot_size} lots)")
 
     def close_positions(self, positions):
         if not self._is_live:
@@ -191,8 +286,33 @@ class MT5Executor:
             logger.error(f"MT5 order failed: retcode={result.retcode}")
             self.risk.record_error()
 
-    def _compute_atr_sl_tp(self, symbol, atr_period=14, sl_mult=2.0, tp_mult=3.0):
-        """Compute ATR-based stop loss and take profit distances."""
+    def _compute_atr_sl_tp(self, symbol, atr_period=14, sl_mult=None, tp_mult=None):
+        """Compute ATR-based stop loss and take profit distances.
+
+        Reads per-symbol ATR multipliers from configs/{symbol}.yaml if available,
+        otherwise uses conservative defaults (sl=2.0, tp=3.0).
+        """
+        if sl_mult is None or tp_mult is None:
+            # Try loading per-symbol config
+            try:
+                import yaml
+                config_path = os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                    "configs", f"{symbol}.yaml"
+                )
+                if os.path.exists(config_path):
+                    with open(config_path, "r") as f:
+                        sym_cfg = yaml.safe_load(f)
+                    risk_cfg = sym_cfg.get("risk", {})
+                    sl_mult = sl_mult or risk_cfg.get("sl_atr_mult", 2.0)
+                    tp_mult = tp_mult or risk_cfg.get("tp_atr_mult", 3.0)
+                else:
+                    sl_mult = sl_mult or 2.0
+                    tp_mult = tp_mult or 3.0
+            except Exception:
+                sl_mult = sl_mult or 2.0
+                tp_mult = tp_mult or 3.0
+
         try:
             rates = _mt5.copy_rates_from_pos(symbol, _mt5.TIMEFRAME_M5, 0, atr_period + 1)
             if rates is None or len(rates) < atr_period + 1:

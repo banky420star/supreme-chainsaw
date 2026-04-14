@@ -51,10 +51,10 @@ drl:
     lstm_layers: 2
 
 risk:
-  max_lots: 0.01           # Micro-lots only for crypto
-  max_positions_per_symbol: 3
+  max_lots: 0.01
+  max_positions_per_symbol: 2
   max_drawdown_pct: 5.0
-  sl_atr_mult: 3.0         # Very wide stops for BTC volatility
+  sl_atr_mult: 3.0
   tp_atr_mult: 5.0
   trailing_trigger_atr: 2.0
   trailing_distance_atr: 1.5

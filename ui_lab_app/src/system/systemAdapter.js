@@ -298,6 +298,15 @@ export function mapStatusToProductShell(status, current = createInitialSystem())
       availableActions: current.controls.availableActions,
       notifications: "telegram+ui",
     },
+    economicCalendar: (status?._economic_calendar || status?.economic_calendar || []).slice(0, 10).map((ev) => ({
+      country: ev.country || "",
+      countryName: ev.country_name || ev.country || "",
+      currency: ev.currency || "",
+      name: ev.name || "",
+      time: ev.time || "",
+      importance: Number(ev.importance || 0),
+      importanceLabel: ev.importance_label || (ev.importance >= 2 ? "high" : ev.importance >= 1 ? "medium" : "low"),
+    })),
     incidents,
     timeline,
   });
@@ -335,16 +344,21 @@ export function createSystemAdapter({
         let cancelled = false;
         async function tick() {
           try {
-            const [statusRes, tradesRes] = await Promise.all([
+            const [statusRes, tradesRes, calendarRes] = await Promise.all([
               fetch(statusUrl, { cache: "no-store" }),
               fetch("/api/trades?limit=20", { cache: "no-store" }).catch(() => null),
               fetch("/api/trade_review", { cache: "no-store" }).catch(() => null),
+              fetch("/api/economic_calendar", { cache: "no-store" }).catch(() => null),
             ]);
             if (!statusRes.ok) throw new Error(`status fetch failed: ${statusRes.status}`);
             const statusJson = await statusRes.json();
             if (tradesRes && tradesRes.ok) {
               const tradesBody = await tradesRes.json().catch(() => []);
               statusJson._trades = Array.isArray(tradesBody) ? tradesBody : (tradesBody?.trades || []);
+            }
+            if (calendarRes && calendarRes.ok) {
+              const calendarBody = await calendarRes.json().catch(() => ({}));
+              statusJson.economic_calendar = calendarBody?.events || [];
             }
             if (!cancelled) onPatch(statusJson);
           } catch (error) {

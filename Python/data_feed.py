@@ -101,13 +101,21 @@ def _synthesize_fx_volume(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _fetch_via_mt5(symbol: str, timeframe: str = "M5", bars: int = 5000) -> pd.DataFrame | None:
-    """Try fetching data via MT5 (Windows only)."""
+    """Try fetching data via MT5 (Windows only).
+
+    Checks if MT5 is already connected before re-initializing.
+    Re-initializing steals the connection from other processes.
+    """
     if _mt5 is None:
         return None
     try:
-        if not _mt5.initialize():
-            logger.warning("MT5 initialize() failed.")
-            return None
+        # Check if already connected — avoid re-initializing if possible
+        account_info = _mt5.account_info()
+        if account_info is None:
+            # Not connected — try to initialize
+            if not _mt5.initialize():
+                logger.warning("MT5 initialize() failed.")
+                return None
         
         tf = _MT5_TIMEFRAMES.get(timeframe, _mt5.TIMEFRAME_M5)
         rates = _mt5.copy_rates_from_pos(symbol, tf, 0, bars)
