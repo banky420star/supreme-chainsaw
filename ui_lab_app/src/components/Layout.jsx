@@ -30,7 +30,7 @@ export default function Layout({ screen, onNavigate, selectedSymbol, onSelectSym
       <aside className="sidebar">
         <div className="sidebar-brand">
           <img src="/app_icon.ico" alt="CG" />
-          <span className="sidebar-brand-text">Cautious Giggle</span>
+          <span className="sidebar-brand-text">Money Printer</span>
         </div>
 
         <nav className="sidebar-nav">

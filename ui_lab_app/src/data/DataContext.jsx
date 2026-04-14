@@ -92,7 +92,7 @@ function mapStatusToState(status, trades = [], tradeReview = null, learning = nu
 
   return {
     meta: {
-      appName: "Cautious Giggle",
+      appName: "Money Printer",
       featureVersion: "ultimate_150",
       dreamerVersion: "DreamerV3",
       transportMode: "live",

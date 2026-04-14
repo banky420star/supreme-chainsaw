@@ -33,6 +33,7 @@ from Python.mt5_executor import MT5Executor
 from Python.hybrid_brain import HybridBrain
 from Python.data_feed import get_latest_data, fetch_training_data
 from Python.api_server import start_api_server, cache_decision
+from alerts.telegram_alerts import TelegramAlerter
 
 # ── Logging ─────────────────────────────────────────────────────────
 LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
@@ -78,9 +79,20 @@ class AGIServer:
         except Exception:
             self.symbols = ["EURUSD"]
 
+        # Telegram alerter
+        tel_cfg = (cfg or {}).get("telegram", {}) if isinstance(cfg, dict) else {}
+        tel_token = os.environ.get("TELEGRAM_TOKEN", "") or str(tel_cfg.get("token", "")).strip()
+        tel_chat = os.environ.get("TELEGRAM_CHAT_ID", "") or str(tel_cfg.get("chat_id", "")).strip()
+        self.telegram = TelegramAlerter(tel_token or None, tel_chat or None)
+        if self.telegram.token:
+            logger.success(f"Telegram bot wired | chat_id={tel_chat}")
+        else:
+            logger.info("Telegram bot not configured — alerts disabled")
+
         self.start_time = time.time()
         self._equity_poll_interval = int(os.environ.get("AGI_EQUITY_POLL_SEC", "30"))
         self._trade_interval = int(os.environ.get("AGI_TRADE_INTERVAL_SEC", "900"))
+        self._heartbeat_interval = int(os.environ.get("AGI_HEARTBEAT_SEC", "1800"))  # 30 min default
         logger.success(f"AGIServer initialized | live={self.live} | symbols={self.symbols} | trade_interval={self._trade_interval}s")
 
         # Start equity polling in background
@@ -95,6 +107,10 @@ class AGIServer:
         self._trail_interval = int(os.environ.get("AGI_TRAIL_INTERVAL_SEC", "45"))
         self._trail_thread = threading.Thread(target=self._trailing_stop_loop, daemon=True)
         self._trail_thread.start()
+
+        # Start Telegram heartbeat in background
+        self._hb_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        self._hb_thread.start()
 
     def handle_command(self, request: dict) -> dict:
         """Process a command from the socket server or n8n bridge."""
@@ -143,6 +159,26 @@ class AGIServer:
             )
             result = decision if decision else {"action": "HOLD", "reason": "risk_blocked"}
             cache_decision(symbol, result)
+
+            # Send Telegram alert for executed trades
+            action = result.get("action", "HOLD")
+            if action in ("BUY", "SELL"):
+                try:
+                    self.telegram.trade(
+                        symbol=symbol,
+                        action=action,
+                        exposure=result.get("exposure", 0.0),
+                        confidence=result.get("confidence", 0.0),
+                        balance=getattr(self.risk, "_mt5_balance", 0) or 0,
+                        equity=getattr(self.risk, "_current_equity", 0) or 0,
+                        free_margin=getattr(self.risk, "_mt5_free_margin", 0) or 0,
+                        sl=result.get("sl", 0),
+                        tp=result.get("tp", 0),
+                        tag=result.get("tag", ""),
+                    )
+                except Exception as e:
+                    logger.debug(f"Telegram trade alert failed: {e}")
+
             return result
         except Exception as e:
             return {"error": str(e), "action": "ERROR"}
@@ -176,15 +212,64 @@ class AGIServer:
     def _equity_poll_loop(self):
         """Background thread: poll MT5 account equity and update the risk engine."""
         logger.info(f"Equity poll started (every {self._equity_poll_interval}s)")
+        prev_halt = False
         while True:
             try:
                 equity = self._read_equity()
                 if equity is not None and equity > 0:
                     self.risk.update_equity(equity)
                     logger.debug(f"Equity update: ${equity:.2f} | peak=${self.risk._peak_equity:.2f} | dd={self.risk.current_dd:.2f}%")
+                    # Alert on risk halt activation
+                    if self.risk.halt and not prev_halt:
+                        try:
+                            self.telegram.risk_event(
+                                "RISK HALT ACTIVATED",
+                                f"drawdown={self.risk.current_dd:.1f}% | daily_loss=${self.risk.realized_pnl_today:.2f} | trades={self.risk.daily_trades}"
+                            )
+                        except Exception:
+                            pass
+                    prev_halt = self.risk.halt
             except Exception as e:
                 logger.warning(f"Equity poll error: {e}")
             time.sleep(self._equity_poll_interval)
+
+    def _heartbeat_loop(self):
+        """Background thread: periodic Telegram heartbeat and status snapshot."""
+        logger.info(f"Telegram heartbeat started (every {self._heartbeat_interval}s)")
+        # Wait for server to stabilize before first heartbeat
+        time.sleep(60)
+        while True:
+            try:
+                uptime = time.time() - self.start_time
+                mt5_ok = _mt5 is not None and self.live
+                equity = getattr(self.risk, "_current_equity", 0) or 0
+                balance = getattr(self.risk, "_mt5_balance", 0) or 0
+                profit = getattr(self.risk, "_mt5_profit", 0) or 0
+
+                # Count open positions
+                positions = 0
+                if _mt5 is not None and self.live:
+                    try:
+                        if _mt5.initialize():
+                            pos = _mt5.positions_get()
+                            if pos:
+                                positions = len(pos)
+                            _mt5.shutdown()
+                    except Exception:
+                        pass
+
+                self.telegram.heartbeat(
+                    uptime=uptime,
+                    mt5_connected=mt5_ok,
+                    trading_enabled=not self.risk.halt,
+                    equity=equity,
+                    balance=balance,
+                    positions=positions,
+                    pnl=profit,
+                )
+            except Exception as e:
+                logger.debug(f"Telegram heartbeat error: {e}")
+            time.sleep(self._heartbeat_interval)
 
     def _read_equity(self) -> float | None:
         """Read current account equity from MT5 (Windows) or return None for dry-run.

@@ -155,7 +155,7 @@ export default function LoadingScreen() {
 
         {/* Brand */}
         <h1 className={`brand-title ${isComplete ? "brand-ready" : ""}`}>
-          CAUTIOUS GIGGLE
+          MONEY PRINTER
         </h1>
         <div className="brand-subtitle">
           {isComplete ? "SYSTEM ONLINE" : "AUTONOMOUS TRADING PIPELINE"}

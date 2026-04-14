@@ -277,7 +277,7 @@ export default function TradingScreen({ data, selectedSymbol }) {
       </Panel>
 
       {/* Evolutionary Loop */}
-      <Panel title="Continuous Evolutionary Loop" subtitle="How Cautious Giggle improves itself" icon={GitBranch}>
+      <Panel title="Continuous Evolutionary Loop" subtitle="How Money Printer improves itself" icon={GitBranch}>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 24, paddingTop: 8 }}>
           <div>
             <div className="eyebrow" style={{ marginBottom: 10 }}><Brain size={14} /> 1. Context & Pressure</div>
