@@ -18,6 +18,28 @@ import time
 import threading
 from collections import deque
 from datetime import datetime, timezone
+
+# ── Trade Review Summary Cache ─────────────────────────────────────
+_trade_review_cache = {"summary": {}, "updated_at": 0}
+_trade_review_lock = threading.Lock()
+
+def _get_trade_review_summary():
+    """Return cached trade review summary, refreshing if older than 5 minutes."""
+    global _trade_review_cache
+    now = time.time()
+    if now - _trade_review_cache.get("updated_at", 0) > 300:  # 5 min cache
+        try:
+            with _trade_review_lock:
+                from Python.trade_review import get_latest_review
+                review = get_latest_review()
+                if review:
+                    _trade_review_cache = {
+                        "summary": review.get("summary", {}),
+                        "updated_at": now,
+                    }
+        except Exception:
+            pass
+    return _trade_review_cache.get("summary", {})
 from typing import Any
 
 from bottle import Bottle, request, response, run as bottle_run
@@ -316,6 +338,7 @@ def api_status():
             "current_equity": current_equity,
             "can_trade": can_trade,
         },
+        "trade_review": _get_trade_review_summary(),
     })
 
 
@@ -522,6 +545,11 @@ def api_ppo_diagnostics():
                 "cached_at": d.get("_cached_at"),
             }
 
+    # PPO bias correction data
+    ppo_biases = {}
+    if brain_obj and hasattr(brain_obj, "get_ppo_biases"):
+        ppo_biases = brain_obj.get_ppo_biases()
+
     return _json({
         "ppo_loaded": ppo_loaded,
         "obs_shape": obs_shape,
@@ -532,6 +560,7 @@ def api_ppo_diagnostics():
         "canary_path": canary_path,
         "model_version": os.path.basename(canary_path if is_canary else champ_path) or "none",
         "last_actions": last_actions,
+        "ppo_biases": ppo_biases,
     })
 
 
@@ -867,6 +896,184 @@ def api_health():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# GET /api/strategies — Analyze trades into strategies & patterns
+# ═══════════════════════════════════════════════════════════════════════════
+@app.get("/api/strategies")
+def api_strategies():
+    trades = _fetch_trade_history("")
+    if not trades:
+        return _json({"strategies": [], "patterns": [], "meta": {"total_trades": 0}})
+
+    from collections import defaultdict
+    import math
+
+    # --- Derive regime from comment/time ---
+    def _hour_bucket(t):
+        ct = t.get("close_time") or t.get("open_time") or ""
+        if not ct:
+            return "unknown"
+        try:
+            h = int(ct[11:13])
+        except Exception:
+            return "unknown"
+        if h < 8:
+            return "asian"
+        if h < 14:
+            return "london"
+        if h < 21:
+            return "new_york"
+        return "asian"
+
+    def _side(t):
+        return (t.get("side") or "HOLD").upper()
+
+    # --- Group trades into strategy buckets ---
+    buckets = defaultdict(list)
+    for t in trades:
+        sym = t.get("symbol", "UNKNOWN")
+        session = _hour_bucket(t)
+        side = _side(t)
+        key = f"{sym}|{session}|{side}"
+        buckets[key].append(t)
+
+    strategies = []
+    for key, group in buckets.items():
+        sym, session, side = key.split("|")
+        profits = [t.get("profit", 0) for t in group]
+        wins = [p for p in profits if p > 0]
+        losses = [p for p in profits if p < 0]
+        total_pnl = sum(profits)
+        win_rate = len(wins) / len(profits) if profits else 0
+        avg_win = sum(wins) / len(wins) if wins else 0
+        avg_loss = sum(losses) / len(losses) if losses else 0
+        expectancy = (win_rate * avg_win) + ((1 - win_rate) * avg_loss)
+        gross_profit = sum(wins)
+        gross_loss = abs(sum(losses))
+        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (999.0 if gross_profit > 0 else 0.0)
+
+        # Sharpe-like score
+        if len(profits) > 1:
+            mean_r = sum(profits) / len(profits)
+            var_r = sum((p - mean_r) ** 2 for p in profits) / (len(profits) - 1)
+            std_r = math.sqrt(var_r) if var_r > 0 else 1e-6
+            sharpe = mean_r / std_r
+        else:
+            sharpe = 0.0
+
+        # Weighted score: combines win_rate, expectancy, and trade count
+        confidence = min(1.0, len(group) / 20.0)  # confidence grows with sample size
+        score = (expectancy * 100 + sharpe * 2) * confidence
+
+        strategies.append({
+            "id": key.replace("|", "_"),
+            "symbol": sym,
+            "session": session,
+            "side": side,
+            "trades": len(group),
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate": round(win_rate, 4),
+            "total_pnl": round(total_pnl, 2),
+            "avg_win": round(avg_win, 2),
+            "avg_loss": round(avg_loss, 2),
+            "expectancy": round(expectancy, 4),
+            "profit_factor": round(profit_factor, 2),
+            "sharpe": round(sharpe, 3),
+            "score": round(score, 2),
+            "confidence": round(confidence, 2),
+        })
+
+    strategies.sort(key=lambda s: s["score"], reverse=True)
+
+    # --- Pattern recognition: symbol-session combos ranked by profitability ---
+    sym_stats = defaultdict(lambda: {"trades": 0, "pnl": 0.0, "wins": 0})
+    session_stats = defaultdict(lambda: {"trades": 0, "pnl": 0.0, "wins": 0})
+    side_stats = defaultdict(lambda: {"trades": 0, "pnl": 0.0, "wins": 0})
+
+    for t in trades:
+        sym = t.get("symbol", "UNKNOWN")
+        session = _hour_bucket(t)
+        side = _side(t)
+        profit = t.get("profit", 0)
+        is_win = 1 if profit > 0 else 0
+
+        sym_stats[sym]["trades"] += 1
+        sym_stats[sym]["pnl"] += profit
+        sym_stats[sym]["wins"] += is_win
+
+        session_stats[session]["trades"] += 1
+        session_stats[session]["pnl"] += profit
+        session_stats[session]["wins"] += is_win
+
+        side_stats[side]["trades"] += 1
+        side_stats[side]["pnl"] += profit
+        side_stats[side]["wins"] += is_win
+
+    def _build_patterns(label, stats):
+        result = []
+        for name, s in stats.items():
+            wr = s["wins"] / s["trades"] if s["trades"] > 0 else 0
+            result.append({
+                "type": label,
+                "name": name,
+                "trades": s["trades"],
+                "pnl": round(s["pnl"], 2),
+                "win_rate": round(wr, 4),
+                "weight": round(s["pnl"] / max(abs(s["pnl"]), 0.01) * wr, 3) if s["trades"] >= 3 else 0,
+            })
+        result.sort(key=lambda p: p["pnl"], reverse=True)
+        return result
+
+    patterns = (
+        _build_patterns("symbol", sym_stats) +
+        _build_patterns("session", session_stats) +
+        _build_patterns("side", side_stats)
+    )
+
+    return _json({
+        "strategies": strategies,
+        "patterns": patterns,
+        "meta": {
+            "total_trades": len(trades),
+            "analysis_window": "30d",
+        },
+    })
+
+
+# GET /api/trade_review — Post-trade review with annotations and analysis
+@app.get("/api/trade_review")
+def api_trade_review():
+    """Return the latest trade review with annotations, tags, and per-symbol breakdown."""
+    from Python.trade_review import get_latest_review, run_review
+    review = get_latest_review()
+    if review is None:
+        review = run_review(days_back=7)
+    return _json(review.get("summary", review))
+
+
+# GET /api/trade_review/enriched — Full enriched trade list with decision context
+@app.get("/api/trade_review/enriched")
+def api_trade_review_enriched():
+    """Return enriched trade list with decision context and tags."""
+    from Python.trade_review import get_latest_review
+    review = get_latest_review()
+    if review is None:
+        return _json({"error": "No review available. Run /api/trade_review first."})
+    return _json({
+        "trades": review.get("enriched", [])[:50],  # Last 50 trades
+        "summary": review.get("summary", {}),
+    })
+
+
+# POST /api/trade_review/refresh — Force a fresh review cycle
+@app.post("/api/trade_review/refresh")
+def api_trade_review_refresh():
+    """Force a fresh trade review cycle."""
+    from Python.trade_review import run_review
+    result = run_review(days_back=7)
+    return _json(result.get("summary", {}))
+
+
 # Server lifecycle
 # ═══════════════════════════════════════════════════════════════════════════
 API_PORT = int(os.environ.get("AGI_API_PORT", "5000"))

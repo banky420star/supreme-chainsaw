@@ -28,6 +28,7 @@ if sys.platform == "win32":
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from Python.risk_engine import RiskEngine
+from Python.risk_supervisor import RiskSupervisor
 from Python.mt5_executor import MT5Executor
 from Python.hybrid_brain import HybridBrain
 from Python.data_feed import get_latest_data, fetch_training_data
@@ -57,6 +58,7 @@ class AGIServer:
 
         # Core components
         self.risk = RiskEngine()
+        self.risk_supervisor = RiskSupervisor()
         self.executor = MT5Executor(self.risk)
         self.brain = HybridBrain(self.risk, self.executor)
         self.risk_engine = self.risk  # Alias for AutonomyLoop compatibility
@@ -78,11 +80,16 @@ class AGIServer:
 
         self.start_time = time.time()
         self._equity_poll_interval = int(os.environ.get("AGI_EQUITY_POLL_SEC", "30"))
-        logger.success(f"AGIServer initialized | live={self.live} | symbols={self.symbols}")
+        self._trade_interval = int(os.environ.get("AGI_TRADE_INTERVAL_SEC", "900"))
+        logger.success(f"AGIServer initialized | live={self.live} | symbols={self.symbols} | trade_interval={self._trade_interval}s")
 
         # Start equity polling in background
         self._equity_thread = threading.Thread(target=self._equity_poll_loop, daemon=True)
         self._equity_thread.start()
+
+        # Start autonomous trading loop in background
+        self._trade_thread = threading.Thread(target=self._auto_trade_loop, daemon=True)
+        self._trade_thread.start()
 
     def handle_command(self, request: dict) -> dict:
         """Process a command from the socket server or n8n bridge."""
@@ -124,7 +131,11 @@ class AGIServer:
             if df is None or df.empty or len(df) < 100:
                 return {"error": f"Insufficient data for {symbol}", "action": "ERROR"}
 
-            decision = self.brain.live_trade(symbol, df)
+            decision = self.brain.live_trade(
+                symbol, df,
+                risk_supervisor=self.risk_supervisor,
+                max_positions_per_symbol=int(os.environ.get("AGI_MAX_POS_PER_SYMBOL", "5"))
+            )
             result = decision if decision else {"action": "HOLD", "reason": "risk_blocked"}
             cache_decision(symbol, result)
             return result
@@ -182,6 +193,23 @@ class AGIServer:
                 return None
         # Dry-run mode: no live equity feed — rely on initial bootstrap value
         return None
+
+    def _auto_trade_loop(self):
+        """Background thread: scan ALL symbols each cycle for parallel lane-based trading."""
+        logger.info(f"Auto-trade loop started (every {self._trade_interval}s, symbols={self.symbols})")
+        # Initial delay to let models load
+        time.sleep(15)
+        while True:
+            for symbol in self.symbols:
+                try:
+                    result = self._handle_trade(symbol)
+                    action = result.get("action", "UNKNOWN") if result else "ERROR"
+                    reason = result.get("reason", "") if result else ""
+                    exposure = result.get("exposure", 0.0) if result else 0.0
+                    logger.info(f"AUTO-TRADE {symbol}: {action} | exposure={exposure:.4f} | {reason}")
+                except Exception as e:
+                    logger.warning(f"Auto-trade error for {symbol}: {e}")
+            time.sleep(self._trade_interval)
 
     def run_socket_server(self):
         """Run the TCP socket server for n8n bridge communication."""

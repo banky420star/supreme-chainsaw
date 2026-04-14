@@ -1,6 +1,7 @@
 """
 MT5 Executor — Trade execution with conditional MT5 import and dry-run mode.
 Automatically falls back to DryRunExecutor on Mac/Linux.
+Supports multi-position trading: up to N concurrent positions per symbol.
 """
 import sys
 import os
@@ -53,44 +54,72 @@ class MT5Executor:
                     shorts.append(p)
         return longs, shorts
 
-    def reconcile_exposure(self, symbol, target_exposure, max_lots):
+    def reconcile_exposure(self, symbol, target_exposure, max_lots, max_positions_per_symbol=5):
+        """Multi-position executor: adds new positions up to max_positions_per_symbol.
+
+        Each cycle, if the model says BUY and we have fewer than N long positions,
+        open a new 0.01 lot position. If SELL, open shorts. If opposite direction
+        positions exist, close them first.
+
+        Only adds ONE position per call to avoid rapid stacking.
+        """
         if not self.risk.can_trade():
             return
 
+        min_lots = float(os.environ.get("AGI_MIN_LOTS", "0.01"))
+
         if not self._is_live:
             # Dry-run: just log the intended trade
-            target_lots = round(target_exposure * max_lots, 2)
             direction = "BUY" if target_exposure > 0 else "SELL" if target_exposure < 0 else "FLAT"
             logger.info(
-                f"📋 DRY-RUN TRADE: {symbol} | {direction} | "
-                f"exposure={target_exposure:.4f} | lots={abs(target_lots):.2f}"
+                f"DRY-RUN TRADE: {symbol} | {direction} | "
+                f"exposure={target_exposure:.4f} | lots={min_lots}"
             )
             self.risk.record_trade()
             return
 
         # ── Live MT5 execution ──
         longs, shorts = self.get_positions(symbol)
+        n_longs = len(longs)
+        n_shorts = len(shorts)
 
-        long_lots = sum(p.volume for p in longs)
-        short_lots = sum(p.volume for p in shorts)
-
-        net_lots = long_lots - short_lots
-        target_lots = round(target_exposure * max_lots, 2)
-        delta = target_lots - net_lots
-
-        if abs(delta) < 0.01:
+        # Determine direction from PPO exposure
+        if abs(target_exposure) < float(os.environ.get("AGI_ACTION_THRESHOLD", "0.001")):
+            # Signal too weak — skip
             return
 
-        if delta > 0:
-            if short_lots > 0:
-                self.close_positions(shorts)
-            self.open_position(symbol, _mt5.ORDER_TYPE_BUY, abs(delta))
-        else:
-            if long_lots > 0:
-                self.close_positions(longs)
-            self.open_position(symbol, _mt5.ORDER_TYPE_SELL, abs(delta))
+        is_buy = target_exposure > 0
 
-        self.risk.record_trade()
+        if is_buy:
+            # If we already have long positions, don't add more unless under the limit
+            # and the existing positions are profitable (avoid doubling down on losers)
+            if n_longs >= max_positions_per_symbol:
+                logger.debug(f"{symbol}: max long positions reached ({n_longs}/{max_positions_per_symbol})")
+                return
+
+            # Close any opposing short positions first
+            if n_shorts > 0:
+                self.close_positions(shorts)
+                logger.info(f"Closed {n_shorts} short position(s) for {symbol}")
+
+            # Open ONE new long position
+            self.open_position(symbol, _mt5.ORDER_TYPE_BUY, min_lots)
+            self.risk.record_trade()
+            logger.info(f"Opened long #{n_longs + 1}/{max_positions_per_symbol} for {symbol}")
+        else:
+            if n_shorts >= max_positions_per_symbol:
+                logger.debug(f"{symbol}: max short positions reached ({n_shorts}/{max_positions_per_symbol})")
+                return
+
+            # Close any opposing long positions first
+            if n_longs > 0:
+                self.close_positions(longs)
+                logger.info(f"Closed {n_longs} long position(s) for {symbol}")
+
+            # Open ONE new short position
+            self.open_position(symbol, _mt5.ORDER_TYPE_SELL, min_lots)
+            self.risk.record_trade()
+            logger.info(f"Opened short #{n_shorts + 1}/{max_positions_per_symbol} for {symbol}")
 
     def close_positions(self, positions):
         if not self._is_live:
@@ -106,7 +135,19 @@ class MT5Executor:
             }
             result = _mt5.order_send(request)
             if result.retcode != _mt5.TRADE_RETCODE_DONE:
+                logger.error(f"Close position failed for {p.symbol} ticket={p.ticket}: retcode={result.retcode}")
                 self.risk.record_error()
+
+    def close_all_positions(self, symbol=None):
+        """Close all open positions, optionally filtered by symbol."""
+        if not self._is_live:
+            return
+        if symbol:
+            positions = _mt5.positions_get(symbol=symbol)
+        else:
+            positions = _mt5.positions_get()
+        if positions:
+            self.close_positions(list(positions))
 
     def open_position(self, symbol, order_type, volume):
         if not self._is_live:
@@ -118,13 +159,58 @@ class MT5Executor:
             self.risk.record_error()
             return
 
+        # Compute ATR-based SL/TP defaults
+        sl_distance, tp_distance = self._compute_atr_sl_tp(symbol)
+
+        entry_price = tick.ask if order_type == _mt5.ORDER_TYPE_BUY else tick.bid
+
+        # Compute SL/TP price levels
+        if order_type == _mt5.ORDER_TYPE_BUY:
+            sl = round(entry_price - sl_distance, 5) if sl_distance > 0 else 0
+            tp = round(entry_price + tp_distance, 5) if tp_distance > 0 else 0
+        else:
+            sl = round(entry_price + sl_distance, 5) if sl_distance > 0 else 0
+            tp = round(entry_price - tp_distance, 5) if tp_distance > 0 else 0
+
         request = {
             "action": _mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
             "volume": volume,
             "type": order_type,
-            "price": tick.ask if order_type == _mt5.ORDER_TYPE_BUY else tick.bid,
+            "price": entry_price,
         }
+        if sl > 0:
+            request["sl"] = sl
+        if tp > 0:
+            request["tp"] = tp
+
+        logger.info(f"MT5 ORDER: {symbol} {'BUY' if order_type == _mt5.ORDER_TYPE_BUY else 'SELL'} "
+                     f"{volume:.2f} lots @ {entry_price} | SL={sl} TP={tp}")
         result = _mt5.order_send(request)
         if result.retcode != _mt5.TRADE_RETCODE_DONE:
+            logger.error(f"MT5 order failed: retcode={result.retcode}")
             self.risk.record_error()
+
+    def _compute_atr_sl_tp(self, symbol, atr_period=14, sl_mult=2.0, tp_mult=3.0):
+        """Compute ATR-based stop loss and take profit distances."""
+        try:
+            rates = _mt5.copy_rates_from_pos(symbol, _mt5.TIMEFRAME_M5, 0, atr_period + 1)
+            if rates is None or len(rates) < atr_period + 1:
+                return 0, 0
+
+            # Calculate ATR14
+            high = rates["high"]
+            low = rates["low"]
+            close = rates["close"]
+            trs = []
+            for i in range(1, len(rates)):
+                tr = max(high[i] - low[i], abs(high[i] - close[i-1]), abs(low[i] - close[i-1]))
+                trs.append(tr)
+            atr = sum(trs[-atr_period:]) / atr_period if len(trs) >= atr_period else 0
+
+            sl_distance = atr * sl_mult
+            tp_distance = atr * tp_mult
+            return sl_distance, tp_distance
+        except Exception as e:
+            logger.warning(f"ATR SL/TP computation failed for {symbol}: {e}")
+            return 0, 0

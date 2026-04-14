@@ -276,6 +276,22 @@ export function mapStatusToProductShell(status, current = createInitialSystem())
       loopHealth: status?.state === "online" ? "stable" : "degraded",
       lastImprovementAction: `Runtime: ${status?.mode || "DRY-RUN"} mode, ${Number(status?.risk?.daily_trades || 0)} trades today`,
     },
+    tradeReview: {
+      totalTrades: Number(status?.trade_review?.total_trades || 0),
+      wins: Number(status?.trade_review?.wins || 0),
+      losses: Number(status?.trade_review?.losses || 0),
+      winRate: Number(status?.trade_review?.win_rate || 0),
+      totalPnl: Number(status?.trade_review?.total_pnl || 0),
+      avgWin: Number(status?.trade_review?.avg_win || 0),
+      avgLoss: Number(status?.trade_review?.avg_loss || 0),
+      profitFactor: Number(status?.trade_review?.profit_factor || 0),
+      slHits: Number(status?.trade_review?.sl_hits || 0),
+      tpHits: Number(status?.trade_review?.tp_hits || 0),
+      slRate: Number(status?.trade_review?.sl_rate || 0),
+      tpRate: Number(status?.trade_review?.tp_rate || 0),
+      tagDistribution: status?.trade_review?.tag_distribution || {},
+      bySymbol: status?.trade_review?.by_symbol || {},
+    },
     controls: {
       runtimeStatus: status?.server?.running ? "running" : "stopped",
       processes: mapProcesses(status),
@@ -322,6 +338,7 @@ export function createSystemAdapter({
             const [statusRes, tradesRes] = await Promise.all([
               fetch(statusUrl, { cache: "no-store" }),
               fetch("/api/trades?limit=20", { cache: "no-store" }).catch(() => null),
+              fetch("/api/trade_review", { cache: "no-store" }).catch(() => null),
             ]);
             if (!statusRes.ok) throw new Error(`status fetch failed: ${statusRes.status}`);
             const statusJson = await statusRes.json();

@@ -5,8 +5,10 @@ Decision flow:
   1. LSTM (SmartAGI) classifies volatility regime → LOW / MED / HIGH
   2. PPO determines position sizing and direction → continuous action in [-1, 1]
   3. Deadzone logic: if LSTM says LOW_VOLATILITY and confidence > threshold → HOLD
-  4. Canary scaling: reduce position size when running a canary model
-  5. Final signal passed to executor for trade reconciliation
+  4. PPO bias correction: subtract per-symbol running mean to center actions around zero
+  5. Volatility-scaled exposure: multiply by regime-dependent risk scalar
+  6. Canary scaling: reduce position size when running a canary model
+  7. Final signal passed to executor for trade reconciliation
 """
 import json
 import os
@@ -24,7 +26,7 @@ import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
-from Python.feature_pipeline import build_env_feature_matrix, ULTIMATE_150
+from Python.feature_pipeline import build_env_feature_matrix, ENGINEERED_V2
 
 
 class HybridBrain:
@@ -33,13 +35,24 @@ class HybridBrain:
     deadzones, and Canary risk scaling.
     """
 
-    def __init__(self, risk, executor, confidence_threshold: float = 0.85):
+    def __init__(self, risk, executor, confidence_threshold: float = None):
         self.risk = risk
         self.executor = executor
-        self.confidence_threshold = confidence_threshold
+        # Allow env override: set AGI_DEADZONE_CONFIDENCE=0.99 to effectively disable deadzone
+        if confidence_threshold is not None:
+            self.confidence_threshold = confidence_threshold
+        else:
+            self.confidence_threshold = float(os.environ.get("AGI_DEADZONE_CONFIDENCE", "0.85"))
 
         # Canary lot multiplier (reduce risk for unproven models)
         self.canary_lot_mult = float(os.environ.get("CANARY_LOT_MULT", "0.25"))
+
+        # Per-symbol PPO bias correction
+        # Track running mean of PPO outputs per symbol so we can center them
+        # If a model consistently outputs +0.005, we subtract 0.005 to get the
+        # true directional signal (positive = buy, negative = sell)
+        self._ppo_bias_window = int(os.environ.get("AGI_BIAS_WINDOW", "50"))
+        self._ppo_bias: dict[str, deque] = {}  # symbol → deque of recent raw PPO outputs
 
         # Decision ring buffer (last 100 decisions)
         self._decision_history: deque = deque(maxlen=100)
@@ -102,7 +115,7 @@ class HybridBrain:
                     if os.path.exists(vec_path):
                         # Build a dummy env matching the trained model's obs/action spaces
                         from drl.trading_env import TradingEnv
-                        dummy = DummyVecEnv([lambda: TradingEnv(feature_version=ULTIMATE_150)])
+                        dummy = DummyVecEnv([lambda: TradingEnv(feature_version=ENGINEERED_V2)])
                         self.vec_env = VecNormalize.load(vec_path, dummy)
                         self.vec_env.training = False
                         self.vec_env.norm_reward = False
@@ -126,7 +139,7 @@ class HybridBrain:
 
                     if os.path.exists(vec_path):
                         from drl.trading_env import TradingEnv
-                        dummy = DummyVecEnv([lambda: TradingEnv(feature_version=ULTIMATE_150)])
+                        dummy = DummyVecEnv([lambda: TradingEnv(feature_version=ENGINEERED_V2)])
                         self.vec_env = VecNormalize.load(vec_path, dummy)
                         self.vec_env.training = False
                         self.vec_env.norm_reward = False
@@ -173,13 +186,17 @@ class HybridBrain:
             "ppo_raw_action": [],
             "ppo_primary_action": 0.0,
 
+            # PPO bias correction (populated in step 4)
+            "ppo_bias": 0.0,
+            "ppo_corrected_action": 0.0,
+
             # LSTM details (populated in step 1)
             "lstm_regime": "UNKNOWN",
             "lstm_confidence": 0.0,
             "lstm_top_indicators": [],
             "lstm_top_feature_groups": [],
 
-            # Risk/scaling (populated in steps 4-5)
+            # Risk/scaling (populated in steps 5-6)
             "vol_scale": 1.0,
             "canary_scale": 1.0,
             "pre_threshold_exposure": 0.0,
@@ -238,31 +255,46 @@ class HybridBrain:
                         obs = self.vec_env.normalize_obs(obs)
 
                     action, _ = self.ppo_model.predict(obs, deterministic=True)
-                    # 6-dim action: [position_sizing, stop_loss, take_profit,
-                    #                hold_threshold, confidence_weight, risk_mult]
-                    # Use action[0] (position sizing) as the primary exposure signal
+                    # 1D action: direction/exposure in [-1, 1]
+                    # Negative = short, positive = long, magnitude = position size
                     ppo_raw_action = [round(float(a), 6) for a in action.flatten()]
-                    ppo_action = float(action[0])
+                    ppo_action = float(action.flatten()[0])
             except Exception as e:
                 logger.warning(f"PPO prediction failed: {e}")
 
         result["ppo_raw_action"] = ppo_raw_action
         result["ppo_primary_action"] = round(float(ppo_action), 6)
 
-        # ── Step 4: Volatility-Scaled Exposure ──
+        # ── Step 4: PPO Bias Correction ──
+        # Models can develop a systematic directional bias (e.g. always outputting +0.005).
+        # We subtract the per-symbol running mean so the signal is centered around zero,
+        # allowing both BUY and SELL signals to emerge from the residual.
+        ppo_bias = self._update_ppo_bias(symbol, ppo_action)
+        ppo_corrected = ppo_action - ppo_bias
+        result["ppo_bias"] = round(float(ppo_bias), 6)
+        result["ppo_corrected_action"] = round(float(ppo_corrected), 6)
+
+        if abs(ppo_bias) > 0.001:
+            logger.info(
+                f"{symbol}: PPO bias correction | raw={ppo_action:.6f} "
+                f"bias={ppo_bias:.6f} corrected={ppo_corrected:.6f}"
+            )
+
+        # Use bias-corrected action for all downstream steps
+        ppo_action = ppo_corrected
+
+        # ── Step 5: Volatility-Scaled Exposure ──
         # Scale PPO action by volatility regime
-        vol_scale = 1.0
-        if lstm_signal == "MED_VOLATILITY":
-            vol_scale = 0.7  # Moderate confidence → moderate position
-        elif lstm_signal == "HIGH_VOLATILITY":
-            vol_scale = 1.0  # Full confidence → full PPO sizing
-        else:
-            vol_scale = 0.3  # Unknown or low → conservative
+        # Higher volatility → smaller position (risk-adjusted sizing)
+        # Lower volatility → larger position (tighter stops allow bigger size)
+        from Python.agi_brain import _regime_to_risk_scalar
+        vol_scale = _regime_to_risk_scalar(lstm_signal)
+        # _regime_to_risk_scalar: HIGH=0.55, MED=0.80, LOW=0.95, unknown=0.75
 
         result["vol_scale"] = vol_scale
         exposure = ppo_action * vol_scale
 
-        # ── Step 5: Canary Risk Scaling ──
+        # ── Step 6: Canary Risk Scaling ──
         canary_scale = 1.0
         if self._is_canary:
             canary_scale = self.canary_lot_mult
@@ -272,28 +304,74 @@ class HybridBrain:
         result["canary_scale"] = canary_scale
         result["pre_threshold_exposure"] = round(float(exposure), 6)
 
-        # ── Step 6: Determine Action ──
-        if abs(exposure) < 0.05:
+        # ── Step 7: Determine Action ──
+        # Sub-threshold: if exposure is too small, treat as HOLD
+        action_threshold = float(os.environ.get("AGI_ACTION_THRESHOLD", "0.02"))
+        if abs(exposure) < action_threshold:
             result["action"] = "HOLD"
             result["exposure"] = 0.0
             result["reason"] = "sub_threshold"
         elif exposure > 0:
             result["action"] = "BUY"
             result["exposure"] = round(float(exposure), 4)
-            result["reason"] = f"ppo={ppo_action:.3f} vol={lstm_signal} scale={vol_scale}"
+            result["reason"] = f"ppo_corrected={ppo_action:.4f} bias={ppo_bias:.4f} vol={lstm_signal} scale={vol_scale}"
         else:
             result["action"] = "SELL"
             result["exposure"] = round(float(exposure), 4)
-            result["reason"] = f"ppo={ppo_action:.3f} vol={lstm_signal} scale={vol_scale}"
+            result["reason"] = f"ppo_corrected={ppo_action:.4f} bias={ppo_bias:.4f} vol={lstm_signal} scale={vol_scale}"
 
         logger.info(
             f"[HybridBrain] {symbol}: {result['action']} | "
             f"exposure={result['exposure']:.4f} | vol={lstm_signal} | "
-            f"conf={lstm_confidence:.2%} | canary={self._is_canary}"
+            f"conf={lstm_confidence:.2%} | bias={ppo_bias:.4f} | canary={self._is_canary}"
         )
 
         self._record_decision(result)
         return result
+
+    # ── PPO Bias Correction ─────────────────────────────────────────
+
+    def _update_ppo_bias(self, symbol: str, ppo_action: float) -> float:
+        """
+        Track and return the per-symbol running mean of PPO outputs.
+
+        When a model consistently outputs positive values (e.g., always ~+0.005),
+        we subtract the running mean so the residual reveals the true directional
+        signal. This allows both BUY and SELL signals to emerge.
+
+        Returns:
+            The current bias (running mean) for this symbol.
+        """
+        if symbol not in self._ppo_bias:
+            self._ppo_bias[symbol] = deque(maxlen=self._ppo_bias_window)
+
+        self._ppo_bias[symbol].append(ppo_action)
+
+        if len(self._ppo_bias[symbol]) >= 3:
+            # Use exponential moving average for smoother bias estimation
+            samples = list(self._ppo_bias[symbol])
+            alpha = 2.0 / (len(samples) + 1)
+            ema = samples[0]
+            for s in samples[1:]:
+                ema = alpha * s + (1 - alpha) * ema
+            return ema
+        else:
+            # Not enough samples yet — return 0 (no correction)
+            return 0.0
+
+    def get_ppo_biases(self) -> dict:
+        """Return current per-symbol PPO bias values for diagnostics."""
+        biases = {}
+        for symbol, samples in self._ppo_bias.items():
+            if len(samples) >= 3:
+                biases[symbol] = {
+                    "mean": round(float(np.mean(samples)), 6),
+                    "std": round(float(np.std(samples)), 6),
+                    "n": len(samples),
+                }
+            else:
+                biases[symbol] = {"mean": 0.0, "std": 0.0, "n": len(samples)}
+        return biases
 
     # ── Decision history & logging helpers ──────────────────────────
 
@@ -322,8 +400,8 @@ class HybridBrain:
 
     def _build_observation(self, df: pd.DataFrame) -> np.ndarray | None:
         """
-        Build the observation vector matching TradingEnv ULTIMATE_150 format:
-        [window_size * 164 features] + [3 portfolio state features] = (16403,)
+        Build the observation vector matching TradingEnv engineered_v2 format:
+        [window_size * 21 features] + [3 portfolio state features] = (2103,)
         """
         try:
             window_size = 100
@@ -342,8 +420,8 @@ class HybridBrain:
                     end=pd.Timestamp.utcnow(), periods=len(feed_df), freq="5min", tz="UTC"
                 )
 
-            # Build the full 164-feature matrix via the feature pipeline
-            feature_matrix = build_env_feature_matrix(feed_df, feature_version=ULTIMATE_150)
+            # Build the feature matrix via the feature pipeline (engineered_v2: 21 features)
+            feature_matrix = build_env_feature_matrix(feed_df, feature_version=ENGINEERED_V2)
 
             if len(feature_matrix) < window_size:
                 logger.warning(f"Not enough data for observation: {len(feature_matrix)} < {window_size}")
@@ -363,13 +441,22 @@ class HybridBrain:
             logger.error(f"Failed to build observation: {e}")
             return None
 
-    def live_trade(self, symbol: str, df: pd.DataFrame, max_lots: float = None):
+    def live_trade(self, symbol: str, df: pd.DataFrame, max_lots: float = None,
+                   risk_supervisor=None, max_positions_per_symbol: int = 5):
         """
         Full live trading loop: decide → execute.
+        Each cycle can open a new position (up to max_positions_per_symbol).
         """
         if not self.risk.can_trade():
             logger.debug(f"{symbol}: Risk engine blocked trading")
             return
+
+        # RiskSupervisor circuit breaker check
+        if risk_supervisor is not None:
+            decision_rs = risk_supervisor.can_trade(symbol)
+            if not decision_rs.allowed:
+                logger.warning(f"{symbol}: RiskSupervisor blocked trading — {decision_rs.reason}")
+                return
 
         if max_lots is None:
             max_lots = self.risk.max_lots
@@ -381,7 +468,12 @@ class HybridBrain:
 
         # Execute via MT5 or dry-run executor
         try:
-            self.executor.reconcile_exposure(symbol, decision["exposure"], max_lots)
+            self.executor.reconcile_exposure(
+                symbol, decision["exposure"], max_lots,
+                max_positions_per_symbol=max_positions_per_symbol
+            )
+            if risk_supervisor is not None:
+                risk_supervisor.mark_trade(symbol)
         except Exception as e:
             logger.error(f"Execution error for {symbol}: {e}")
             self.risk.record_error()

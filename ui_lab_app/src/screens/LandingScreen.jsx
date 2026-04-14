@@ -5,9 +5,16 @@ import { Button, LargeSparkline, MetricTile, Panel, ProgressBar, money, pct, sho
 export default function LandingScreen({ system, selectedSymbol, onStartJourney, onGoTrading, onGoControl }) {
   const lane = (system.trading.lanes || []).find((e) => e.symbol === selectedSymbol) || system.trading.lanes[0];
   const equityHistory = system._history?.equity || [];
+  const isDemo = system.meta?.isDemo || system.connection?.transport === "mock";
 
   return (
     <div className="stack animate-in">
+      {/* ─── DEMO MODE BANNER ─── */}
+      {isDemo && (
+        <div className="banner banner-warn" style={{ marginBottom: "16px" }}>
+          <strong>DEMO MODE</strong> — Showing simulated data. Start the backend server to see live trading data.
+        </div>
+      )}
       
       {/* ─── ATMOSPHERIC HERO MONITOR ─── */}
       <section className="hero-monitor">

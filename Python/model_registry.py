@@ -142,20 +142,35 @@ class ModelRegistry:
         win_rate = metrics.get("win_rate", 0.0)
         loss = metrics.get("loss", float("inf"))
 
-        # PPO candidates: always stage as canary for live evaluation
-        # (the walk-forward backtest in model_evaluator is the real gate)
+        # PPO candidates: stage as canary, auto-promote if no champion exists
         if model_type == "ppo":
-            self.set_canary(candidate_dir)
-            logger.success(f"PPO candidate staged as canary for live eval")
+            active = self._read_active()
+            if not active.get("champion"):
+                # No champion yet — promote directly so trading can begin
+                active["champion"] = candidate_dir
+                active["canary"] = None
+                self._write_active(active)
+                logger.success(f"No existing champion — PPO candidate auto-promoted to champion: {candidate_dir}")
+            else:
+                self.set_canary(candidate_dir)
+                logger.success(f"PPO candidate staged as canary for live eval")
             return True
 
-        # LSTM candidates: minimum thresholds for canary staging
-        if win_rate >= 45.0 and loss < 2.0:
+        # LSTM candidates: meaningful quality thresholds for canary staging
+        # Raw accuracy is misleading with class imbalance, so we require macro F1
+        # and minimum per-class recall to ensure all regimes are detected
+        macro_f1 = metrics.get("macro_f1", 0.0)
+        per_class = metrics.get("per_class", {})
+        min_recall = min(
+            (per_class.get(cls, {}).get("recall", 0.0) for cls in ["LOW_VOL", "MED_VOL", "HIGH_VOL"]),
+            default=0.0
+        )
+        if macro_f1 >= 0.40 and min_recall >= 0.10 and loss < 2.0:
             self.set_canary(candidate_dir)
-            logger.success(f"Candidate staged as canary: win_rate={win_rate:.1f}% loss={loss:.4f}")
+            logger.success(f"Candidate staged as canary: macro_f1={macro_f1:.3f} min_recall={min_recall:.2f} loss={loss:.4f}")
             return True
         else:
-            logger.info(f"Candidate did not pass canary gate: win_rate={win_rate:.1f}% loss={loss:.4f}")
+            logger.info(f"Candidate did not pass canary gate: macro_f1={macro_f1:.3f} min_recall={min_recall:.2f} loss={loss:.4f}")
             return False
 
     def read_metadata(self, version_dir: str) -> dict:

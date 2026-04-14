@@ -3,9 +3,9 @@ import { Activity, Shield, Cpu, Network, Zap } from "lucide-react";
 
 export default function LoadingScreen({ onComplete }) {
   const [progress, setProgress] = useState(0);
-  const [step, setStep] = useState(0);
   const apiReadyRef = useRef(false);
   const doneRef = useRef(false);
+  const timerRef = useRef(null);
 
   const onCompleteRef = useRef(onComplete);
   useEffect(() => {
@@ -43,31 +43,24 @@ export default function LoadingScreen({ onComplete }) {
 
   // Animate progress bar — single stable interval
   useEffect(() => {
-    const interval = 50;
+    const intervalMs = 50;
     let elapsed = 0;
 
-    const timer = setInterval(() => {
-      if (doneRef.current) return;
-      elapsed += interval;
+    timerRef.current = setInterval(() => {
+      if (!apiReadyRef.current) elapsed += intervalMs;
 
       setProgress((prev) => {
         let target;
         if (apiReadyRef.current) {
-          // API ready — race to 100%
           target = Math.min(100, prev + 4);
         } else {
-          // Slow ease-out that caps at 80%
           const t = elapsed / 5000;
           target = Math.min(80, (1 - (1 - t) * (1 - t)) * 80);
         }
 
-        if (target > 85) setStep(4);
-        else if (target > 65) setStep(3);
-        else if (target > 40) setStep(2);
-        else if (target > 15) setStep(1);
-
         if (target >= 100 && !doneRef.current) {
           doneRef.current = true;
+          clearInterval(timerRef.current);
           setTimeout(() => {
             if (onCompleteRef.current) onCompleteRef.current();
           }, 400);
@@ -75,11 +68,12 @@ export default function LoadingScreen({ onComplete }) {
 
         return target;
       });
-    }, interval);
+    }, intervalMs);
 
-    return () => clearInterval(timer);
+    return () => clearInterval(timerRef.current);
   }, []);
 
+  const step = progress > 85 ? 4 : progress > 65 ? 3 : progress > 40 ? 2 : progress > 15 ? 1 : 0;
   const CurrentIcon = steps[step].icon;
 
   return (

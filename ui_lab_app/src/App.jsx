@@ -241,7 +241,7 @@ export default function App() {
 
           {view === ROUTES.raw ? <RawDataScreen system={system} /> : null}
 
-          {view === ROUTES.strategies ? <StrategiesScreen system={system} /> : null}
+          {view === ROUTES.strategies ? <StrategiesScreen /> : null}
         </main>
 
         <SupportRail system={system} selectedSymbol={selectedSymbol} />

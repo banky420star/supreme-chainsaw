@@ -1,0 +1,73 @@
+# Per-symbol configuration for EURUSDm
+# EUR/USD is the most liquid forex pair with tight spreads and moderate volatility.
+
+symbol: EURUSDm
+asset_class: forex
+timeframe: M5
+
+# ── Data & Preprocessing ──────────────────────────────────────────────
+data:
+  period: 60d           # How far back to fetch training data
+  interval: 5m          # Candle interval
+  min_rows: 1000        # Minimum rows required for training
+
+# ── LSTM Configuration ────────────────────────────────────────────────
+lstm:
+  seq_len: 60
+  epochs: 50
+  batch_size: 64
+  learning_rate: 0.001
+  lr_scheduler: ReduceLROnPlateau
+  lr_patience: 3
+  lr_factor: 0.5
+  early_stopping_patience: 7
+  dropout: 0.3
+  hidden_size: 128
+  num_layers: 3
+  class_weights: auto     # Compute inverse-frequency weights from data
+  volatility_thresholds:   # For 3-class labeling
+    low: 0.0005           # |return| <= 0.05% = LOW_VOL
+    high: 0.0015          # |return| > 0.15% = HIGH_VOL
+
+# ── PPO / DRL Configuration ───────────────────────────────────────────
+drl:
+  total_timesteps: 100000
+  n_envs: 4
+  learning_rate: 1e-4
+  n_steps: 4096
+  batch_size: 512
+  n_epochs: 10
+  gamma: 0.995
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.005
+  target_kl: 0.01
+  use_sde: true
+  sde_sample_freq: 4
+  initial_balance: 10000.0
+  feature_version: engineered_v2
+
+  # LSTM feature extractor for PPO
+  lstm_feature_extractor:
+    features_dim: 256
+    window_size: 100
+    portfolio_feature_count: 3
+    lstm_hidden: 128
+    lstm_layers: 2
+
+# ── Risk Parameters ───────────────────────────────────────────────────
+risk:
+  max_lots: 0.5
+  max_positions_per_symbol: 5
+  max_drawdown_pct: 5.0
+  sl_atr_mult: 2.0      # Stop loss = ATR * sl_atr_mult
+  tp_atr_mult: 3.0      # Take profit = ATR * tp_atr_mult
+  trailing_trigger_atr: 1.5   # Start trailing after ATR * this many points profit
+  trailing_distance_atr: 1.0  # Trail at ATR * this distance
+
+# ── Canary Policy ─────────────────────────────────────────────────────
+canary_policy:
+  min_trades: 30
+  min_realized_pnl: 0.0
+  max_drawdown: 0.10
+  min_runtime_minutes: 45

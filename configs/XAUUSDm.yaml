@@ -1,0 +1,66 @@
+# Per-symbol configuration for XAUUSDm (Gold)
+# Gold is highly volatile with large price swings. Wider SL/TP and lower position sizes.
+
+symbol: XAUUSDm
+asset_class: commodity
+timeframe: M5
+
+data:
+  period: 60d
+  interval: 5m
+  min_rows: 1000
+
+lstm:
+  seq_len: 60
+  epochs: 50
+  batch_size: 64
+  learning_rate: 0.001
+  lr_scheduler: ReduceLROnPlateau
+  lr_patience: 3
+  lr_factor: 0.5
+  early_stopping_patience: 7
+  dropout: 0.3
+  hidden_size: 128
+  num_layers: 3
+  class_weights: auto
+  volatility_thresholds:
+    low: 0.0010           # Gold has much larger typical moves
+    high: 0.0030
+
+drl:
+  total_timesteps: 100000
+  n_envs: 4
+  learning_rate: 1e-4
+  n_steps: 4096
+  batch_size: 512
+  n_epochs: 10
+  gamma: 0.995
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.005
+  target_kl: 0.01
+  use_sde: true
+  sde_sample_freq: 4
+  initial_balance: 10000.0
+  feature_version: engineered_v2
+  lstm_feature_extractor:
+    features_dim: 256
+    window_size: 100
+    portfolio_feature_count: 3
+    lstm_hidden: 128
+    lstm_layers: 2
+
+risk:
+  max_lots: 0.3           # Lower lots for gold's volatility
+  max_positions_per_symbol: 3
+  max_drawdown_pct: 5.0
+  sl_atr_mult: 2.5        # Wider stops for gold's volatility
+  tp_atr_mult: 4.0
+  trailing_trigger_atr: 2.0
+  trailing_distance_atr: 1.5
+
+canary_policy:
+  min_trades: 30
+  min_realized_pnl: 0.0
+  max_drawdown: 0.12       # Slightly more tolerance for gold
+  min_runtime_minutes: 45

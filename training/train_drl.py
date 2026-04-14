@@ -273,9 +273,17 @@ def train_drl():
         
         with open(os.path.join(candidate_path, "scorecard.json"), "w") as f:
             json.dump(metrics, f, indent=4)
-            
+
         logger.success(f"✅ Optimal Joint LSTM-PPO Candidate staged to: {candidate_path}")
-        
+
+        # Register with the model registry and stage as canary for live evaluation
+        registry.register_candidate(candidate_path, metrics)
+        promoted = registry.evaluate_and_stage_canary(candidate_path)
+        if promoted:
+            logger.success(f"PPO candidate auto-staged as canary — will be evaluated for champion promotion")
+        else:
+            logger.warning(f"PPO candidate saved but did not pass canary gate")
+
     except Exception as e:
         logger.error(f"Failed to register PPO candidate model: {e}")
 

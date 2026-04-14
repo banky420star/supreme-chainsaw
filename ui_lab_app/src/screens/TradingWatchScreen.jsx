@@ -1,13 +1,18 @@
 import React, { useState } from "react";
-import { AlertTriangle, CandlestickChart, Shield, Wallet, Activity, ArrowRightLeft, Brain, Sparkles, TrendingUp, GitBranch } from "lucide-react";
+import { AlertTriangle, CandlestickChart, Shield, Wallet, Activity, ArrowRightLeft, Brain, Sparkles, TrendingUp, GitBranch, BarChart3, Target, TrendingDown } from "lucide-react";
 import { Button, EventList, MetricTile, Panel, money, pct, LargeSparkline } from "../components/common";
+
+function dollars(value) { const n = Number(value || 0); return `$${n.toFixed(2)}`; }
 
 export default function TradingWatchScreen({ system, selectedSymbol, onReplayJourney, onGoControl }) {
   const [timeframe, setTimeframe] = useState("1d");
   const openTrades = [...(system.trading.lanes || [])].filter((lane) => lane.status === "live");
-  
+  const account = system.trading.account;
+  const risk = system.trading.risk;
+  const review = system.tradeReview || {};
+
   // Fake historical data for sparkline to smooth out the initial boot sequence
-  const dummyEquityData = [12100, 12050, 12220, 12180, 12300, 12250, 12380, 12450, 12390, system.trading.account.equity];
+  const dummyEquityData = [12100, 12050, 12220, 12180, 12300, 12250, 12380, 12450, 12390, account.equity];
 
   return (
     <div className="stack">
@@ -16,12 +21,36 @@ export default function TradingWatchScreen({ system, selectedSymbol, onReplayJou
         <Button onClick={onGoControl}>Open control plane</Button>
       </div>
 
+      {/* ── Account KPIs ── */}
+      <div className="kpi-strip" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))" }}>
+        <div className={`kpi-card ${account.floatingPnl >= 0 ? "tone-pass" : "tone-fail"}`}>
+          <div className="kpi-label">Equity</div>
+          <div className="kpi-value">{dollars(account.equity)}</div>
+          <div className="kpi-sub">Float: {money(account.floatingPnl)}</div>
+        </div>
+        <div className="kpi-card">
+          <div className="kpi-label">Balance</div>
+          <div className="kpi-value">{dollars(account.balance)}</div>
+          <div className="kpi-sub">Free Margin: {dollars(account.freeMargin)}</div>
+        </div>
+        <div className="kpi-card">
+          <div className="kpi-label">Positions</div>
+          <div className="kpi-value">{account.openPositions}</div>
+          <div className="kpi-sub">Today: {money(account.realizedToday)}</div>
+        </div>
+        <div className={`kpi-card ${risk.canTrade ? "tone-pass" : "tone-warn"}`}>
+          <div className="kpi-label">Risk</div>
+          <div className="kpi-value">{risk.canTrade ? "ACTIVE" : "BLOCKED"}</div>
+          <div className="kpi-sub">DD: {risk.drawdownPct.toFixed(1)}%</div>
+        </div>
+      </div>
+
       <Panel title="Live Equity Curve" subtitle="Real-time account value projection" icon={Activity}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "16px", flexWrap: "wrap", gap: "16px" }}>
           <div>
-            <div style={{ fontSize: "2.8rem", fontWeight: 700, letterSpacing: "-0.04em", lineHeight: 1 }}>{money(system.trading.account.equity)}</div>
-            <div style={{ color: system.trading.account.floatingPnl >= 0 ? "var(--green)" : "var(--warn)", fontFamily: "var(--mono)", fontSize: "0.85rem", marginTop: "8px" }}>
-              Floating: {money(system.trading.account.floatingPnl)}
+            <div style={{ fontSize: "2.8rem", fontWeight: 700, letterSpacing: "-0.04em", lineHeight: 1 }}>{dollars(account.equity)}</div>
+            <div style={{ color: account.floatingPnl >= 0 ? "var(--green)" : "var(--red)", fontFamily: "var(--mono)", fontSize: "0.85rem", marginTop: "8px" }}>
+              Floating: {money(account.floatingPnl)}
             </div>
           </div>
           <div className="button-row" style={{ marginTop: 0 }}>
@@ -118,6 +147,79 @@ export default function TradingWatchScreen({ system, selectedSymbol, onReplayJou
           )}
         </div>
       </Panel>
+
+      {/* ── Trade Review Panel ── */}
+      {review.totalTrades > 0 && (
+        <Panel title="Trade Review" subtitle={`${review.totalTrades} trades analyzed | Win rate ${review.winRate}% | PF ${review.profitFactor}`} icon={BarChart3}>
+          <div className="kpi-strip" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(120px, 1fr))" }}>
+            <div className={`kpi-card ${review.totalPnl >= 0 ? "tone-pass" : "tone-fail"}`}>
+              <div className="kpi-label">Total PnL</div>
+              <div className="kpi-value">{dollars(review.totalPnl)}</div>
+              <div className="kpi-sub">{review.totalTrades} trades</div>
+            </div>
+            <div className={`kpi-card ${review.winRate >= 50 ? "tone-pass" : "tone-warn"}`}>
+              <div className="kpi-label">Win Rate</div>
+              <div className="kpi-value">{review.winRate}%</div>
+              <div className="kpi-sub">{review.wins}W / {review.losses}L</div>
+            </div>
+            <div className={`kpi-card ${review.profitFactor >= 1 ? "tone-pass" : "tone-fail"}`}>
+              <div className="kpi-label">Profit Factor</div>
+              <div className="kpi-value">{review.profitFactor}</div>
+              <div className="kpi-sub">Avg W: {dollars(review.avgWin)}</div>
+            </div>
+            <div className="kpi-card">
+              <div className="kpi-label">SL Hits</div>
+              <div className="kpi-value">{review.slHits}</div>
+              <div className="kpi-sub">{review.slRate}% of trades</div>
+            </div>
+            <div className="kpi-card tone-pass">
+              <div className="kpi-label">TP Hits</div>
+              <div className="kpi-value">{review.tpHits}</div>
+              <div className="kpi-sub">{review.tpRate}% of trades</div>
+            </div>
+          </div>
+
+          {Object.keys(review.bySymbol || {}).length > 0 && (
+            <div style={{ marginTop: "16px" }}>
+              <div className="eyebrow-row" style={{ marginBottom: "10px" }}><Target size={13} /><span>Per-Symbol Breakdown</span></div>
+              <div className="card-grid">
+                {Object.entries(review.bySymbol || {}).map(([sym, data]) => (
+                  <div className={`lane-card ${data.pnl >= 0 ? "live" : "watching"}`} key={sym}>
+                    <div className="lane-top">
+                      <div>
+                        <div className="lane-symbol">{sym}</div>
+                        <div className="lane-caption">{data.trades} trades | WR: {data.winRate}%</div>
+                      </div>
+                      <div style={{ textAlign: "right" }}>
+                        <div style={{ color: data.pnl >= 0 ? "var(--green)" : "var(--red)", fontWeight: 700, fontSize: "1.2rem" }}>
+                          {dollars(data.pnl)}
+                        </div>
+                        <div style={{ color: "var(--muted)", fontSize: "0.75rem" }}>
+                          {data.slHits} SL / {data.tpHits} TP
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {Object.keys(review.tagDistribution || {}).length > 0 && (
+            <div style={{ marginTop: "16px" }}>
+              <div className="eyebrow-row" style={{ marginBottom: "10px" }}><TrendingDown size={13} /><span>Outcome Tags</span></div>
+              <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+                {Object.entries(review.tagDistribution).sort((a, b) => b[1] - a[1]).map(([tag, count]) => (
+                  <span key={tag} className={`lane-chip ${tag.includes("correct") || tag.includes("tp") ? "pass" : tag.includes("wrong") || tag.includes("tight") ? "warn" : "default"}`}
+                    style={{ cursor: "default" }}>
+                    {tag.replace(/_/g, " ")}: {count}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+        </Panel>
+      )}
 
       <Panel title="Continuous Evolutionary Loop" subtitle="How Cautious Giggle improves itself over time" icon={GitBranch}>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: "32px", paddingTop: "8px" }}>
