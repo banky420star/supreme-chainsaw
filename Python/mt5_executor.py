@@ -7,6 +7,16 @@ import sys
 import os
 from loguru import logger
 
+# ── Audio alert for trade execution (Windows only) ───────────────────
+if sys.platform == "win32":
+    try:
+        import winsound
+        _ALERT_ENABLED = True
+    except ImportError:
+        _ALERT_ENABLED = False
+else:
+    _ALERT_ENABLED = False
+
 # ── Conditional MT5 import ──────────────────────────────────────────
 _mt5 = None
 if sys.platform == "win32":
@@ -20,9 +30,26 @@ if sys.platform == "win32":
 class MT5Executor:
     """Live MT5 execution (Windows only)."""
 
+    # Magic number ranges: base 505000 + symbol offset * 100 + lane offset
+    # Symbol offsets: EURUSD=0, GBPUSD=1, XAUUSD=2, BTCUSD=3
+    # Lane offsets: champion=0, canary=1
+    _SYMBOL_MAGIC_OFFSET = {
+        "EURUSDm": 0, "EURUSD": 0,
+        "GBPUSDm": 1, "GBPUSD": 1,
+        "XAUUSDm": 2, "XAUUSD": 2,
+        "BTCUSDm": 3, "BTCUSD": 3,
+        "USDCADm": 4, "USDCAD": 4,
+        "USDJPYm": 5, "USDJPY": 5,
+        "AUDUSDm": 6, "AUDUSD": 6,
+    }
+    _MAGIC_BASE = 505000
+    _DEFAULT_MAGIC = 505
+
     def __init__(self, risk):
         self.risk = risk
         self._is_live = _mt5 is not None and sys.platform == "win32"
+        self._last_order_meta = {}  # carry context for close orders
+        self._last_sl_hit_time = {}  # symbol -> timestamp of last SL hit (cooldown tracking)
 
         if self._is_live:
             try:
@@ -37,6 +64,17 @@ class MT5Executor:
             logger.success("MT5Executor: LIVE mode — connected to MetaTrader 5")
         else:
             logger.info("MT5Executor: DRY-RUN mode — trades will be logged only")
+
+    @staticmethod
+    def _play_trade_alert():
+        """Play a loud beep when a trade is executed (Windows only)."""
+        if _ALERT_ENABLED:
+            try:
+                # Two-tone alert: 800Hz for 300ms, then 1000Hz for 300ms
+                winsound.Beep(800, 300)
+                winsound.Beep(1000, 300)
+            except Exception:
+                pass
 
     def get_positions(self, symbol):
         longs = []
@@ -53,6 +91,45 @@ class MT5Executor:
                 else:
                     shorts.append(p)
         return longs, shorts
+
+    def _magic_for_order(self, symbol, order_meta, request_kind="open"):
+        """Compute a unique magic number per symbol + lane combination.
+
+        Magic number scheme: BASE + symbol_offset * 100 + lane_offset
+          - champion orders: symbol_offset * 100
+          - canary orders:   symbol_offset * 100 + 1
+          - close orders:    + 50 (to distinguish from opens)
+
+        This lets the user filter trades by symbol/lane in MT5 history.
+        """
+        sym_offset = self._SYMBOL_MAGIC_OFFSET.get(symbol, 99)
+        lane = (order_meta or {}).get("lane", "champion")
+        lane_offset = 0 if lane == "champion" else 1
+        magic = self._MAGIC_BASE + sym_offset * 100 + lane_offset
+        if request_kind == "close":
+            magic += 50
+        return magic
+
+    def _order_comment(self, symbol, order_meta, request_kind="open"):
+        """Build an MT5 order comment string (max 31 chars).
+
+        Format: {SYM6}{KIND}{LANE}{VERSION}
+          SYM6: first 6 chars of symbol (e.g. XAUUSD)
+          KIND: OP=open, CL=close
+          LANE: CH=champion, CA=canary
+          VERSION: last 6 chars of model version (timestamp)
+        Example: XAUUSDOPCH120510  (21 chars)
+        """
+        sym_short = symbol[:6].ljust(6)
+        kind_code = "OP" if request_kind == "open" else "CL"
+        lane = (order_meta or {}).get("lane", "champion")
+        lane_code = "CH" if lane == "champion" else "CA"
+        model_version = (order_meta or {}).get("model_version", "")
+        ver_short = model_version.replace("_", "")[-6:] if model_version else "------"
+
+        comment = f"{sym_short}{kind_code}{lane_code}{ver_short}"
+        # MT5 comment field limit is 31 chars
+        return comment[:31]
 
     def _check_news_blackout(self, symbol, minutes_before=5, minutes_after=5):
         """Check if a high-impact economic event is within the blackout window.
@@ -121,7 +198,8 @@ class MT5Executor:
             logger.warning(f"News blackout check failed for {symbol}: {e}")
             return False
 
-    def reconcile_exposure(self, symbol, target_exposure, max_lots, max_positions_per_symbol=5):
+    def reconcile_exposure(self, symbol, target_exposure, max_lots, max_positions_per_symbol=5,
+                           order_meta=None):
         """Multi-position executor: adds new positions up to max_positions_per_symbol.
 
         Each cycle, if the model says BUY and we have fewer than N long positions,
@@ -131,9 +209,19 @@ class MT5Executor:
         Reads per-symbol risk config from configs/{symbol}.yaml for max_lots,
         SL/TP ATR multipliers, and position limits.
 
+        order_meta: dict with 'lane', 'model_version', etc. for magic/comment.
+
         Only adds ONE position per call to avoid rapid stacking.
         """
         if not self.risk.can_trade():
+            return
+
+        # Post-SL cooldown: skip trading a symbol for N minutes after an SL hit
+        cooldown_minutes = int(os.environ.get("AGI_SL_COOLDOWN_MIN", "15"))
+        last_sl = self._last_sl_hit_time.get(symbol, 0)
+        if last_sl > 0 and (time.time() - last_sl) < (cooldown_minutes * 60):
+            remaining = cooldown_minutes * 60 - (time.time() - last_sl)
+            logger.debug(f"{symbol}: post-SL cooldown active ({remaining:.0f}s remaining)")
             return
 
         # Skip trade if a high-impact news event is imminent or just released
@@ -194,11 +282,11 @@ class MT5Executor:
 
             # Close any opposing short positions first
             if n_shorts > 0:
-                self.close_positions(shorts)
+                self.close_positions(shorts, order_meta=order_meta)
                 logger.info(f"Closed {n_shorts} short position(s) for {symbol}")
 
             # Open ONE new long position
-            self.open_position(symbol, _mt5.ORDER_TYPE_BUY, lot_size)
+            self.open_position(symbol, _mt5.ORDER_TYPE_BUY, lot_size, order_meta=order_meta)
             self.risk.record_trade()
             logger.info(f"Opened long #{n_longs + 1}/{sym_max_positions} for {symbol} ({lot_size} lots)")
         else:
@@ -208,30 +296,43 @@ class MT5Executor:
 
             # Close any opposing long positions first
             if n_longs > 0:
-                self.close_positions(longs)
+                self.close_positions(longs, order_meta=order_meta)
                 logger.info(f"Closed {n_longs} long position(s) for {symbol}")
 
             # Open ONE new short position
-            self.open_position(symbol, _mt5.ORDER_TYPE_SELL, lot_size)
+            self.open_position(symbol, _mt5.ORDER_TYPE_SELL, lot_size, order_meta=order_meta)
             self.risk.record_trade()
             logger.info(f"Opened short #{n_shorts + 1}/{sym_max_positions} for {symbol} ({lot_size} lots)")
 
-    def close_positions(self, positions):
+    def close_positions(self, positions, order_meta=None):
         if not self._is_live:
             return
 
         for p in positions:
+            # Use position's own magic/comment as fallback if no meta provided
+            meta = order_meta or self._last_order_meta.get(p.symbol, {})
+            magic = self._magic_for_order(p.symbol, meta, request_kind="close")
+            comment = self._order_comment(p.symbol, meta, request_kind="close")
+
             request = {
                 "action": _mt5.TRADE_ACTION_DEAL,
                 "symbol": p.symbol,
                 "volume": p.volume,
                 "type": _mt5.ORDER_TYPE_SELL if p.type == 0 else _mt5.ORDER_TYPE_BUY,
-                "position": p.ticket
+                "position": p.ticket,
+                "magic": magic,
+                "comment": comment,
             }
+            logger.info(f"MT5 CLOSE: {p.symbol} ticket={p.ticket} | magic={magic} comment={comment}")
             result = _mt5.order_send(request)
             if result.retcode != _mt5.TRADE_RETCODE_DONE:
                 logger.error(f"Close position failed for {p.symbol} ticket={p.ticket}: retcode={result.retcode}")
                 self.risk.record_error()
+            else:
+                # Record SL hit time for cooldown tracking
+                if p.sl > 0 and p.profit < 0:
+                    self._last_sl_hit_time[p.symbol] = time.time()
+                    logger.info(f"SL cooldown started for {p.symbol} (15 min)")
 
     def close_all_positions(self, symbol=None):
         """Close all open positions, optionally filtered by symbol."""
@@ -244,7 +345,7 @@ class MT5Executor:
         if positions:
             self.close_positions(list(positions))
 
-    def open_position(self, symbol, order_type, volume):
+    def open_position(self, symbol, order_type, volume, order_meta=None):
         if not self._is_live:
             return
 
@@ -257,6 +358,17 @@ class MT5Executor:
         # Compute ATR-based SL/TP defaults
         sl_distance, tp_distance = self._compute_atr_sl_tp(symbol)
 
+        # Enforce minimum SL distance to prevent instant SL hits on tight ATR periods
+        # Minimum SL: at least spread * 3 to avoid being stopped out by noise
+        spread = tick.ask - tick.bid
+        min_sl = max(spread * 3, self._min_sl_for_symbol(symbol))
+        if 0 < sl_distance < min_sl:
+            logger.warning(f"{symbol}: ATR SL={sl_distance:.5f} too tight, widening to min={min_sl:.5f}")
+            sl_distance = min_sl
+        # Scale TP proportionally if SL was widened
+        if tp_distance > 0 and sl_distance > 0:
+            tp_distance = max(tp_distance, sl_distance * 1.5)
+
         entry_price = tick.ask if order_type == _mt5.ORDER_TYPE_BUY else tick.bid
 
         # Compute SL/TP price levels
@@ -267,12 +379,22 @@ class MT5Executor:
             sl = round(entry_price + sl_distance, 5) if sl_distance > 0 else 0
             tp = round(entry_price - tp_distance, 5) if tp_distance > 0 else 0
 
+        # Magic number and comment for trade identification
+        meta = order_meta or {}
+        magic = self._magic_for_order(symbol, meta, request_kind="open")
+        comment = self._order_comment(symbol, meta, request_kind="open")
+
+        # Store meta for close order matching
+        self._last_order_meta[symbol] = meta
+
         request = {
             "action": _mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
             "volume": volume,
             "type": order_type,
             "price": entry_price,
+            "magic": magic,
+            "comment": comment,
         }
         if sl > 0:
             request["sl"] = sl
@@ -280,11 +402,30 @@ class MT5Executor:
             request["tp"] = tp
 
         logger.info(f"MT5 ORDER: {symbol} {'BUY' if order_type == _mt5.ORDER_TYPE_BUY else 'SELL'} "
-                     f"{volume:.2f} lots @ {entry_price} | SL={sl} TP={tp}")
+                     f"{volume:.2f} lots @ {entry_price} | SL={sl} TP={tp} | magic={magic} comment={comment}")
         result = _mt5.order_send(request)
         if result.retcode != _mt5.TRADE_RETCODE_DONE:
             logger.error(f"MT5 order failed: retcode={result.retcode}")
             self.risk.record_error()
+        else:
+            # Play audio alert on successful trade execution
+            self._play_trade_alert()
+
+    @staticmethod
+    def _min_sl_for_symbol(symbol):
+        """Minimum SL distance (in price units) per symbol type.
+        Prevents stop-outs from noise/spread during low-ATR periods."""
+        # Gold: min $10 distance (XAUUSD ~4800, $10 = ~0.2%)
+        if "XAU" in symbol.upper():
+            return 10.0
+        # BTC: min $500 distance (BTC ~75000, $500 = ~0.67%)
+        if "BTC" in symbol.upper():
+            return 500.0
+        # ETH: min $30
+        if "ETH" in symbol.upper():
+            return 30.0
+        # FX pairs: min 0.003 (30 pips for 5-digit pricing)
+        return 0.003
 
     def _compute_atr_sl_tp(self, symbol, atr_period=14, sl_mult=None, tp_mult=None):
         """Compute ATR-based stop loss and take profit distances.
@@ -334,3 +475,155 @@ class MT5Executor:
         except Exception as e:
             logger.warning(f"ATR SL/TP computation failed for {symbol}: {e}")
             return 0, 0
+
+    def _get_raw_atr(self, symbol, atr_period=14):
+        """Get the raw ATR14 value (not multiplied by SL/TP factors)."""
+        try:
+            rates = _mt5.copy_rates_from_pos(symbol, _mt5.TIMEFRAME_M5, 0, atr_period + 1)
+            if rates is None or len(rates) < atr_period + 1:
+                return 0
+
+            high = rates["high"]
+            low = rates["low"]
+            close = rates["close"]
+            trs = []
+            for i in range(1, len(rates)):
+                tr = max(high[i] - low[i], abs(high[i] - close[i-1]), abs(low[i] - close[i-1]))
+                trs.append(tr)
+            return sum(trs[-atr_period:]) / atr_period if len(trs) >= atr_period else 0
+        except Exception as e:
+            logger.warning(f"Raw ATR computation failed for {symbol}: {e}")
+            return 0
+
+    def manage_trailing_stops(self):
+        """Check all open positions and apply trailing stops.
+
+        For each position, if price has moved in our favor by more than
+        trailing_trigger_atr * ATR, we move the SL to lock in profit.
+        The new SL is placed at current_price - trailing_distance_atr * ATR
+        (for longs) or current_price + trailing_distance_atr * ATR (for shorts).
+
+        Should be called periodically (e.g. every 30-60 seconds).
+        """
+        if not self._is_live or _mt5 is None:
+            return
+
+        try:
+            # MT5 must be initialized in each background thread context
+            if not _mt5.initialize():
+                logger.debug("Trailing stop: MT5 init failed in thread context")
+                return
+
+            try:
+                positions = _mt5.positions_get()
+                if not positions:
+                    return
+
+                logger.debug(f"Trailing stop check: {len(positions)} open positions")
+                for p in positions:
+                    self._trail_single_position(p)
+            finally:
+                _mt5.shutdown()
+        except Exception as e:
+            logger.warning(f"Trailing stop management error: {e}")
+
+    def _trail_single_position(self, position):
+        """Apply trailing stop to a single position if conditions are met."""
+        import yaml
+
+        symbol = position.symbol
+        is_long = position.type == 0  # 0 = BUY/long, 1 = SELL/short
+        current_sl = position.sl
+        current_tp = position.tp
+        open_price = position.price_open
+
+        # Get current tick
+        tick = _mt5.symbol_info_tick(symbol)
+        if tick is None:
+            return
+
+        current_price = tick.bid if is_long else tick.ask
+
+        # Load trailing config
+        try:
+            config_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "configs", f"{symbol}.yaml"
+            )
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
+                    sym_cfg = yaml.safe_load(f)
+                risk_cfg = sym_cfg.get("risk", {})
+                trigger_atr = risk_cfg.get("trailing_trigger_atr", 1.5)
+                distance_atr = risk_cfg.get("trailing_distance_atr", 1.5)
+            else:
+                trigger_atr = 1.5
+                distance_atr = 1.5
+        except Exception:
+            trigger_atr = 1.5
+            distance_atr = 1.5
+
+        # Calculate raw ATR (not SL-adjusted) for trailing stop computation
+        raw_atr = self._get_raw_atr(symbol)
+        if raw_atr <= 0:
+            return
+
+        trigger_distance = raw_atr * trigger_atr
+        trail_distance = raw_atr * distance_atr
+
+        if is_long:
+            # Check if price has moved enough to trigger trailing
+            profit_distance = current_price - open_price
+            if profit_distance < trigger_distance:
+                return
+
+            # New SL = current_price - trail_distance
+            new_sl = round(current_price - trail_distance, 5)
+
+            # Only move SL up, never down
+            if new_sl <= current_sl and current_sl > 0:
+                return
+
+            # Don't move SL below entry
+            if new_sl <= open_price:
+                return
+
+            # Modify the position SL/TP using TRADE_ACTION_SLTP
+            request = {
+                "action": _mt5.TRADE_ACTION_SLTP,
+                "symbol": symbol,
+                "position": position.ticket,
+                "sl": new_sl,
+                "tp": current_tp,
+            }
+            result = _mt5.order_send(request)
+            if result.retcode == _mt5.TRADE_RETCODE_DONE:
+                logger.info(f"TRAILING STOP {symbol} long #{position.ticket}: SL moved {current_sl} -> {new_sl} (locked in {new_sl - open_price:.5f} profit)")
+            else:
+                logger.warning(f"Trailing stop modify failed for {symbol} long #{position.ticket}: retcode={result.retcode} comment={getattr(result, 'comment', '')}")
+
+        else:  # Short position
+            profit_distance = open_price - current_price
+            if profit_distance < trigger_distance:
+                return
+
+            new_sl = round(current_price + trail_distance, 5)
+
+            if new_sl >= current_sl and current_sl > 0:
+                return
+
+            if new_sl >= open_price:
+                return
+
+            request = {
+                "action": _mt5.TRADE_ACTION_SLTP,
+                "symbol": symbol,
+                "position": position.ticket,
+                "sl": new_sl,
+                "tp": current_tp,
+            }
+            result = _mt5.order_send(request)
+            if result.retcode == _mt5.TRADE_RETCODE_DONE:
+                logger.info(f"TRAILING STOP {symbol} short #{position.ticket}: SL moved {current_sl} -> {new_sl} (locked in {open_price - new_sl:.5f} profit)")
+            else:
+                logger.warning(f"Trailing stop modify failed for {symbol} short #{position.ticket}: retcode={result.retcode} comment={getattr(result, 'comment', '')}")

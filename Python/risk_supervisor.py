@@ -108,6 +108,12 @@ class RiskSupervisor:
         self._save_state()
         return RiskDecision(False, reason)
 
+    def clear_halt(self):
+        """Administratively clear a halt. Used when the halt was triggered
+        by a canary rollback but the champion model is still profitable."""
+        self.halt_until = None
+        self._save_state()
+
     def allow_trade(
         self,
         *,
@@ -140,10 +146,10 @@ class RiskSupervisor:
 
         pnl_today = float(snapshot.get("pnl_today", 0.0) or 0.0)
         if pnl_today <= -abs(self.max_daily_loss):
-            return self.enforce_halt(24 * 60, f"daily_loss {pnl_today:.2f} <= -{abs(self.max_daily_loss):.2f}")
+            return self.enforce_halt(120, f"daily_loss {pnl_today:.2f} <= -{abs(self.max_daily_loss):.2f}")
 
         if drawdown_pct >= self.max_drawdown_pct:
-            return self.enforce_halt(24 * 60, f"drawdown_pct {drawdown_pct:.2f} >= {self.max_drawdown_pct:.2f}")
+            return self.enforce_halt(60, f"drawdown_pct {drawdown_pct:.2f} >= {self.max_drawdown_pct:.2f}")
 
         if total_positions >= self.max_open_positions and abs(target_exposure) > 0.0:
             return RiskDecision(False, f"max_open_positions {total_positions} >= {self.max_open_positions}")

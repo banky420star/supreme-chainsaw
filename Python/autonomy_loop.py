@@ -76,8 +76,11 @@ class AutonomyLoop:
         return active.get("canary")
 
     async def _train_candidate(self):
-        logger.info("🌙 Autonomy: Nightly training candidate (train_drl.py)...")
-        subprocess.check_call([sys.executable, "training/train_drl.py"])
+        logger.info("Autonomy: Nightly training candidate (train_drl.py)...")
+        # Use the same Python that's running this process (venv), not sys.executable
+        # which may point to a different Python installation
+        python = os.environ.get("AGI_PYTHON", sys.executable)
+        subprocess.check_call([python, "-m", "training.train_drl"])
 
     def _maybe_set_canary(self, candidate_dir: str):
         import yaml

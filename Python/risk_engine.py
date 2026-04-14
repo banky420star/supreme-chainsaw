@@ -38,6 +38,10 @@ class RiskEngine:
         self._peak_equity = initial_equity
         self._current_equity = initial_equity
 
+        # Equity history for performance charts (capped at 300 points)
+        self._equity_history = []
+        self._pnl_history = []
+
         logger.info(
             f"RiskEngine initialized: max_loss=${self.max_daily_loss} "
             f"max_trades={self.max_daily_trades} max_lots={self.max_lots} "
@@ -84,6 +88,14 @@ class RiskEngine:
         self._current_equity = equity
         if equity > self._peak_equity:
             self._peak_equity = equity
+        # Store history for charts
+        self._equity_history.append(float(equity))
+        if len(self._equity_history) > 300:
+            self._equity_history = self._equity_history[-300:]
+        pnl = getattr(self, "_mt5_profit", 0.0) or 0.0
+        self._pnl_history.append(float(pnl))
+        if len(self._pnl_history) > 300:
+            self._pnl_history = self._pnl_history[-300:]
 
     def reset_daily(self):
         self.realized_pnl_today = 0.0

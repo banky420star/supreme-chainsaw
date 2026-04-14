@@ -147,6 +147,71 @@ def _safe_brain(attr: str, default=None):
     return default
 
 
+def _get_mt5_account_and_positions() -> dict:
+    """Fetch live MT5 account info and open positions.
+
+    Returns a dict with keys: balance, equity, free_margin, profit,
+    open_positions, positions.  Falls back to risk-engine equity and
+    empty positions when MT5 is unavailable (dry-run or non-Windows).
+    """
+    # Fallback defaults from risk engine (populated by equity poll)
+    result = {
+        "balance": _safe_risk("_mt5_balance", None) or _safe_risk("_current_equity", 0.0),
+        "equity": _safe_risk("_current_equity", 0.0),
+        "free_margin": _safe_risk("_mt5_free_margin", None) or _safe_risk("_current_equity", 0.0),
+        "profit": _safe_risk("_mt5_profit", 0.0),
+        "open_positions": 0,
+        "positions": [],
+    }
+
+    if sys.platform != "win32":
+        return result
+
+    try:
+        import MetaTrader5 as mt5
+
+        if not mt5.initialize():
+            logger.debug("MT5 init failed in API status handler")
+            return result
+
+        try:
+            info = mt5.account_info()
+            if info is not None:
+                result["balance"] = float(info.balance)
+                result["equity"] = float(info.equity)
+                result["free_margin"] = float(info.margin_free)
+                result["profit"] = float(info.profit)
+
+            raw_positions = mt5.positions_get()
+            if raw_positions:
+                result["open_positions"] = len(raw_positions)
+                result["positions"] = [
+                    {
+                        "ticket": p.ticket,
+                        "symbol": p.symbol,
+                        "type": "BUY" if p.type == 0 else "SELL",
+                        "volume": float(p.volume),
+                        "open_price": float(p.price_open),
+                        "current_price": float(p.price_current),
+                        "profit": float(p.profit),
+                        "sl": float(p.sl) if p.sl else 0.0,
+                        "tp": float(p.tp) if p.tp else 0.0,
+                        "comment": p.comment or "",
+                        "magic": p.magic,
+                        "open_time": datetime.fromtimestamp(p.time, tz=timezone.utc).isoformat(),
+                    }
+                    for p in raw_positions
+                ]
+        finally:
+            # Never shutdown MT5 here — the server process owns the connection.
+            # Calling shutdown() would kill the server's MT5 session.
+            pass
+    except Exception as e:
+        logger.debug(f"MT5 account/positions fetch failed: {e}")
+
+    return result
+
+
 def _read_training_progress():
     """Read per-trainer progress files."""
     result = {}
@@ -204,10 +269,29 @@ def api_status():
     mode = "LIVE" if (srv and getattr(srv, "live", False)) else "DRY-RUN"
 
     # ── Build lane rows from decision cache ──
+    # Build per-symbol model info
+    per_symbol_models = {}
+    symbols_map = active.get("symbols", {})
+    for sym, sym_data in symbols_map.items():
+        sym_champ = sym_data.get("champion")
+        sym_canary = sym_data.get("canary")
+        per_symbol_models[sym] = {
+            "champion": os.path.basename(sym_champ) if sym_champ else None,
+            "canary": os.path.basename(sym_canary) if sym_canary else None,
+            "has_per_symbol_champion": sym_champ is not None,
+            "has_per_symbol_canary": sym_canary is not None,
+            "canary_policy": sym_data.get("canary_policy", {}),
+            "canary_state": sym_data.get("canary_state", {}),
+        }
+
     lane_rows = []
     for sym in symbols:
         recent = list(_decision_cache.get(sym, []))
         last = recent[0] if recent else {}
+        sym_model = per_symbol_models.get(sym, {})
+        # Per-symbol champion/canary with global fallback
+        sym_champ_id = sym_model.get("champion") or champ_id
+        sym_canary_id = sym_model.get("canary") or (canary_id or None)
         lane_rows.append({
             "symbol": sym,
             "decision": {
@@ -220,7 +304,12 @@ def api_status():
             "pipeline": {
                 "lstm": {"state": last.get("volatility", "UNKNOWN")},
             },
-            "champion": champ_id,
+            "champion": sym_champ_id,
+            "canary": sym_canary_id,
+            "has_per_symbol_champion": sym_model.get("has_per_symbol_champion", False),
+            "has_per_symbol_canary": sym_model.get("has_per_symbol_canary", False),
+            "model_version": last.get("model_version", "champion"),
+            "is_canary": last.get("is_canary", False),
             "status": "live" if not halt else "halted",
             "side": last.get("action", "HOLD").lower(),
             "confidence": last.get("confidence", 0.0),
@@ -240,12 +329,26 @@ def api_status():
         "trading_active_symbols": len(symbols) if can_trade else 0,
     }
 
+    # ── MT5 account info and open positions ──
+    mt5_account = _get_mt5_account_and_positions()
+
+    # ── Build a symbol->position lookup so lanes can show live PnL ──
+    pos_by_symbol: dict[str, list] = {}
+    for pos in mt5_account["positions"]:
+        pos_by_symbol.setdefault(pos["symbol"], []).append(pos)
+
+    # Merge real position PnL into lane rows
+    for row in lane_rows:
+        sym = row["symbol"]
+        if sym in pos_by_symbol:
+            row["pnl"] = round(sum(p["profit"] for p in pos_by_symbol[sym]), 2)
+
     lane_summary = {
         "actionable_symbols": sum(1 for r in lane_rows if r["side"] != "hold"),
         "executed_symbols": daily_trades,
         "blocked_symbols": sum(1 for r in lane_rows if not r["canTrade"]),
         "neutral_symbols": sum(1 for r in lane_rows if r["side"] == "hold"),
-        "open_positions": 0,
+        "open_positions": mt5_account["open_positions"],
     }
 
     return _json({
@@ -256,11 +359,15 @@ def api_status():
             "pids": [os.getpid()],
         },
         "account": {
-            "balance": current_equity,
-            "equity": current_equity,
-            "free_margin": current_equity,
-            "open_positions": 0,
-            "positions": [],
+            "balance": mt5_account["balance"],
+            "equity": mt5_account["equity"],
+            "free_margin": mt5_account["free_margin"],
+            "profit": mt5_account["profit"],
+            "open_positions": mt5_account["open_positions"],
+            "positions": mt5_account["positions"],
+            "realized_today": realized_pnl,
+            "drawdown_pct": current_dd,
+            "connected": mode == "LIVE" or mt5_account["equity"] > 0,
         },
         "training": {
             "cycle_running": False,
@@ -315,6 +422,7 @@ def api_status():
         "registry_summary": {
             "champion": champ_id,
             "canary": canary_id or None,
+            "per_symbol_models": per_symbol_models,
         },
         "incidents": incidents or [{
             "id": "SYS-001",
@@ -729,25 +837,68 @@ def api_lanes():
             pass
 
     lanes = []
+    symbols_map = active.get("symbols", {})
     for sym in symbols:
         recent = list(_decision_cache.get(sym, []))
         last = recent[0] if recent else {}
+        sym_data = symbols_map.get(sym, {})
+        sym_champ = sym_data.get("champion")
+        sym_canary = sym_data.get("canary")
+        sym_champ_id = os.path.basename(sym_champ) if sym_champ else champ_id
+        sym_canary_id = os.path.basename(sym_canary) if sym_canary else (canary_id or None)
         lanes.append({
             "symbol": sym,
-            "champion": champ_id,
-            "canary": canary_id or None,
+            "champion": sym_champ_id,
+            "canary": sym_canary_id,
+            "has_per_symbol_champion": sym_champ is not None,
+            "has_per_symbol_canary": sym_canary is not None,
+            "model_version": last.get("model_version", "champion"),
             "action": last.get("action", "HOLD"),
             "exposure": last.get("exposure", 0.0),
             "confidence": last.get("confidence", 0.0),
             "volatility": last.get("volatility", "UNKNOWN"),
             "reason": last.get("reason", ""),
             "can_trade": can_trade,
-            "is_canary": bool(canary_id),
+            "is_canary": last.get("is_canary", bool(sym_canary or canary_id)),
             "last_decision_at": last.get("_cached_at"),
             "recent_decisions": len(recent),
         })
 
     return _json({"lanes": lanes})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 7b. GET /api/per_symbol_models — Per-symbol model registry info
+# ═══════════════════════════════════════════════════════════════════════════
+@app.get("/api/per_symbol_models")
+def api_per_symbol_models():
+    """Return per-symbol champion and canary model paths from the registry."""
+    active = _read_active_registry()
+    symbols_map = active.get("symbols", {})
+    global_champ = active.get("champion")
+    global_canary = active.get("canary")
+
+    result = {}
+    for sym, sym_data in symbols_map.items():
+        sym_champ = sym_data.get("champion")
+        sym_canary = sym_data.get("canary")
+        result[sym] = {
+            "champion": sym_champ,
+            "champion_basename": os.path.basename(sym_champ) if sym_champ else None,
+            "canary": sym_canary,
+            "canary_basename": os.path.basename(sym_canary) if sym_canary else None,
+            "uses_global_champion": sym_champ is None,
+            "uses_global_canary": sym_canary is None,
+            "canary_policy": sym_data.get("canary_policy", {}),
+            "canary_state": sym_data.get("canary_state", {}),
+            "champion_history_count": len(sym_data.get("champion_history", [])),
+        }
+
+    return _json({
+        "global_champion": global_champ,
+        "global_canary": global_canary,
+        "symbols": result,
+    })
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -769,9 +920,28 @@ def api_perf():
     """Performance metrics summary."""
     live = _read_live_state()
     hist = live.get("_history", {})
+
+    # Primary: live equity history from server's risk engine
+    srv = _server_ref
+    equity_curve = []
+    pnl_curve = []
+
+    if srv and hasattr(srv, "risk"):
+        try:
+            equity_curve = list(getattr(srv.risk, "_equity_history", []))
+            pnl_curve = list(getattr(srv.risk, "_pnl_history", []))
+        except Exception:
+            pass
+
+    # Fallback to file-based history if server has no data yet
+    if not equity_curve:
+        equity_curve = hist.get("equity", [])
+    if not pnl_curve:
+        pnl_curve = hist.get("pnl", [])
+
     return _json({
-        "equity_curve": hist.get("equity", []),
-        "pnl_curve": hist.get("pnl", []),
+        "equity_curve": equity_curve,
+        "pnl_curve": pnl_curve,
         "confidence_curve": hist.get("confidence", []),
         "lstm_loss_curve": hist.get("lstmLoss", []),
     })
@@ -1038,6 +1208,20 @@ def api_strategies():
             "analysis_window": "30d",
         },
     })
+
+
+# GET /api/economic_calendar — Upcoming economic events from MT5
+@app.get("/api/economic_calendar")
+def api_economic_calendar():
+    """Return upcoming economic calendar events from the MT5 calendar API."""
+    try:
+        from Python.trade_review import get_economic_calendar
+        days = int(request.params.get("days_ahead", 7))
+        events = get_economic_calendar(days_ahead=days)
+        return _json({"events": events, "count": len(events)})
+    except Exception as e:
+        logger.error(f"Economic calendar fetch failed: {e}")
+        return _json({"events": [], "count": 0, "error": str(e)})
 
 
 # GET /api/trade_review — Post-trade review with annotations and analysis

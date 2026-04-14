@@ -79,34 +79,139 @@ class HybridBrain:
         self.lstm_brain = None
         self._is_canary = False
 
+        # Per-symbol PPO model cache: symbol -> {"ppo": PPO, "vec_env": VecNormalize, "is_canary": bool}
+        self._per_symbol_ppo: dict[str, dict] = {}
+
+        self._model_version = "fallback"
         self._load_ppo_from_registry()
         self._load_lstm()
 
-        # Track which model slot is active for decision trace
-        if self._is_canary:
-            self._model_version = "canary"
-        elif self.ppo_model is not None:
-            self._model_version = "champion"
-        else:
-            self._model_version = "fallback"
+        # _model_version is set inside _load_ppo_from_registry() from the
+        # actual model directory name (e.g. ppo_20260412_115739).
+        # Only fall back to generic labels if loading didn't set one.
+        if not hasattr(self, '_model_version') or not self._model_version or self._model_version == "fallback":
+            if self._is_canary:
+                self._model_version = "canary"
+            elif self.ppo_model is not None:
+                self._model_version = "champion"
 
         logger.success(f"HybridBrain initialized on {self.device.upper()} | canary={self._is_canary}")
 
-    def _load_ppo_from_registry(self):
-        """Load PPO model + VecNormalize from the model registry (champion or canary)."""
+    def _load_ppo_for_symbol(self, symbol: str) -> dict | None:
+        """
+        Load a per-symbol PPO model + VecNormalize from the registry.
+        Returns dict with "ppo", "vec_env", "is_canary", "model_dir" keys,
+        or None if no model is available for that symbol.
+        """
         try:
             from Python.model_registry import ModelRegistry
             registry = ModelRegistry()
-            active_dir = registry.load_active_model(prefer_canary=True)
+            active_dir = registry.get_active_model(symbol=symbol, prefer_canary=True)
+
+            if not active_dir:
+                return None
+
+            model_path = os.path.join(active_dir, "ppo_trading.zip")
+            vec_path = os.path.join(active_dir, "vec_normalize.pkl")
+
+            if not os.path.exists(model_path):
+                logger.warning(f"No ppo_trading.zip in per-symbol dir {active_dir}")
+                return None
+
+            ppo = PPO.load(model_path, device=self.device)
+            vec_env = None
+            if os.path.exists(vec_path):
+                from drl.trading_env import TradingEnv
+                dummy = DummyVecEnv([lambda: TradingEnv(feature_version=ENGINEERED_V2)])
+                vec_env = VecNormalize.load(vec_path, dummy)
+                vec_env.training = False
+                vec_env.norm_reward = False
+
+            is_canary = registry.is_per_symbol_canary(symbol, active_dir)
+            if not is_canary:
+                active = registry._read_active()
+                is_canary = (active.get("canary") is not None and
+                             active_dir == active.get("canary"))
+
+            logger.success(f"Per-symbol PPO loaded for {symbol}: {active_dir} (canary={is_canary})")
+            return {
+                "ppo": ppo,
+                "vec_env": vec_env,
+                "is_canary": is_canary,
+                "model_dir": active_dir,
+            }
+
+        except Exception as e:
+            logger.warning(f"Failed to load per-symbol PPO for {symbol}: {e}")
+            return None
+
+    def _get_ppo_for_symbol(self, symbol: str) -> tuple:
+        """
+        Get the PPO model, VecNormalize, and canary status for a given symbol.
+        Tries per-symbol champion/canary first, falls back to global.
+
+        Returns:
+            (ppo_model, vec_env, is_canary, model_version_str)
+        """
+        # Check per-symbol cache first
+        if symbol in self._per_symbol_ppo:
+            cached = self._per_symbol_ppo[symbol]
+            return (
+                cached["ppo"],
+                cached.get("vec_env"),
+                cached.get("is_canary", False),
+                "canary" if cached.get("is_canary") else "per_symbol_champion",
+            )
+
+        # Try loading per-symbol model
+        per_symbol = self._load_ppo_for_symbol(symbol)
+        if per_symbol is not None:
+            # Only cache if this is actually a per-symbol model (different from global)
+            from Python.model_registry import ModelRegistry
+            registry = ModelRegistry()
+            global_model = registry.get_active_model(symbol=None, prefer_canary=True)
+            if per_symbol["model_dir"] != global_model:
+                self._per_symbol_ppo[symbol] = per_symbol
+                return (
+                    per_symbol["ppo"],
+                    per_symbol.get("vec_env"),
+                    per_symbol["is_canary"],
+                    "canary" if per_symbol["is_canary"] else "per_symbol_champion",
+                )
+
+        # Fall back to global model
+        return (
+            self.ppo_model,
+            self.vec_env,
+            self._is_canary,
+            self._model_version,
+        )
+
+    def _load_ppo_from_registry(self, symbol: str = None):
+        """
+        Load PPO model + VecNormalize from the model registry (champion or canary).
+        If symbol is provided, tries per-symbol champion/canary first, then global.
+        """
+        try:
+            from Python.model_registry import ModelRegistry
+            registry = ModelRegistry()
+            active_dir = registry.get_active_model(symbol=symbol, prefer_canary=True)
 
             if active_dir:
                 model_path = os.path.join(active_dir, "ppo_trading.zip")
                 vec_path = os.path.join(active_dir, "vec_normalize.pkl")
 
-                # Check if this is a canary
-                active = registry._read_active()
-                self._is_canary = (active.get("canary") is not None and
-                                   active_dir == active.get("canary"))
+                # Extract model version from directory name (e.g. ppo_20260412_115739)
+                model_dir_name = os.path.basename(active_dir.rstrip("/\\"))
+                self._model_version = model_dir_name
+
+                # Check if this is a canary (per-symbol or global)
+                if symbol:
+                    self._is_canary = registry.is_per_symbol_canary(symbol, active_dir)
+                if not self._is_canary:
+                    active = registry._read_active()
+                    self._is_canary = (active.get("canary") is not None and
+                                       active_dir == active.get("canary"))
 
                 if os.path.exists(model_path):
                     self.ppo_model = PPO.load(model_path, device=self.device)
@@ -246,21 +351,26 @@ class HybridBrain:
         # ── Step 3: PPO Position Sizing ──
         ppo_action = 0.0
         ppo_raw_action = []
-        if self.ppo_model is not None and len(df) >= 100:
+        ppo_model, ppo_vec_env, ppo_is_canary, ppo_model_version = self._get_ppo_for_symbol(symbol)
+        if ppo_model is not None and len(df) >= 100:
             try:
                 obs = self._build_observation(df)
                 if obs is not None:
                     # Apply VecNormalize if available
-                    if self.vec_env is not None:
-                        obs = self.vec_env.normalize_obs(obs)
+                    if ppo_vec_env is not None:
+                        obs = ppo_vec_env.normalize_obs(obs)
 
-                    action, _ = self.ppo_model.predict(obs, deterministic=True)
+                    action, _ = ppo_model.predict(obs, deterministic=True)
                     # 1D action: direction/exposure in [-1, 1]
                     # Negative = short, positive = long, magnitude = position size
                     ppo_raw_action = [round(float(a), 6) for a in action.flatten()]
                     ppo_action = float(action.flatten()[0])
             except Exception as e:
                 logger.warning(f"PPO prediction failed: {e}")
+
+        # Update result with per-symbol model info
+        result["model_version"] = ppo_model_version
+        result["is_canary"] = ppo_is_canary
 
         result["ppo_raw_action"] = ppo_raw_action
         result["ppo_primary_action"] = round(float(ppo_action), 6)
@@ -296,7 +406,7 @@ class HybridBrain:
 
         # ── Step 6: Canary Risk Scaling ──
         canary_scale = 1.0
-        if self._is_canary:
+        if ppo_is_canary:
             canary_scale = self.canary_lot_mult
             exposure *= canary_scale
             result["reason"] = f"canary_scaled (x{self.canary_lot_mult})"
@@ -323,7 +433,7 @@ class HybridBrain:
         logger.info(
             f"[HybridBrain] {symbol}: {result['action']} | "
             f"exposure={result['exposure']:.4f} | vol={lstm_signal} | "
-            f"conf={lstm_confidence:.2%} | bias={ppo_bias:.4f} | canary={self._is_canary}"
+            f"conf={lstm_confidence:.2%} | bias={ppo_bias:.4f} | canary={ppo_is_canary} | model={ppo_model_version}"
         )
 
         self._record_decision(result)
@@ -468,9 +578,14 @@ class HybridBrain:
 
         # Execute via MT5 or dry-run executor
         try:
+            order_meta = {
+                "lane": "canary" if decision.get("is_canary") else "champion",
+                "model_version": decision.get("model_version", ""),
+            }
             self.executor.reconcile_exposure(
                 symbol, decision["exposure"], max_lots,
-                max_positions_per_symbol=max_positions_per_symbol
+                max_positions_per_symbol=max_positions_per_symbol,
+                order_meta=order_meta,
             )
             if risk_supervisor is not None:
                 risk_supervisor.mark_trade(symbol)

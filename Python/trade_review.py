@@ -175,7 +175,19 @@ def annotate_trade(trade: dict, decision: dict | None) -> list[str]:
     tags = []
 
     if trade["is_sl"]:
-        tags.append(TAG_SL_TOO_TIGHT)
+        # Differentiate SL at loss vs SL in profit
+        profit = trade.get("profit", 0)
+        commission = trade.get("commission", 0)
+        swap = trade.get("swap", 0)
+        gross = profit - commission - swap
+        if profit > 0:
+            # SL hit but trade was in profit — trailing stop would have helped
+            tags.append("sl_in_profit")
+        elif abs(gross) < 0.5 and profit < 0:
+            # Gross profit near zero, net negative — spread killed it
+            tags.append(TAG_SPREAD_WIDENED)
+        else:
+            tags.append(TAG_SL_TOO_TIGHT)
     elif trade["is_tp"]:
         tags.append(TAG_TP_HIT)
         tags.append(TAG_SIGNAL_CORRECT)

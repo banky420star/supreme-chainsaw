@@ -91,6 +91,11 @@ class AGIServer:
         self._trade_thread = threading.Thread(target=self._auto_trade_loop, daemon=True)
         self._trade_thread.start()
 
+        # Start trailing stop manager in background
+        self._trail_interval = int(os.environ.get("AGI_TRAIL_INTERVAL_SEC", "45"))
+        self._trail_thread = threading.Thread(target=self._trailing_stop_loop, daemon=True)
+        self._trail_thread.start()
+
     def handle_command(self, request: dict) -> dict:
         """Process a command from the socket server or n8n bridge."""
         # Token auth
@@ -182,17 +187,35 @@ class AGIServer:
             time.sleep(self._equity_poll_interval)
 
     def _read_equity(self) -> float | None:
-        """Read current account equity from MT5 (Windows) or return None for dry-run."""
+        """Read current account equity from MT5 (Windows) or return None for dry-run.
+
+        Also stores full account info on the risk engine for API access.
+        """
         if _mt5 is not None and self.live:
             try:
                 info = _mt5.account_info()
                 if info is not None:
+                    # Store full account info so the API can read it
+                    self.risk._mt5_balance = float(info.balance)
+                    self.risk._mt5_free_margin = float(info.margin_free)
+                    self.risk._mt5_profit = float(info.profit)
                     return float(info.equity)
             except Exception as e:
                 logger.debug(f"MT5 equity read failed: {e}")
                 return None
         # Dry-run mode: no live equity feed — rely on initial bootstrap value
         return None
+
+    def _trailing_stop_loop(self):
+        """Background thread: manage trailing stops on open positions."""
+        logger.info(f"Trailing stop manager started (every {self._trail_interval}s)")
+        time.sleep(30)  # Let positions settle before first check
+        while True:
+            try:
+                self.executor.manage_trailing_stops()
+            except Exception as e:
+                logger.warning(f"Trailing stop manager error: {e}")
+            time.sleep(self._trail_interval)
 
     def _auto_trade_loop(self):
         """Background thread: scan ALL symbols each cycle for parallel lane-based trading."""

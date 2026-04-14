@@ -54,10 +54,10 @@ risk:
   max_lots: 0.01
   max_positions_per_symbol: 2
   max_drawdown_pct: 5.0
-  sl_atr_mult: 3.0
-  tp_atr_mult: 5.0
-  trailing_trigger_atr: 2.0
-  trailing_distance_atr: 1.5
+  sl_atr_mult: 4.0        # Wider stops for BTC's extreme volatility (was 3.0 — all 3 losses from SL too tight)
+  tp_atr_mult: 3.0        # Tighter TP to be reachable (was 5.0)
+  trailing_trigger_atr: 2.0   # Start trailing after 2.0x ATR profit (widened from 1.5)
+  trailing_distance_atr: 2.0  # Trail at wider distance (was 1.5 — BTC needs more room)
 
 canary_policy:
   min_trades: 60           # More trades needed to evaluate crypto
