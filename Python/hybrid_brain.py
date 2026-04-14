@@ -404,6 +404,22 @@ class HybridBrain:
         result["vol_scale"] = vol_scale
         exposure = ppo_action * vol_scale
 
+        # ── Step 5b: HIGH_VOL Confidence Gate ──
+        # During HIGH_VOLATILITY, require stronger PPO conviction before entering.
+        # This prevents weak-signal entries during volatile conditions where
+        # 3/3 recent losses occurred with tiny PPO actions (<0.006).
+        high_vol_min_action = float(os.environ.get("AGI_HIGH_VOL_MIN_ACTION", "0.01"))
+        if lstm_signal == "HIGH_VOLATILITY" and abs(ppo_action) < high_vol_min_action:
+            result["action"] = "HOLD"
+            result["exposure"] = 0.0
+            result["reason"] = f"high_vol_gate (ppo={ppo_action:.4f} < {high_vol_min_action})"
+            logger.info(
+                f"[HybridBrain] {symbol}: HOLD (HIGH_VOL gate) | "
+                f"ppo={ppo_action:.4f} < {high_vol_min_action}"
+            )
+            self._record_decision(result)
+            return result
+
         # ── Step 6: Canary Risk Scaling ──
         canary_scale = 1.0
         if ppo_is_canary:

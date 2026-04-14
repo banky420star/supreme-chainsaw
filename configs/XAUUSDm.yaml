@@ -55,7 +55,7 @@ risk:
   max_positions_per_symbol: 2   # Max 2 positions for gold
   max_drawdown_pct: 5.0
   sl_atr_mult: 3.0        # Wide stops for gold's extreme volatility
-  tp_atr_mult: 3.0        # Tighter TP so take-profit is actually reachable (was 5.0)
+  tp_atr_mult: 2.0        # Reduced from 3.0 — 0% TP rate across 12 trades, was unreachable
   trailing_trigger_atr: 2.0   # Start trailing after 2.0x ATR profit (widened from 1.5 — gold needs room)
   trailing_distance_atr: 2.5  # Trail at wider distance (was 1.5 — captured $3-5 vs $20-25 without trailing)
 

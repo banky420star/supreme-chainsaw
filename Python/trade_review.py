@@ -76,6 +76,14 @@ def gather_closed_trades(days_back: int = 7) -> list[dict]:
         if not deals:
             return []
 
+        # Also get orders to find open times for hold duration
+        orders = mt5.history_orders_get(since, datetime.now(timezone.utc))
+        order_open_times = {}
+        if orders:
+            for o in orders:
+                if o.type in (0, 1):  # BUY or SELL market order
+                    order_open_times[o.ticket] = _ts_to_utc(o.time_setup)
+
         trades = []
         for d in deals:
             if d.entry != 1:  # Only closing deals
@@ -86,6 +94,19 @@ def gather_closed_trades(days_back: int = 7) -> list[dict]:
             close_reason = REASON_MAP.get(d.reason, f"reason_{d.reason}")
             is_sl = d.reason == 4
             is_tp = d.reason == 5
+
+            # Compute hold duration
+            open_time = order_open_times.get(d.order)
+            hold_minutes = None
+            if open_time:
+                close_dt = _ts_to_utc(d.time)
+                hold_minutes = int((close_dt - open_time).total_seconds() / 60)
+
+            # Extract model version from comment (format: {SYM6}{OP/CL}{CH/CA}{VERSION6})
+            model_version = ""
+            comment = d.comment or ""
+            if len(comment) >= 12:
+                model_version = comment[6:]  # Last part is version
 
             trades.append({
                 "ticket": d.ticket,
@@ -98,10 +119,13 @@ def gather_closed_trades(days_back: int = 7) -> list[dict]:
                 "commission": round(d.commission, 2),
                 "swap": round(d.swap, 6),
                 "close_time": _ts_to_utc(d.time).isoformat(),
+                "open_time": open_time.isoformat() if open_time else "",
+                "hold_minutes": hold_minutes,
                 "close_reason": close_reason,
                 "is_sl": is_sl,
                 "is_tp": is_tp,
-                "comment": d.comment or "",
+                "comment": comment,
+                "model_version": model_version,
             })
         return trades
     finally:
@@ -180,17 +204,29 @@ def annotate_trade(trade: dict, decision: dict | None) -> list[str]:
         commission = trade.get("commission", 0)
         swap = trade.get("swap", 0)
         gross = profit - commission - swap
+        hold_min = trade.get("hold_minutes")
         if profit > 0:
-            # SL hit but trade was in profit — trailing stop would have helped
+            # SL hit but trade was in profit — trailing stop locked gains
             tags.append("sl_in_profit")
+            # Tag very short holds as quick trailing stop capture
+            if hold_min is not None and hold_min < 30:
+                tags.append("quick_trail_capture")
         elif abs(gross) < 0.5 and profit < 0:
             # Gross profit near zero, net negative — spread killed it
             tags.append(TAG_SPREAD_WIDENED)
+        elif hold_min is not None and hold_min < 15:
+            # SL hit very quickly — likely a bad entry signal
+            tags.append(TAG_SIGNAL_WRONG)
         else:
             tags.append(TAG_SL_TOO_TIGHT)
     elif trade["is_tp"]:
         tags.append(TAG_TP_HIT)
         tags.append(TAG_SIGNAL_CORRECT)
+    else:
+        # Not SL or TP — closed by signal reversal or reconciliation
+        if trade["profit"] > 0:
+            tags.append(TAG_SIGNAL_CORRECT)
+            tags.append("signal_reversal_close")
 
     if decision:
         confidence = decision.get("confidence", 0)
@@ -198,6 +234,7 @@ def annotate_trade(trade: dict, decision: dict | None) -> list[str]:
         action = decision.get("action", "HOLD")
         ppo_action = decision.get("ppo_primary_action", 0)
         ppo_bias = decision.get("ppo_bias", 0)
+        reason = decision.get("reason", "")
 
         if confidence < 0.5:
             tags.append(TAG_LOW_CONFIDENCE)
@@ -213,6 +250,10 @@ def annotate_trade(trade: dict, decision: dict | None) -> list[str]:
         if trade["profit"] < 0 and abs(ppo_action) < 0.01:
             tags.append(TAG_SIGNAL_WRONG)
 
+        # Tag if high_vol_gate was active (trade bypassed it)
+        if "high_vol_gate" in reason:
+            tags.append("bypassed_high_vol_gate")
+
     # If no decision matched, flag as unknown
     if decision is None:
         tags.append(TAG_UNKNOWN)
@@ -220,6 +261,11 @@ def annotate_trade(trade: dict, decision: dict | None) -> list[str]:
     # If trade lost but wasn't SL (manual close or other)
     if trade["profit"] < 0 and not trade["is_sl"] and not trade["is_tp"]:
         tags.append(TAG_REVERSAL)
+
+    # Tag long holds
+    hold_min = trade.get("hold_minutes")
+    if hold_min is not None and hold_min > 240:
+        tags.append("long_hold")
 
     return tags
 
