@@ -71,9 +71,16 @@ export default function App() {
         <h2>Cannot connect to backend</h2>
         <p style={{ color: "var(--text-secondary)" }}>Make sure the backend is running at http://localhost:5000</p>
         <p style={{ color: "var(--text-muted)", fontFamily: "monospace", fontSize: 12 }}>{error}</p>
+        <button onClick={() => window.location.reload()}
+          style={{ marginTop: 20, padding: "8px 16px", background: "var(--accent-cyan)", color: "#000", border: "none", cursor: "pointer", borderRadius: 8 }}>
+          Retry
+        </button>
       </div>
     );
   }
+
+  // If we have data (even partial), show the dashboard
+  // Error banner will appear in the UI if needed
 
   const ScreenComponent = SCREENS[screen] || DashboardScreen;
 

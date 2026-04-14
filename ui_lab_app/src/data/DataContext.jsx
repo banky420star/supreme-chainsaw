@@ -285,11 +285,56 @@ export function DataProvider({ children, pollMs = 3000 }) {
 
       if (cancelledRef.current) return;
 
-      const mapped = mapStatusToState(status, trades, tradeReview, learning, ppoDiag, lstmExpl, scenarios, perf, strategies, lanes);
+      // Core status must succeed — other endpoints are optional
+      if (!status) {
+        setError("Backend unreachable");
+        setLoading(false);
+        return;
+      }
+
+      let mapped;
+      try {
+        mapped = mapStatusToState(status, trades, tradeReview, learning, ppoDiag, lstmExpl, scenarios, perf, strategies, lanes);
+      } catch (mapErr) {
+        console.error("mapStatusToState error:", mapErr);
+        // Build minimal state so the dashboard still renders
+        const account = status?.account || {};
+        const risk = status?.risk || {};
+        mapped = {
+          meta: { appName: "Money Printer", featureVersion: "ultimate_150" },
+          connection: { status: "connected", transport: "backend" },
+          trading: {
+            mode: "active",
+            account: {
+              balance: Number(account.balance || 0), equity: Number(account.equity || 0),
+              freeMargin: Number(account.free_margin || 0), floatingPnl: Number(account.profit || 0),
+              realizedToday: Number(account.realized_today || 0), openPositions: Number(account.open_positions || 0),
+              positions: (account.positions || []).map(p => ({
+                ticket: p.ticket, symbol: p.symbol, type: (p.type || "").toLowerCase(),
+                volume: Number(p.volume || 0), openPrice: Number(p.open_price || 0),
+                currentPrice: Number(p.current_price || 0), profit: Number(p.profit || 0),
+                sl: Number(p.sl || 0), tp: Number(p.tp || 0), comment: p.comment || "",
+              })),
+            },
+            risk: {
+              canTrade: risk.can_trade !== false && !risk.halt,
+              drawdownPct: Number(risk.current_dd || 0), maxDailyLossPct: 3,
+              dailyLossPct: 0, sizeCap: 0.64, killSwitchArmed: true,
+            },
+            lanes: [], tradeHistory: [],
+          },
+          tradeReview: { totalTrades: 0, wins: 0, losses: 0, winRate: 0, totalPnl: 0, profitFactor: 0, slHits: 0, tpHits: 0, slRate: 0, tpRate: 0, tagDistribution: {}, bySymbol: {} },
+          training: { activePhase: "idle", configuredSymbols: [], lstm: { state: "idle" }, ppo: { state: "idle" }, dreamerV3: { state: "idle" } },
+          registry: { champion: { id: "none" }, canary: { id: "none" }, gate: { ready: false, reason: "" } },
+          incidents: [], timeline: [], controls: { runtimeStatus: "running", processes: [], availableActions: [] },
+          _tick: Date.now(),
+        };
+      }
 
       const equity = Number(status?.account?.equity || 0);
       const pnl = Number(status?.account?.profit || 0);
-      const topConf = Math.max(...(mapped.trading.lanes.map((l) => l.confidence).filter(Boolean)), 0);
+      const laneConfs = (mapped.trading?.lanes || []).map((l) => l.confidence).filter(Boolean);
+      const topConf = laneConfs.length > 0 ? Math.max(...laneConfs) : 0;
 
       const h = historyRef.current;
       h.equity.push(equity);
