@@ -42,7 +42,7 @@ const SCREENS = {
   about: AboutScreen,
 };
 
-const MIN_SPLASH_MS = 10000; // Loading screen shows for at least 10 seconds
+const MIN_SPLASH_MS = 4000; // Loading screen shows for at least 4 seconds
 
 export default function App() {
   const { data, loading, error } = useData();

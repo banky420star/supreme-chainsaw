@@ -8,13 +8,26 @@ export default function HistoryScreen({ data }) {
   const learning = data?.learning || {};
   const log = learning?.learning_log || {};
 
-  const bySymbol = log.by_symbol || review.by_symbol || {};
+  const bySymbol = review.bySymbol || review.by_symbol || log.by_symbol || {};
+  const isLiveData = review.totalTrades > 0;
+  const dataSourceLabel = isLiveData ? "LIVE" : "BACKTEST";
   const byHour = log.by_hour_utc || [];
 
   return (
     <div className="stack animate-in">
+      {/* Data source indicator */}
+      <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 14px", borderRadius: 8, border: `1px solid ${isLiveData ? "rgba(57,217,138,0.2)" : "rgba(243,187,74,0.2)"}`, background: isLiveData ? "rgba(57,217,138,0.04)" : "rgba(243,187,74,0.04)", marginBottom: 8 }}>
+        <div style={{ width: 8, height: 8, borderRadius: "50%", background: isLiveData ? "var(--accent-green)" : "var(--accent-amber)", boxShadow: `0 0 6px ${isLiveData ? "var(--accent-green)" : "var(--accent-amber)"}` }} />
+        <span style={{ fontFamily: "var(--mono)", fontSize: "0.72rem", textTransform: "uppercase", letterSpacing: "0.1em", color: isLiveData ? "var(--accent-green)" : "var(--accent-amber)", fontWeight: 600 }}>
+          {dataSourceLabel} DATA
+        </span>
+        <span style={{ color: "var(--text-muted)", fontSize: "0.78rem" }}>
+          {isLiveData ? `${review.totalTrades} live trades from MT5` : "Simulated backtest data — not from live trading"}
+        </span>
+      </div>
+
       {/* Trade Review KPIs */}
-      <Panel title="Trade Review" subtitle={`${review.totalTrades || log.trades || 0} trades analyzed`} icon={BarChart3}>
+      <Panel title="Live Trade Review" subtitle={`${review.totalTrades || log.trades || 0} live trades analyzed`} icon={BarChart3}>
         <div className="kpi-strip">
           <KpiCard label="Total PnL" value={dollars(review.totalPnl || log.total_pnl || 0)} tone={(review.totalPnl || log.total_pnl || 0) >= 0 ? "pass" : "fail"} />
           <KpiCard label="Win Rate" value={`${(review.winRate || log.win_rate || 0).toFixed(1)}%`} sub={`${review.wins || log.wins || 0}W / ${review.losses || log.losses || 0}L`} tone={(review.winRate || log.win_rate || 0) >= 50 ? "pass" : "warn"} />

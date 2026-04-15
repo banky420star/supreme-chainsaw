@@ -111,12 +111,14 @@ def build_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
 class AGIModel(nn.Module):
     def __init__(self, input_dim: int = len(FEATURE_COLUMNS)):
         super().__init__()
-        self.lstm = nn.LSTM(input_dim, 128, 3, batch_first=True, dropout=0.1)
+        self.lstm = nn.LSTM(input_dim, 128, 3, batch_first=True, dropout=0.3)
+        self.dropout = nn.Dropout(0.3)
         self.fc = nn.Linear(128, 3)
 
     def forward(self, x):
         x, _ = self.lstm(x)
-        return self.fc(x[:, -1, :])
+        x = self.dropout(x[:, -1, :])
+        return self.fc(x)
 
 
 class SmartAGI:

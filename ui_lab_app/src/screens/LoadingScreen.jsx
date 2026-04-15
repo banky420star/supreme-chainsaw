@@ -165,6 +165,7 @@ export default function LoadingScreen() {
         <div className="boot-log">
           {completedSteps.map((idx) => {
             const s = BOOT_SEQUENCE[idx];
+            if (!s || !s.icon) return null;
             const SIcon = s.icon;
             return (
               <div className="boot-line done" key={idx}>

@@ -137,6 +137,7 @@ function mapStatusToState(status, trades = [], tradeReview = null, learning = nu
         targetTimesteps: Number(status?.training?.drl_timesteps || ppo.target_timesteps || 100000),
         state: ppo.state || "idle",
         progressPct: Number(ppo.progress_pct || 0),
+        perSymbol: status?.training?.ppo_per_symbol || {},
       },
       dreamerV3: {
         enabled: Boolean(status?.training?.dreamer_running),
@@ -157,8 +158,8 @@ function mapStatusToState(status, trades = [], tradeReview = null, learning = nu
     },
     registry: {
       champion: {
-        id: status?.active_models?.champion || "ppo_20260412_115739",
-        symbol: mappedLanes[0]?.symbol || "BTCUSDm",
+        id: status?.active_models?.champion || "none",
+        symbol: mappedLanes[0]?.symbol || "",
         featureVersion: "ultimate_150",
         verdict: "champion",
       },
@@ -169,6 +170,7 @@ function mapStatusToState(status, trades = [], tradeReview = null, learning = nu
         verdict: status?.active_models?.canary ? "canary" : "none",
         progress: 0,
       },
+      perSymbolModels: status?.registry_summary?.per_symbol_models || {},
       gate: {
         ready: Boolean(status?.canary_gate?.ready),
         reason: status?.canary_gate?.reason || "min trades not yet reached",

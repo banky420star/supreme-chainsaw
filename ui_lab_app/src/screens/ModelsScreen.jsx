@@ -18,8 +18,52 @@ export default function ModelsScreen({ data }) {
   const lstmCandidates = candidates.filter((c) => c.type === "lstm").sort((a, b) => (a.loss || 0) - (b.loss || 0));
   const bestLstm = lstmCandidates[0] || {};
 
+  // Per-symbol model information from the registry
+  const perSymbolModels = registry.perSymbolModels || {};
+  const configuredSymbols = training.configuredSymbols || ["BTCUSDm", "XAUUSDm", "EURUSDm", "GBPUSDm"];
+
   return (
     <div className="stack animate-in">
+      {/* Per-Symbol Model Status */}
+      {Object.keys(perSymbolModels).length > 0 && (
+        <Panel title="Per-Symbol Models" subtitle="Active champion/canary per trading symbol" icon={Shield}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 12 }}>
+            {configuredSymbols.map((sym) => {
+              const symInfo = perSymbolModels[sym] || {};
+              return (
+                <div key={sym} style={{
+                  padding: 16, borderRadius: 12, border: "1px solid rgba(255,255,255,0.06)",
+                  background: symInfo.has_per_symbol_champion ? "rgba(57,217,138,0.04)" : "rgba(255,255,255,0.02)",
+                }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ fontSize: "1.1rem", fontWeight: 700 }}>{sym}</span>
+                      {symInfo.has_per_symbol_champion && (
+                        <span className="lane-chip tone-pass" style={{ fontSize: "0.7rem" }}>DEDICATED</span>
+                      )}
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between" }}>
+                      <span style={{ color: "var(--text-muted)", fontSize: "0.78rem" }}>Champion</span>
+                      <span style={{ fontFamily: "var(--mono)", fontSize: "0.78rem" }}>
+                        {symInfo.champion || <span style={{ color: "var(--text-muted)" }}>global</span>}
+                      </span>
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "space-between" }}>
+                      <span style={{ color: "var(--text-muted)", fontSize: "0.78rem" }}>Canary</span>
+                      <span style={{ fontFamily: "var(--mono)", fontSize: "0.78rem" }}>
+                        {symInfo.canary || <span style={{ color: "var(--text-muted)" }}>none</span>}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </Panel>
+      )}
+
       {/* Champion Model */}
       <Panel title="Champion Model" subtitle="Current production model" icon={Shield}>
         <div style={{ display: "flex", gap: 20, flexWrap: "wrap" }}>

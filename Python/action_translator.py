@@ -11,7 +11,14 @@ def translate_trade_action(
     exposure: float,
     max_lots: float,
     tick: Optional[mt5.Tick] = None,
+    atr_value: float = 0.0,
 ) -> Optional[dict]:
+    """Translate a brain decision into an order dict.
+
+    If atr_value is provided and positive, computes SL/TP using per-symbol
+    ATR multipliers from the OrderManager config (preferred method).
+    Otherwise falls back to percentage offsets from action_meta.
+    """
     if action_meta is None or tick is None:
         return None
     if abs(float(exposure)) < 0.01:
@@ -24,18 +31,27 @@ def translate_trade_action(
 
     entry_mode = action_meta.get("entry_mode", "market")
     entry_offset_pct = float(action_meta.get("entry_offset_pct", 0.0))
-    tp_offset_pct = float(action_meta.get("tp_offset_pct", 0.0))
-    sl_offset_pct = float(action_meta.get("sl_offset_pct", 0.0))
-
     mid_price = float((tick.ask + tick.bid) / 2.0)
     entry_price = _compute_entry_price(direction, mid_price, entry_offset_pct)
 
-    if direction >= 0:
-        tp_price = float(entry_price * (1.0 + tp_offset_pct))
-        sl_price = float(entry_price * (1.0 - sl_offset_pct))
+    # Use ATR-based SL/TP if available (preferred)
+    if atr_value > 0:
+        from Python.order_manager import OrderManager
+        side = "BUY" if direction > 0 else "SELL"
+        sl_price, tp_price = OrderManager.compute_sl_tp(
+            symbol, side, entry_price, atr_value
+        )
     else:
-        tp_price = float(entry_price * (1.0 - tp_offset_pct))
-        sl_price = float(entry_price * (1.0 + sl_offset_pct))
+        # Fallback: percentage offsets from action_meta
+        tp_offset_pct = float(action_meta.get("tp_offset_pct", 0.0))
+        sl_offset_pct = float(action_meta.get("sl_offset_pct", 0.0))
+
+        if direction >= 0:
+            tp_price = float(entry_price * (1.0 + tp_offset_pct))
+            sl_price = float(entry_price * (1.0 - sl_offset_pct))
+        else:
+            tp_price = float(entry_price * (1.0 - tp_offset_pct))
+            sl_price = float(entry_price * (1.0 + sl_offset_pct))
 
     lots = round(abs(size * max_lots), 2)
     order_type = "BUY" if direction > 0 else "SELL"

@@ -79,6 +79,13 @@ body { padding: max(12px, env(safe-area-inset-top)) 10px max(16px, env(safe-area
 
 /* ── Metrics Grid ── */
 .metrics { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+.metric { padding: 10px 8px; border-radius: 8px; background: var(--white-a03); border: 1px solid var(--line); }
+.metric .k { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
+.metric .v { font-size: 15px; font-weight: 700; letter-spacing: -0.02em; line-height: 1.2; }
+.metric .v.good { color: var(--green); }
+.metric .v.bad { color: var(--red); }
+.metric .v.warn { color: var(--amber); }
+.metric .m { font-size: 10px; color: var(--muted); margin-top: 2px; }
 .metric, .mini { padding: 12px; border-radius: var(--radius-sm); border: 1px solid var(--line); background: var(--panel-2); }
 .metric .k, .mini .k { font-size: 9px; text-transform: uppercase; letter-spacing: 0.16em; color: var(--muted); }
 .metric .v { margin-top: 6px; font-size: 20px; font-weight: 700; }
@@ -144,7 +151,8 @@ body { padding: max(12px, env(safe-area-inset-top)) 10px max(16px, env(safe-area
 .footer { text-align: center; color: var(--muted); font-size: 11px; padding: 6px; }
 
 /* ── Training ── */
-.train-row { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; }
+.train-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--white-a05); }
+.train-row:last-child { border-bottom: none; }
 .train-label { font-size: 12px; font-weight: 600; }
 .train-state { font-size: 10px; padding: 3px 8px; border-radius: 99px; font-weight: 600; }
 .train-state.idle { color: var(--muted); background: var(--white-a03); }
@@ -417,10 +425,10 @@ function renderTraining(s) {
   html += `<div class="train-row"><div><div class="train-label">LSTM Context</div><div style="font-size:11px;color:var(--muted);margin-top:2px">Features: ${tr.lstm?.featuresUsed||0} &middot; Loss: ${fmt(tr.lstm?.loss)}</div></div><span class="train-state ${tr.lstm?.state||"idle"}">${esc((tr.lstm?.state||"idle").toUpperCase())}</span></div>`;
   html += `<div class="bar"><div class="fill ${tone(tr.lstm?.state)}" style="width:${fmt(tr.lstm?.memoryStrength||0,0)}%"></div></div>`;
   // PPO
-  html += `<div class="train-row" style="margin-top:10px"><div><div class="train-label">PPO Execution</div><div style="font-size:11px;color:var(--muted);margin-top:2px">${fmtI(tr.ppo?.currentTimesteps)} / ${fmtI(tr.ppo?.targetTimesteps)} ts</div></div><span class="train-state ${tr.ppo?.state||"idle"}">${esc((tr.ppo?.state||"idle").toUpperCase())}</span></div>`;
+  html += `<div class="train-row"><div><div class="train-label">PPO Execution</div><div style="font-size:11px;color:var(--muted);margin-top:2px">${fmtI(tr.ppo?.currentTimesteps)} / ${fmtI(tr.ppo?.targetTimesteps)} ts</div></div><span class="train-state ${tr.ppo?.state||"idle"}">${esc((tr.ppo?.state||"idle").toUpperCase())}</span></div>`;
   html += `<div class="bar"><div class="fill ${tone(tr.ppo?.state)}" style="width:${fmt(tr.ppo?.progressPct||0,0)}%"></div></div>`;
   // Dreamer
-  html += `<div class="train-row" style="margin-top:10px"><div><div class="train-label">DreamerV3</div><div style="font-size:11px;color:var(--muted);margin-top:2px">${fmtI(tr.dreamerV3?.steps)} steps &middot; Align: ${fmt(tr.dreamerV3?.alignment)}</div></div><span class="train-state ${tr.dreamerV3?.state||"idle"}">${esc((tr.dreamerV3?.state||"idle").toUpperCase())}</span></div>`;
+  html += `<div class="train-row"><div><div class="train-label">DreamerV3</div><div style="font-size:11px;color:var(--muted);margin-top:2px">${fmtI(tr.dreamerV3?.steps)} steps &middot; Align: ${fmt(tr.dreamerV3?.alignment)}</div></div><span class="train-state ${tr.dreamerV3?.state||"idle"}">${esc((tr.dreamerV3?.state||"idle").toUpperCase())}</span></div>`;
   html += `<div class="bar"><div class="fill ${tone(tr.dreamerV3?.state)}" style="width:${fmt((tr.dreamerV3?.alignment||0)*100,0)}%"></div></div>`;
   $("training-section").innerHTML = html;
 
@@ -431,9 +439,9 @@ function renderTraining(s) {
   $("reg-tag").textContent = ch.id ? "active" : "none";
   $("registry-section").innerHTML = `
     <div class="metrics">
-      ${metric("Champion", esc(ch.id || "none"), `Symbol: ${esc(ch.symbol||"-")}`)}
-      ${metric("Canary", esc(ca.id || "none"), ca.id ? `Verdict: ${esc(ca.verdict)}` : "No canary")}
-      ${metric("Canary Gate", gate.ready ? "READY" : "HOLD", esc(gate.reason || ""), gate.ready ? "good" : "warn")}
+      ${metric("Champion", esc(ch.id || "none").split("_").pop(), `Symbol: ${esc(ch.symbol||"-")}`)}
+      ${metric("Canary", esc(ca.id || "none").split("_").pop(), ca.id ? `Verdict: ${esc(ca.verdict)}` : "No canary staged")}
+      ${metric("Canary Gate", gate.ready ? "READY" : "HOLD", esc(gate.reason || "min trades not reached"), gate.ready ? "good" : "warn")}
       ${metric("Symbols", fmtI(tr.configuredSymbols?.length || 0), esc((tr.configuredSymbols||[]).join(", ")))}
     </div>`;
 }
@@ -491,7 +499,7 @@ async function refresh() {
     ]);
     state = mapStatus(status, trades, tradeReview, perf, lanes);
     render();
-    if (tg) { tg.MainButton.setText("Open Full Dashboard"); tg.MainButton.show(); tg.MainButton.onClick(() => tg.openLink(location.origin+"/")); }
+    if (tg) { tg.ready(); }
   } catch (e) {
     $("footer").textContent = `Error: ${e.message}`;
   }

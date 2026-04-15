@@ -13,7 +13,7 @@ import json
 import socket
 import asyncio
 import threading
-from datetime import datetime
+from datetime import datetime, date as datetime_date
 from loguru import logger
 
 # ── Conditional MT5 import ──────────────────────────────────────────
@@ -33,6 +33,7 @@ from Python.mt5_executor import MT5Executor
 from Python.hybrid_brain import HybridBrain
 from Python.data_feed import get_latest_data, fetch_training_data
 from Python.api_server import start_api_server, cache_decision
+from Python.order_manager import OrderManager
 from alerts.telegram_alerts import TelegramAlerter
 
 # ── Logging ─────────────────────────────────────────────────────────
@@ -63,6 +64,7 @@ class AGIServer:
         self.executor = MT5Executor(self.risk)
         self.brain = HybridBrain(self.risk, self.executor)
         self.risk_engine = self.risk  # Alias for AutonomyLoop compatibility
+        self.order_manager = OrderManager(self.executor)
 
         # Socket server config
         self.host = os.environ.get("AGI_HOST", "127.0.0.1")
@@ -213,8 +215,16 @@ class AGIServer:
         """Background thread: poll MT5 account equity and update the risk engine."""
         logger.info(f"Equity poll started (every {self._equity_poll_interval}s)")
         prev_halt = False
+        _last_reset_date = datetime_date.today()
         while True:
             try:
+                # Daily reset: reset risk engine counters at midnight
+                today = datetime_date.today()
+                if today != _last_reset_date:
+                    logger.info(f"Daily risk reset: {_last_reset_date} -> {today}")
+                    self.risk.reset_daily()
+                    _last_reset_date = today
+
                 equity = self._read_equity()
                 if equity is not None and equity > 0:
                     self.risk.update_equity(equity)
@@ -292,14 +302,21 @@ class AGIServer:
         return None
 
     def _trailing_stop_loop(self):
-        """Background thread: manage trailing stops on open positions."""
-        logger.info(f"Trailing stop manager started (every {self._trail_interval}s)")
+        """Background thread: manage trailing stops, breakeven, and partial closes via OrderManager."""
+        logger.info(f"Order management loop started (every {self._trail_interval}s)")
         time.sleep(30)  # Let positions settle before first check
         while True:
             try:
-                self.executor.manage_trailing_stops()
+                results = self.order_manager.manage_all_positions()
+                for r in results:
+                    if r.success:
+                        logger.info(
+                            f"OrderManager: {r.action} on {r.ticket} "
+                            f"SL={r.old_sl:.5f}->{r.new_sl:.5f}"
+                            + (f" closed={r.volume_closed:.2f}" if r.volume_closed else "")
+                        )
             except Exception as e:
-                logger.warning(f"Trailing stop manager error: {e}")
+                logger.warning(f"Order management loop error: {e}")
             time.sleep(self._trail_interval)
 
     def _auto_trade_loop(self):

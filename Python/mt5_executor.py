@@ -146,12 +146,28 @@ class MT5Executor:
             window_start = now - timedelta(minutes=minutes_after)
             window_end = now + timedelta(minutes=minutes_before)
 
-            # Determine the currency pair's two currencies (e.g. EURUSD -> EUR, USD)
+            # Parse currencies from symbol name (handles broker suffixes like 'm')
+            base = symbol.rstrip("m").rstrip("M")
             currencies = []
-            for i in range(0, len(symbol) - 2, 3):
-                currencies.append(symbol[i:i+3])
-            if len(currencies) == 0:
-                # Can't determine currencies — check all events as a safety net
+            # Known commodity prefixes
+            for prefix in ["XAU", "XAG", "XPT"]:
+                if base.startswith(prefix):
+                    currencies = [prefix, base[len(prefix):]]
+                    break
+            else:
+                # Standard FX: 6-char base
+                if len(base) == 6:
+                    currencies = [base[:3], base[3:]]
+                else:
+                    # Crypto or unknown: try 3-char splits
+                    for prefix in ["BTC", "ETH", "SOL", "LTC"]:
+                        if base.startswith(prefix):
+                            currencies = [prefix, base[len(prefix):]]
+                            break
+                    if not currencies:
+                        for i in range(0, len(base) - 2, 3):
+                            currencies.append(base[i:i+3])
+            if not currencies:
                 currencies = None
 
             countries = _mt5.calendar_country()

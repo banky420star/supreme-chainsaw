@@ -84,8 +84,13 @@ export default function TradingScreen({ data, selectedSymbol }) {
                         {pos.sl > 0 && pos.tp > 0 && (
                           <div style={{ display: "flex", alignItems: "center", gap: 6, color: "var(--text-muted)", fontSize: "0.72rem", marginTop: 2, fontFamily: "var(--mono)" }}>
                             <Shield size={10} />
-                            <span>SL: {dollars(pos.sl)}</span>
+                            <span style={{ color: "var(--accent-red)" }}>SL: {dollars(pos.sl)}</span>
                             <span style={{ color: "var(--accent-green)" }}>TP: {dollars(pos.tp)}</span>
+                            <span style={{ color: "var(--text-muted)", fontSize: "0.65rem" }}>
+                              ({pos.type === "buy"
+                                ? `SL -${(pos.openPrice - pos.sl).toFixed(2)} / TP +${(pos.tp - pos.openPrice).toFixed(2)}`
+                                : `SL +${(pos.sl - pos.openPrice).toFixed(2)} / TP -${(pos.openPrice - pos.tp).toFixed(2)}`})
+                            </span>
                           </div>
                         )}
                       </div>

@@ -1,4 +1,4 @@
-"""LSTM Training Script — trains on real market data."""
+"""LSTM Training Script — trains on real market data with balanced sampling and Macro F1 early stopping."""
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from training.progress_writer import update_training_progress
@@ -17,43 +17,95 @@ from Python.data_feed import fetch_training_data
 
 CLASS_NAMES = ["LOW_VOL", "MED_VOL", "HIGH_VOL"]
 
+# Per-symbol volatility thresholds (FX pairs have tiny moves, commodities have large moves)
+SYMBOL_THRESHOLDS = {
+    "EURUSDm": (0.0003, 0.0008),   # MED > 0.03%, HIGH > 0.08%
+    "GBPUSDm": (0.0004, 0.0010),   # MED > 0.04%, HIGH > 0.10%
+    "XAUUSDm": (0.0015, 0.0040),   # MED > 0.15%, HIGH > 0.40%
+    "BTCUSDm": (0.0050, 0.0150),   # MED > 0.50%, HIGH > 1.50%
+}
+DEFAULT_THRESHOLDS = (0.0005, 0.0015)
+
 # ── Logging ─────────────────────────────────────────────────────────
 LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 logger.add(os.path.join(LOG_DIR, "lstm_training.log"), rotation="10 MB", level="DEBUG")
 
-def create_sequences(data, close_prices, seq_len=60):
+
+def _parse_symbol_currencies(symbol):
+    """Parse a broker symbol into its two currency/commodity codes.
+    Handles: EURUSDm -> [EUR, USD], XAUUSDm -> [XAU, USD], BTCUSDm -> [BTC, USD]
+    Strips trailing lowercase broker suffixes (e.g. 'm').
+    """
+    base = symbol.rstrip("m").rstrip("M")
+    for prefix in ["XAU", "XAG", "XPT"]:
+        if base.startswith(prefix):
+            return [prefix, base[len(prefix):]]
+    if len(base) == 6:
+        return [base[:3], base[3:]]
+    for prefix in ["BTC", "ETH", "SOL", "LTC"]:
+        if base.startswith(prefix):
+            return [prefix, base[len(prefix):]]
+    currencies = []
+    for i in range(0, len(base) - 2, 3):
+        currencies.append(base[i:i+3])
+    return currencies if currencies else [base]
+
+
+def create_sequences(data, close_prices, seq_len=60, med_thresh=0.0005, high_thresh=0.0015):
     """Create input sequences and labels for LSTM training (Volatility Focused).
 
     Args:
         data: scaled feature matrix (n_samples, n_features)
         close_prices: raw close prices for label generation
         seq_len: sequence length for LSTM
+        med_thresh: threshold for MED_VOL label
+        high_thresh: threshold for HIGH_VOL label
     """
     X, y = [], []
     for i in range(seq_len, len(data) - 1):
         X.append(data[i - seq_len:i])
 
-        # Calculate next return magnitude from raw close prices
         future_return = (close_prices[i] - close_prices[i - 1]) / (close_prices[i - 1] + 1e-8)
         magnitude = abs(future_return)
 
-        # Classify based on volatility threshold
-        # 0 = Low volatility (HOLD)
-        # 1 = Medium volatility
-        # 2 = High Volatility Spike
-        if magnitude > 0.0015:
-            y.append(2)  # High vol
-        elif magnitude > 0.0005:
-            y.append(1)  # Med vol
+        if magnitude > high_thresh:
+            y.append(2)  # HIGH_VOL
+        elif magnitude > med_thresh:
+            y.append(1)  # MED_VOL
         else:
-            y.append(0)  # Low vol/Hold
+            y.append(0)  # LOW_VOL
 
     return np.array(X), np.array(y)
 
-def train_lstm(symbols=None, epochs=50, seq_len=60):
+
+def _balance_per_symbol(X_sym, y_sym, max_per_class=None):
+    """Undersample LOW_VOL within a single symbol so classes are more balanced.
+    Keeps all MED_VOL and HIGH_VOL samples, randomly samples LOW_VOL down to
+    2x the largest minority class count.
+    """
+    counts = [(y_sym == c).sum() for c in range(3)]
+    minority_max = max(counts[1], counts[2])
+    if minority_max == 0:
+        minority_max = counts[0] // 4
+    low_cap = min(counts[0], minority_max * 2)
+    if max_per_class is not None:
+        low_cap = min(low_cap, max_per_class)
+
+    low_idx = np.where(y_sym == 0)[0]
+    keep_low = np.random.choice(low_idx, size=low_cap, replace=False) if len(low_idx) > low_cap else low_idx
+
+    med_idx = np.where(y_sym == 1)[0]
+    high_idx = np.where(y_sym == 2)[0]
+
+    all_idx = np.concatenate([keep_low, med_idx, high_idx])
+    np.random.shuffle(all_idx)
+    return X_sym[all_idx], y_sym[all_idx]
+
+
+def train_lstm(symbols=None, epochs=80, seq_len=60):
     if symbols is None:
-        symbols = ["EURUSDm", "GBPUSDm", "XAUUSDm"]
+        symbols = ["EURUSDm", "GBPUSDm", "XAUUSDm", "BTCUSDm"]
 
     if torch.cuda.is_available():
         device = 'cuda'
@@ -64,14 +116,12 @@ def train_lstm(symbols=None, epochs=50, seq_len=60):
     feature_columns = list(FEATURE_COLUMNS)
     n_features = len(feature_columns)
     model = AGIModel(input_dim=n_features).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    criterion = nn.CrossEntropyLoss()
-    scaler = MinMaxScaler()
 
     logger.success(f"LSTM Training started on {device.upper()} | Symbols: {symbols} | Epochs: {epochs} | Features: {n_features}")
 
-    # ── Fetch and combine training data ─────────────────────────────
+    # ── Fetch per-symbol data with balanced sampling ────────────────
     all_X, all_y = [], []
+    per_symbol_scalers = {}
     for sym in symbols:
         logger.info(f"Fetching training data for {sym}...")
         df = fetch_training_data(sym, period="60d")
@@ -79,24 +129,33 @@ def train_lstm(symbols=None, epochs=50, seq_len=60):
             logger.warning(f"Insufficient data for {sym} (len={0 if df is None else len(df)}), skipping")
             continue
 
-        # Build engineered features using the feature pipeline
         feat_df, available_cols = build_lstm_feature_frame(df, feature_version=ENGINEERED_V2)
         if len(feat_df) < seq_len + 10:
             logger.warning(f"Not enough feature rows for {sym} after pipeline, skipping")
             continue
 
-        # Use the columns the model expects
         use_cols = feature_columns if set(feature_columns).issubset(set(available_cols)) else available_cols
         features = feat_df[use_cols].astype(float).values
 
-        # Get close prices for label generation (aligned with feature rows)
         close_prices = df["close"].iloc[-len(feat_df):].values
 
-        data = scaler.fit_transform(features)
-        X, y = create_sequences(data, close_prices, seq_len)
-        all_X.append(X)
-        all_y.append(y)
-        logger.info(f"  {sym}: {len(X)} sequences | LOW:{(y==0).sum()} MED:{(y==1).sum()} HIGH:{(y==2).sum()}")
+        # Per-symbol scaler (preserves resolution for different price ranges)
+        sym_scaler = MinMaxScaler()
+        data = sym_scaler.fit_transform(features)
+        per_symbol_scalers[sym] = sym_scaler
+
+        # Per-symbol thresholds
+        med_t, high_t = SYMBOL_THRESHOLDS.get(sym, DEFAULT_THRESHOLDS)
+
+        X, y = create_sequences(data, close_prices, seq_len, med_thresh=med_t, high_thresh=high_t)
+        logger.info(f"  {sym} raw: {len(X)} seq | LOW:{(y==0).sum()} MED:{(y==1).sum()} HIGH:{(y==2).sum()} | thresh: MED>{med_t} HIGH>{high_t}")
+
+        # Balance within symbol: keep all minority, cap LOW_VOL
+        X_bal, y_bal = _balance_per_symbol(X, y)
+        logger.info(f"  {sym} balanced: {len(X_bal)} seq | LOW:{(y_bal==0).sum()} MED:{(y_bal==1).sum()} HIGH:{(y_bal==2).sum()}")
+
+        all_X.append(X_bal)
+        all_y.append(y_bal)
 
     if not all_X:
         logger.error("No training data available!")
@@ -104,25 +163,19 @@ def train_lstm(symbols=None, epochs=50, seq_len=60):
 
     X_train = np.concatenate(all_X)
     y_train = np.concatenate(all_y)
-    logger.info(f"Total training set: {len(X_train)} sequences | "
-                f"LOW_VOL:{(y_train==0).sum()} MED_VOL:{(y_train==1).sum()} HIGH_VOL:{(y_train==2).sum()}")
+    logger.info(f"Total balanced set: {len(X_train)} seq | LOW_VOL:{(y_train==0).sum()} MED_VOL:{(y_train==1).sum()} HIGH_VOL:{(y_train==2).sum()}")
 
-    # Convert to tensors
     X_tensor = torch.tensor(X_train, dtype=torch.float32).to(device)
     y_tensor = torch.tensor(y_train, dtype=torch.long).to(device)
 
-    # ── Compute class weights for imbalanced dataset ──
-    # Use sqrt-inverse-frequency: less aggressive than full inverse frequency
-    # Prevents the model from overcompensating on minority classes
+    # ── Compute class weights ──
     class_counts = np.array([(y_train == i).sum() for i in range(3)], dtype=np.float64)
     total_samples = len(y_train)
     raw_weights = total_samples / (3.0 * class_counts + 1e-6)
-    # Cap weights at 3x to prevent extreme overprediction of rare classes
     class_weights = np.minimum(raw_weights, 3.0)
-    # Normalize so weights average to 1.0
     class_weights = class_weights / class_weights.mean()
     class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32).to(device)
-    logger.info(f"Class weights (capped sqrt): LOW_VOL={class_weights[0]:.3f} MED_VOL={class_weights[1]:.3f} HIGH_VOL={class_weights[2]:.3f}")
+    logger.info(f"Class weights: LOW_VOL={class_weights[0]:.3f} MED_VOL={class_weights[1]:.3f} HIGH_VOL={class_weights[2]:.3f}")
 
     # ── Time-aware train/val split (last 20% as validation) ──
     split_idx = int(len(X_tensor) * 0.8)
@@ -137,10 +190,11 @@ def train_lstm(symbols=None, epochs=50, seq_len=60):
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.5, min_lr=1e-6)
 
-    # ── Early stopping ──
+    # ── Early stopping on Macro F1 (not val loss) ──
+    best_macro_f1 = 0.0
     best_val_loss = float('inf')
     patience_counter = 0
-    patience = 7
+    patience = 10
     best_model_state = None
 
     # ── Training loop ───────────────────────────────────────────────
@@ -149,7 +203,6 @@ def train_lstm(symbols=None, epochs=50, seq_len=60):
     n_batches = len(X_train_split) // batch_size
 
     for epoch in range(epochs):
-        # Shuffle each epoch
         perm = torch.randperm(len(X_train_split))
         X_train_shuf = X_train_split[perm]
         y_train_shuf = y_train_split[perm]
@@ -186,33 +239,27 @@ def train_lstm(symbols=None, epochs=50, seq_len=60):
             _, val_preds = val_outputs.max(1)
             val_acc = (val_preds == y_val_split).sum().item() / len(y_val_split) * 100
 
-            # Per-class recall on validation set
             per_class = []
+            f1_scores = []
+            min_recall = 1.0
             for c in range(3):
                 mask = (y_val_split == c)
-                if mask.sum() > 0:
-                    recall = (val_preds[mask] == c).sum().item() / mask.sum().item() * 100
-                    per_class.append(f"{CLASS_NAMES[c]}:{recall:.0f}%")
-                else:
-                    per_class.append(f"{CLASS_NAMES[c]}:N/A")
-            per_class_str = " | ".join(per_class)
-
-            # Macro F1
-            f1_scores = []
-            for c in range(3):
-                mask_c = (y_val_split == c)
                 pred_c = (val_preds == c)
-                tp = (pred_c & mask_c).sum().item()
-                fp = (pred_c & ~mask_c).sum().item()
-                fn = (~pred_c & mask_c).sum().item()
+                tp = (pred_c & mask).sum().item()
+                fp = (pred_c & ~mask).sum().item()
+                fn = (~pred_c & mask).sum().item()
                 prec = tp / (tp + fp + 1e-8)
                 rec = tp / (tp + fn + 1e-8)
                 f1 = 2 * prec * rec / (prec + rec + 1e-8)
                 f1_scores.append(f1)
+                recall_pct = rec * 100 if mask.sum() > 0 else 0
+                per_class.append(f"{CLASS_NAMES[c]}:R={recall_pct:.0f}%")
+                min_recall = min(min_recall, rec)
             macro_f1 = sum(f1_scores) / 3
+            per_class_str = " | ".join(per_class)
 
-        logger.info(f"Epoch {epoch+1:3d}/{epochs} | Train Loss: {avg_loss:.4f} | Train Acc: {acc:.1f}% | "
-                    f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.1f}% | Macro F1: {macro_f1:.3f} | {per_class_str}")
+        logger.info(f"Epoch {epoch+1:3d}/{epochs} | Loss: {avg_loss:.4f} | Acc: {acc:.1f}% | "
+                    f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.1f}% | Macro F1: {macro_f1:.3f} | MinRecall: {min_recall:.3f} | {per_class_str}")
         update_training_progress("lstm", {
             "running": True,
             "symbol": ",".join(symbols),
@@ -225,58 +272,71 @@ def train_lstm(symbols=None, epochs=50, seq_len=60):
             "macro_f1": round(macro_f1, 4),
         })
 
-        # ── LR scheduler and early stopping ──
         scheduler.step(val_loss)
 
-        if val_loss < best_val_loss:
+        # ── Early stopping on Macro F1 (primary metric) ──
+        if macro_f1 > best_macro_f1:
+            best_macro_f1 = macro_f1
             best_val_loss = val_loss
             patience_counter = 0
             best_model_state = {k: v.clone() for k, v in model.state_dict().items()}
+            logger.info(f"  -> New best Macro F1: {macro_f1:.4f} (val_loss={val_loss:.4f})")
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                logger.info(f"Early stopping at epoch {epoch+1} (no val loss improvement for {patience} epochs)")
+                logger.info(f"Early stopping at epoch {epoch+1} (no Macro F1 improvement for {patience} epochs)")
                 break
 
         model.train()
 
-    # ── Save model + scaler + metadata ─────────────────────────────
+    # ── Save model + scalers + metadata ─────────────────────────────
     model_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
     os.makedirs(model_dir, exist_ok=True)
+
+    # Save per-symbol scalers
+    scaler_dir = os.path.join(model_dir, "lstm_scalers")
+    os.makedirs(scaler_dir, exist_ok=True)
+    for sym, scaler in per_symbol_scalers.items():
+        sym_scaler_path = os.path.join(scaler_dir, f"{sym}.pkl")
+        joblib.dump(scaler, sym_scaler_path)
+        logger.success(f"Scaler saved: {sym_scaler_path}")
+
+    # Backward-compat combined scaler
+    combined_scaler_path = os.path.join(model_dir, "lstm_scaler.pkl")
+    last_scaler = list(per_symbol_scalers.values())[-1]
+    joblib.dump(last_scaler, combined_scaler_path)
+
+    # Restore best model
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        logger.info(f"Restored best model (Macro F1={best_macro_f1:.4f}, val_loss={best_val_loss:.4f})")
 
     model_path = os.path.join(model_dir, "lstm_agi_trained.pt")
     torch.save(model.state_dict(), model_path)
     logger.success(f"LSTM model saved: {model_path} ({os.path.getsize(model_path)/1024:.1f} KB)")
 
-    scaler_path = os.path.join(model_dir, "lstm_scaler.pkl")
-    joblib.dump(scaler, scaler_path)
-    logger.success(f"Scaler saved: {scaler_path}")
-
     meta_path = os.path.join(model_dir, "lstm_agi_trained.meta.json")
+    meta_data = {
+        "feature_columns": feature_columns,
+        "feature_version": ENGINEERED_V2,
+        "n_features": n_features,
+        "symbols": symbols,
+        "epochs": epochs,
+        "seq_len": seq_len,
+        "per_symbol_thresholds": {s: SYMBOL_THRESHOLDS.get(s, DEFAULT_THRESHOLDS) for s in symbols},
+        "best_macro_f1": float(best_macro_f1),
+    }
     with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump({
-            "feature_columns": feature_columns,
-            "feature_version": ENGINEERED_V2,
-            "n_features": n_features,
-            "symbols": symbols,
-            "epochs": epochs,
-            "seq_len": seq_len,
-        }, f, indent=2)
+        json.dump(meta_data, f, indent=2)
     logger.success(f"Metadata saved: {meta_path}")
 
-    # ── Final stats ─────────────────────────────────────────────────
-    # Restore best model from early stopping
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
-        logger.info(f"Restored best model (val_loss={best_val_loss:.4f})")
-
+    # ── Final validation metrics ─────────────────────────────────────
     model.eval()
     with torch.no_grad():
         val_outputs = model(X_val_split)
         _, val_preds = val_outputs.max(1)
         final_acc = (val_preds == y_val_split).sum().item() / len(y_val_split) * 100
 
-        # Per-class metrics
         per_class = []
         f1_scores = []
         for c in range(3):
@@ -291,7 +351,8 @@ def train_lstm(symbols=None, epochs=50, seq_len=60):
             f1_scores.append(f1)
             per_class.append(f"{CLASS_NAMES[c]} P={prec:.2f} R={rec:.2f} F1={f1:.2f}")
         macro_f1 = sum(f1_scores) / 3
-    logger.success(f"Training complete! Val accuracy: {final_acc:.1f}% | Macro F1: {macro_f1:.3f}")
+
+    logger.success(f"Training complete! Val Acc: {final_acc:.1f}% | Macro F1: {macro_f1:.3f}")
     for pc in per_class:
         logger.info(f"  {pc}")
     update_training_progress("lstm", {
@@ -301,10 +362,11 @@ def train_lstm(symbols=None, epochs=50, seq_len=60):
         "epochs_total": epochs,
         "loss": round(avg_loss, 4),
         "accuracy": round(final_acc, 1),
+        "macro_f1": round(macro_f1, 4),
         "completed": True,
     })
 
-    # Compute per-class metrics for scorecard
+    # Build per-class metrics for scorecard
     per_class_metrics = {}
     with torch.no_grad():
         val_outputs_final = model(X_val_split)
@@ -329,20 +391,23 @@ def train_lstm(symbols=None, epochs=50, seq_len=60):
         "val_accuracy": float(final_acc),
         "date": __import__('datetime').datetime.now().isoformat()
     }
-    
-    # Save Candidate locally in Model Registry for autonomous evaluation loop
+
+    # Save candidate in Model Registry
     try:
         from Python.model_registry import ModelRegistry
         import shutil
         reg = ModelRegistry()
         cand_path = reg.save_candidate(model.state_dict(), metrics, model_type="lstm")
-        shutil.copy(scaler_path, os.path.join(cand_path, "lstm_scaler.pkl"))
-        
-        # Immediately Test against Champion to see if Canary Staging is permitted
+        for sym in per_symbol_scalers:
+            shutil.copy(os.path.join(scaler_dir, f"{sym}.pkl"), os.path.join(cand_path, f"lstm_scaler_{sym}.pkl"))
+        shutil.copy(combined_scaler_path, os.path.join(cand_path, "lstm_scaler.pkl"))
+
         if reg.evaluate_and_stage_canary(cand_path):
-            logger.success("Candidate surpassed Champion. Scheduled for live Canary testing tomorrow!")
+            logger.success("Candidate surpassed Champion. Scheduled for live Canary testing!")
+        else:
+            logger.info("Candidate did not pass canary gate — will continue training improvements.")
     except Exception as e:
         logger.error(f"Failed to register candidate model: {e}")
 
 if __name__ == "__main__":
-    train_lstm(epochs=50)
+    train_lstm(epochs=80)

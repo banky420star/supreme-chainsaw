@@ -103,6 +103,11 @@ class RiskEngine:
         self.error_count = 0
         self.halt = False
 
+    def reset_peak_equity(self):
+        """Reset peak equity to current equity (e.g. after cash withdrawal)."""
+        self._peak_equity = max(self._current_equity, 0.01)
+        logger.info(f"RiskEngine: peak equity reset to {self._peak_equity:.2f}")
+
     def record_trade(self):
         self.daily_trades += 1
 

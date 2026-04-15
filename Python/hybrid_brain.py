@@ -340,13 +340,19 @@ class HybridBrain:
                 logger.warning(f"LSTM prediction failed: {e}")
 
         # ── Step 2: Deadzone Gate ──
-        # If LSTM says LOW_VOLATILITY with high confidence, don't trade
+        # If LSTM says LOW_VOLATILITY with high confidence, apply conservative filter
+        # rather than complete block — allow strong signals through but with reduced size
         if lstm_signal == "LOW_VOLATILITY" and lstm_confidence > self.confidence_threshold:
-            result["action"] = "HOLD"
-            result["reason"] = f"deadzone (low_vol conf={lstm_confidence:.2%})"
-            logger.debug(f"{symbol}: DEADZONE — low volatility, holding")
-            self._record_decision(result)
-            return result
+            # Very high confidence LOW_VOL = flat market, still hold
+            if lstm_confidence > 0.98:
+                result["action"] = "HOLD"
+                result["reason"] = f"deadzone (low_vol conf={lstm_confidence:.2%})"
+                logger.debug(f"{symbol}: DEADZONE — low volatility, holding")
+                self._record_decision(result)
+                return result
+            # Moderate LOW_VOL confidence — allow but tag for conservative sizing
+            result["regime_note"] = "low_vol_scalp"
+            logger.debug(f"{symbol}: LOW_VOL scalp mode — reduced sizing")
 
         # ── Step 3: PPO Position Sizing ──
         ppo_action = 0.0
@@ -393,29 +399,44 @@ class HybridBrain:
         # Use bias-corrected action for all downstream steps
         ppo_action = ppo_corrected
 
-        # ── Step 5: Volatility-Scaled Exposure ──
-        # Scale PPO action by volatility regime
-        # Higher volatility → smaller position (risk-adjusted sizing)
-        # Lower volatility → larger position (tighter stops allow bigger size)
+        # ── Step 5: Volatility-Scaled Exposure (Per-Regime Strategy) ──
+        # Each regime has a distinct trading strategy:
+        #   LOW_VOL:  Conservative scalping — tight entries, small size, quick exits
+        #   MED_VOL:  Standard trend-following — normal sizing, standard thresholds
+        #   HIGH_VOL: Breakout/momentum — wide stops, strong conviction required
         from Python.agi_brain import _regime_to_risk_scalar
         vol_scale = _regime_to_risk_scalar(lstm_signal)
         # _regime_to_risk_scalar: HIGH=0.55, MED=0.80, LOW=0.95, unknown=0.75
 
+        # Per-regime action thresholds (minimum PPO conviction to enter)
+        _regime_thresholds = {
+            "LOW_VOLATILITY": 0.005,    # Low vol: still need meaningful signal
+            "MED_VOLATILITY": 0.002,    # Med vol: standard entry threshold
+            "HIGH_VOLATILITY": float(os.environ.get("AGI_HIGH_VOL_MIN_ACTION", "0.01")),  # High vol: strong conviction only
+        }
+        regime_min_action = _regime_thresholds.get(lstm_signal, 0.005)
+
+        # Per-regime trailing strategies (set as metadata for executor)
+        _regime_trailing = {
+            "LOW_VOLATILITY": {"trigger": 1.0, "distance": 1.0},  # Tight trail, quick exit
+            "MED_VOLATILITY": {"trigger": 1.5, "distance": 1.5},  # Standard trail
+            "HIGH_VOLATILITY": {"trigger": 2.0, "distance": 2.5},  # Wide trail, let it run
+        }
+        result["regime_trailing"] = _regime_trailing.get(lstm_signal, _regime_trailing["MED_VOLATILITY"])
+
         result["vol_scale"] = vol_scale
         exposure = ppo_action * vol_scale
 
-        # ── Step 5b: HIGH_VOL Confidence Gate ──
-        # During HIGH_VOLATILITY, require stronger PPO conviction before entering.
-        # This prevents weak-signal entries during volatile conditions where
-        # 3/3 recent losses occurred with tiny PPO actions (<0.006).
-        high_vol_min_action = float(os.environ.get("AGI_HIGH_VOL_MIN_ACTION", "0.01"))
-        if lstm_signal == "HIGH_VOLATILITY" and abs(ppo_action) < high_vol_min_action:
+        # ── Step 5b: Per-Regime Confidence Gate ──
+        # Each regime requires minimum PPO conviction scaled to its risk profile
+        if abs(ppo_action) < regime_min_action:
             result["action"] = "HOLD"
             result["exposure"] = 0.0
-            result["reason"] = f"high_vol_gate (ppo={ppo_action:.4f} < {high_vol_min_action})"
+            gate_name = "high_vol_gate" if lstm_signal == "HIGH_VOLATILITY" else "low_vol_gate" if lstm_signal == "LOW_VOLATILITY" else "med_vol_gate"
+            result["reason"] = f"{gate_name} (ppo={ppo_action:.4f} < {regime_min_action})"
             logger.info(
-                f"[HybridBrain] {symbol}: HOLD (HIGH_VOL gate) | "
-                f"ppo={ppo_action:.4f} < {high_vol_min_action}"
+                f"[HybridBrain] {symbol}: HOLD ({gate_name}) | "
+                f"regime={lstm_signal} ppo={ppo_action:.4f} < {regime_min_action}"
             )
             self._record_decision(result)
             return result

@@ -9,6 +9,7 @@ export default function DashboardScreen({ data, selectedSymbol }) {
   const positions = account.positions || [];
   const training = data?.training || {};
   const review = data?.tradeReview || {};
+  const economicCalendar = data?.economicCalendar || [];
   const incidents = data?.incidents || [];
   const timeline = data?.timeline || [];
   const equityHistory = data?._history?.equity || [];
@@ -39,7 +40,7 @@ export default function DashboardScreen({ data, selectedSymbol }) {
           </div>
           <div>
             <div className="secondary-label">Realized Today</div>
-            <div className="secondary-value text-pass">{money(account.realizedToday)}</div>
+            <div className={`secondary-value ${account.realizedToday >= 0 ? "text-pass" : "text-fail"}`}>{money(account.realizedToday)}</div>
           </div>
           <div>
             <div className="secondary-label">Positions</div>
@@ -189,6 +190,36 @@ export default function DashboardScreen({ data, selectedSymbol }) {
           <Panel title="Incidents" subtitle="Recent activity and warnings" icon={Zap}>
             <EventList items={incidents} empty="No active incidents." />
           </Panel>
+
+          {/* Economic Calendar Preview */}
+          {economicCalendar.length > 0 && (
+            <Panel title="Upcoming Events" subtitle="High-impact market events" icon={Calendar}>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {economicCalendar.filter(e => e.importance >= 2).slice(0, 4).map((event, i) => {
+                  const formattedTime = event.time
+                    ? new Date(event.time).toLocaleDateString([], { month: "short", day: "numeric" }) + " " + new Date(event.time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+                    : "";
+                  return (
+                    <div key={i} style={{
+                      display: "flex", alignItems: "center", justifyContent: "space-between",
+                      padding: "8px 12px", borderRadius: 8, border: "1px solid rgba(255,123,143,0.1)",
+                      background: "rgba(255,255,255,0.02)",
+                    }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <span style={{ fontFamily: "var(--mono)", fontSize: "0.7rem", fontWeight: 700, color: "var(--text-muted)", width: 30 }}>
+                          {event.currency || "?"}
+                        </span>
+                        <span style={{ fontSize: "0.85rem", fontWeight: 500 }}>{event.name}</span>
+                      </div>
+                      <span style={{ fontFamily: "var(--mono)", fontSize: "0.72rem", color: "var(--text-muted)" }}>
+                        {formattedTime}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </Panel>
+          )}
         </div>
       </div>
     </div>

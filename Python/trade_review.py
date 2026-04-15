@@ -205,6 +205,7 @@ def annotate_trade(trade: dict, decision: dict | None) -> list[str]:
         swap = trade.get("swap", 0)
         gross = profit - commission - swap
         hold_min = trade.get("hold_minutes")
+        sl_distance = trade.get("sl_distance", 0)  # Set by executor: entry - SL
         if profit > 0:
             # SL hit but trade was in profit — trailing stop locked gains
             tags.append("sl_in_profit")
@@ -216,6 +217,13 @@ def annotate_trade(trade: dict, decision: dict | None) -> list[str]:
             tags.append(TAG_SPREAD_WIDENED)
         elif hold_min is not None and hold_min < 15:
             # SL hit very quickly — likely a bad entry signal
+            tags.append(TAG_SIGNAL_WRONG)
+        elif sl_distance > 0 and sl_distance < 100:
+            # SL distance was very small (for crypto < $100, for FX < 0.001)
+            # This indicates the SL was placed too close to entry
+            tags.append(TAG_SL_TOO_TIGHT)
+        elif profit < 0:
+            # SL hit at loss with reasonable distance — market moved against us
             tags.append(TAG_SIGNAL_WRONG)
         else:
             tags.append(TAG_SL_TOO_TIGHT)
@@ -250,9 +258,17 @@ def annotate_trade(trade: dict, decision: dict | None) -> list[str]:
         if trade["profit"] < 0 and abs(ppo_action) < 0.01:
             tags.append(TAG_SIGNAL_WRONG)
 
-        # Tag if high_vol_gate was active (trade bypassed it)
-        if "high_vol_gate" in reason:
-            tags.append("bypassed_high_vol_gate")
+        # Tag if trade executed during HIGH_VOL regime (gate was in play)
+        # A trade that passed the gate legitimately has ppo_action >= threshold
+        # A bypass means the trade happened in HIGH_VOL but shouldn't have
+        _high_vol_min = float(os.environ.get("AGI_HIGH_VOL_MIN_ACTION", "0.01"))
+        if regime == "HIGH_VOLATILITY" and action != "HOLD":
+            if abs(ppo_action) < _high_vol_min:
+                # PPO action was below gate threshold but trade still executed — true bypass
+                tags.append("bypassed_high_vol_gate")
+            else:
+                # Trade legitimately passed the gate in HIGH_VOL regime
+                tags.append("high_vol_entry_passed_gate")
 
     # If no decision matched, flag as unknown
     if decision is None:

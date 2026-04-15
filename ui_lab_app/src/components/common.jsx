@@ -13,7 +13,7 @@ export function money(value) {
 
 export function dollars(value) {
   const n = Number(value || 0);
-  return `$${Math.abs(n).toFixed(2)}`;
+  return `${n < 0 ? "-" : ""}$${Math.abs(n).toFixed(2)}`;
 }
 
 export function shortDuration(seconds) {

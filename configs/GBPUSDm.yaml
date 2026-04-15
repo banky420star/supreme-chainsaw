@@ -1,66 +1,58 @@
-# Per-symbol configuration for GBPUSDm
-# GBP/USD has higher volatility than EUR/USD with wider spreads.
-
-symbol: GBPUSDm
 asset_class: forex
-timeframe: M5
-
+canary_policy:
+  max_drawdown: 0.1
+  min_realized_pnl: 0.0
+  min_runtime_minutes: 45
+  min_trades: 30
 data:
-  period: 60d
   interval: 5m
   min_rows: 1000
-
-lstm:
-  seq_len: 60
-  epochs: 50
-  batch_size: 64
-  learning_rate: 0.001
-  lr_scheduler: ReduceLROnPlateau
-  lr_patience: 3
-  lr_factor: 0.5
-  early_stopping_patience: 7
-  dropout: 0.3
-  hidden_size: 128
-  num_layers: 3
-  class_weights: auto
-  volatility_thresholds:
-    low: 0.0006           # GBP tends to be more volatile
-    high: 0.0018
-
+  period: 60d
 drl:
-  total_timesteps: 100000
-  n_envs: 4
-  learning_rate: 1e-4
-  n_steps: 4096
   batch_size: 512
-  n_epochs: 10
-  gamma: 0.995
-  gae_lambda: 0.95
   clip_range: 0.2
   ent_coef: 0.005
-  target_kl: 0.01
-  use_sde: true
-  sde_sample_freq: 4
-  initial_balance: 10000.0
   feature_version: engineered_v2
+  gae_lambda: 0.95
+  gamma: 0.995
+  initial_balance: 10000.0
+  learning_rate: 1e-4
   lstm_feature_extractor:
     features_dim: 256
-    window_size: 100
-    portfolio_feature_count: 3
     lstm_hidden: 128
     lstm_layers: 2
-
+    portfolio_feature_count: 3
+    window_size: 100
+  n_envs: 4
+  n_epochs: 10
+  n_steps: 4096
+  sde_sample_freq: 4
+  target_kl: 0.01
+  total_timesteps: 100000
+  use_sde: true
+lstm:
+  batch_size: 64
+  class_weights: auto
+  dropout: 0.3
+  early_stopping_patience: 7
+  epochs: 50
+  hidden_size: 128
+  learning_rate: 0.001
+  lr_factor: 0.5
+  lr_patience: 3
+  lr_scheduler: ReduceLROnPlateau
+  num_layers: 3
+  seq_len: 60
+  volatility_thresholds:
+    high: 0.0018
+    low: 0.0006
 risk:
-  max_lots: 0.5
-  max_positions_per_symbol: 5
   max_drawdown_pct: 5.0
+  max_lots: 0.5
+  max_positions_per_symbol: 99
   sl_atr_mult: 2.0
   tp_atr_mult: 3.0
-  trailing_trigger_atr: 1.5
   trailing_distance_atr: 1.0
-
-canary_policy:
-  min_trades: 30
-  min_realized_pnl: 0.0
-  max_drawdown: 0.10
-  min_runtime_minutes: 45
+  trailing_trigger_atr: 1.5
+symbol: GBPUSDm
+timeframe: M5

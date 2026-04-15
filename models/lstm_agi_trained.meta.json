@@ -23,8 +23,28 @@
   "symbols": [
     "EURUSDm",
     "GBPUSDm",
-    "XAUUSDm"
+    "XAUUSDm",
+    "BTCUSDm"
   ],
-  "epochs": 50,
-  "seq_len": 60
+  "epochs": 80,
+  "seq_len": 60,
+  "per_symbol_thresholds": {
+    "EURUSDm": [
+      0.0003,
+      0.0008
+    ],
+    "GBPUSDm": [
+      0.0004,
+      0.001
+    ],
+    "XAUUSDm": [
+      0.0015,
+      0.004
+    ],
+    "BTCUSDm": [
+      0.005,
+      0.015
+    ]
+  },
+  "best_macro_f1": 0.5166418628690314
 }

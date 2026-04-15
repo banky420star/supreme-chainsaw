@@ -1,4 +1,4 @@
-import sys, os
+import sys, os, argparse
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from training.progress_writer import update_training_progress
@@ -21,7 +21,8 @@ from drl.lstm_feature_extractor import LSTMFeatureExtractor
 from analysis.gradient_flow_analyzer import LSTMGradientDiagnostics
 
 # Local log path for Windows/Mac compatibility
-LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOG_DIR = os.path.join(ROOT_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 logger.add(os.path.join(LOG_DIR, "ppo_training.log"), rotation="10 MB", level="INFO")
 
@@ -45,16 +46,17 @@ class EvalCallbackSaveVec(EvalCallback):
             if self.vec_env is not None and self.vec_save_path:
                 os.makedirs(os.path.dirname(self.vec_save_path), exist_ok=True)
                 self.vec_env.save(self.vec_save_path)
-                logger.success(f"✅ Saved VecNormalize with new best model → {self.vec_save_path}")
+                logger.success(f"Saved VecNormalize with new best model -> {self.vec_save_path}")
 
         return cont
 
 
 class ProgressWriterCallback:
     """Write PPO training progress for API consumption."""
-    def __init__(self, total_timesteps, symbols, interval=5000):
+    def __init__(self, total_timesteps, symbols, interval=5000, symbol_key=None):
         self.total_ts = total_timesteps
         self.symbols = symbols
+        self.symbol_key = symbol_key  # per-symbol key for separate progress files
         self.interval = interval
         self.num_timesteps = 0
 
@@ -66,92 +68,172 @@ class ProgressWriterCallback:
                 "current_timesteps": self.num_timesteps,
                 "total_timesteps": self.total_ts,
                 "progress_pct": round(self.num_timesteps / max(self.total_ts, 1) * 100, 1),
-            })
+            }, symbol=self.symbol_key)
         return True
 
 
-def make_env(df, seed: int = 0):
+def make_env(df, seed: int = 0, initial_balance: float = 10000.0,
+             feature_version: str = "engineered_v2"):
     def _init():
         set_random_seed(seed)
-        
+
         # Ensure TradingEnv gets a clean dataframe with proper index
         if isinstance(df, pl.DataFrame):
             pdf = df.to_pandas()
             if "time" in pdf.columns:
                 pdf["time"] = pd.to_datetime(pdf["time"])
                 pdf = pdf.sort_values("time").set_index("time")
-            env = TradingEnv(pdf, initial_balance=10000.0, feature_version="engineered_v2")
+            env = TradingEnv(pdf, initial_balance=initial_balance, feature_version=feature_version)
         else:
-            env = TradingEnv(df, initial_balance=10000.0, feature_version="engineered_v2")
-            
+            env = TradingEnv(df, initial_balance=initial_balance, feature_version=feature_version)
+
         env = Monitor(env)
         return env
     return _init
 
 def linear_schedule(initial_value: float):
+    iv = float(initial_value)  # YAML may return "1e-4" as string
     def func(progress_remaining: float) -> float:
-        return progress_remaining * initial_value
+        return progress_remaining * iv
     return func
 
-def train_drl():
-    with open("config.yaml") as f:
+
+def _load_symbol_config(symbol: str) -> dict:
+    """Load per-symbol config from configs/{symbol}.yaml, falling back to defaults."""
+    config_path = os.path.join(ROOT_DIR, "configs", f"{symbol}.yaml")
+    if os.path.exists(config_path):
+        with open(config_path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    logger.warning(f"No config found at {config_path}, using defaults")
+    return {}
+
+
+def train_drl(symbol: str | None = None):
+    """
+    Train a PPO model.
+
+    If symbol is provided, trains a per-symbol model using that symbol's config
+    and saves to the per-symbol registry. Otherwise trains on all symbols from
+    config.yaml and saves to the global registry.
+    """
+    # Load global config
+    with open(os.path.join(ROOT_DIR, "config.yaml")) as f:
         cfg = yaml.safe_load(f)
-    symbols = cfg.get("trading", {}).get("symbols", ["EURUSD"])
-    total_timesteps = cfg.get("drl", {}).get("total_timesteps", 100_000)
-    
-    logger.info(f"DRL Training (Joint LSTM-PPO 2026) — symbols: {symbols} | timesteps: {total_timesteps:,}")
 
-    df_pd = get_combined_training_df(symbols, period="60d")
-    if df_pd.empty:
-        logger.error("No valid training data found.")
-        return
-        
-    # ---- sanitize pandas frame for polars (belt and suspenders) ----
-    if isinstance(df_pd, pd.Series):
-        df_pd = df_pd.to_frame()
+    if symbol:
+        # -- Per-symbol training mode --
+        logger.info(f"Per-symbol DRL training for {symbol}")
+        sym_cfg = _load_symbol_config(symbol)
+        symbols = [symbol]
+        drl_cfg = sym_cfg.get("drl", {})
+        total_timesteps = drl_cfg.get("total_timesteps", cfg.get("drl", {}).get("total_timesteps", 100_000))
 
-    # Flatten MultiIndex columns (common with yfinance)
-    if isinstance(df_pd.columns, pd.MultiIndex):
-        df_pd.columns = [
-            "_".join([str(x) for x in col if x is not None and str(x) != ""])
-            for col in df_pd.columns.to_list()
-        ]
+        # Allow env var override for timesteps (used by start_individual_training.ps1)
+        env_ts = os.environ.get("AGI_DRL_TIMESTEPS")
+        if env_ts:
+            total_timesteps = int(env_ts)
+        data_cfg = sym_cfg.get("data", {})
+        period = data_cfg.get("period", "60d")
+        interval = data_cfg.get("interval", "5m")
 
-    # Force string column names
-    df_pd.columns = [str(c) for c in df_pd.columns]
+        # Build per-symbol training data
+        df_pd = fetch_training_data(symbol, period=period, interval=interval)
+        if df_pd is None or df_pd.empty:
+            logger.error(f"No valid training data found for {symbol}.")
+            return
+        if len(df_pd) < 1000:
+            logger.error(f"Insufficient data for {symbol}: {len(df_pd)} rows (need 1000+)")
+            return
 
-    # Drop duplicate columns (Polars hates them)
-    if df_pd.columns.duplicated().any():
-        df_pd = df_pd.loc[:, ~df_pd.columns.duplicated(keep="last")]
+        # Sanitize pandas frame for polars
+        if isinstance(df_pd, pd.Series):
+            df_pd = df_pd.to_frame()
+        if isinstance(df_pd.columns, pd.MultiIndex):
+            df_pd.columns = [
+                "_".join([str(x) for x in col if x is not None and str(x) != ""])
+                for col in df_pd.columns.to_list()
+            ]
+        df_pd.columns = [str(c) for c in df_pd.columns]
+        if df_pd.columns.duplicated().any():
+            df_pd = df_pd.loc[:, ~df_pd.columns.duplicated(keep="last")]
+        if df_pd.index.duplicated().any():
+            df_pd = df_pd.loc[~df_pd.index.duplicated(keep="last")].sort_index()
+        if not isinstance(df_pd.index, pd.RangeIndex):
+            df_pd = df_pd.reset_index(drop=True)
+        if df_pd.isna().any().any():
+            logger.warning("NaNs detected in training data. Cleaning via ffill/bfill.")
+            df_pd = df_pd.ffill().bfill()
 
-    # Drop duplicate index values + sort (Polars also hates non-unique index)
-    df_pd = df_pd.loc[~df_pd.index.duplicated(keep="last")].sort_index()
-    # Resetting index to drop the non-unique timestamp column from polars conversion
-    df_pd = df_pd.reset_index(drop=True)
-    
-    # ── NaN Defense ──
-    if df_pd.isna().any().any():
-        logger.warning("⚠️ NaNs detected in historical data. Cleaning via ffill/bfill.")
-        df_pd = df_pd.ffill().bfill()
-        assert not df_pd.isna().any().any(), "❌ CRITICAL: Failed to clean all NaNs in training data"
-    # ---------------------------------------------------------------
-    
+    else:
+        # -- Legacy joint training mode (all symbols) --
+        symbols = cfg.get("trading", {}).get("symbols", ["EURUSD"])
+        total_timesteps = cfg.get("drl", {}).get("total_timesteps", 100_000)
+
+        df_pd = get_combined_training_df(symbols, period="60d")
+        if df_pd.empty:
+            logger.error("No valid training data found.")
+            return
+
+        # Sanitize pandas frame for polars
+        if isinstance(df_pd, pd.Series):
+            df_pd = df_pd.to_frame()
+        if isinstance(df_pd.columns, pd.MultiIndex):
+            df_pd.columns = [
+                "_".join([str(x) for x in col if x is not None and str(x) != ""])
+                for col in df_pd.columns.to_list()
+            ]
+        df_pd.columns = [str(c) for c in df_pd.columns]
+        if df_pd.columns.duplicated().any():
+            df_pd = df_pd.loc[:, ~df_pd.columns.duplicated(keep="last")]
+        df_pd = df_pd.loc[~df_pd.index.duplicated(keep="last")].sort_index()
+        df_pd = df_pd.reset_index(drop=True)
+
+        if df_pd.isna().any().any():
+            logger.warning("NaNs detected in historical data. Cleaning via ffill/bfill.")
+            df_pd = df_pd.ffill().bfill()
+            assert not df_pd.isna().any().any(), "Failed to clean all NaNs in training data"
+
+        # Use global config for hyperparams in joint mode
+        drl_cfg = cfg.get("drl", {})
+
+    logger.info(f"DRL Training (LSTM-PPO) -- symbols: {symbols} | timesteps: {total_timesteps:,}")
+
     df = pl.from_pandas(df_pd)
-    
-    # We remove the disjoint "easy mask" logic because it shreds time-series continuity
-    # and causes exactly 12-step truncation episodes! We train on the full continuous series.
-    n_envs = 4
-    
-    # ── Stage 1: Continuous Full Training ──
-    env = DummyVecEnv([make_env(df, i) for i in range(n_envs)])
+
+    # -- Extract per-symbol DRL hyperparameters --
+    n_envs = drl_cfg.get("n_envs", 4)
+    learning_rate_val = drl_cfg.get("learning_rate", 1e-4)
+    n_steps = drl_cfg.get("n_steps", 4096)
+    batch_size = drl_cfg.get("batch_size", 512)
+    n_epochs = drl_cfg.get("n_epochs", 10)
+    gamma = drl_cfg.get("gamma", 0.995)
+    gae_lambda = drl_cfg.get("gae_lambda", 0.95)
+    clip_range = drl_cfg.get("clip_range", 0.2)
+    ent_coef = drl_cfg.get("ent_coef", 0.005)
+    target_kl = drl_cfg.get("target_kl", 0.01)
+    use_sde = drl_cfg.get("use_sde", True)
+    sde_sample_freq = drl_cfg.get("sde_sample_freq", 4)
+    initial_balance = drl_cfg.get("initial_balance", 10000.0)
+    feature_version = drl_cfg.get("feature_version", "engineered_v2")
+
+    # LSTM feature extractor config
+    lstm_cfg = drl_cfg.get("lstm_feature_extractor", {})
+    features_dim = lstm_cfg.get("features_dim", 256)
+    window_size = lstm_cfg.get("window_size", 100)
+    portfolio_feature_count = lstm_cfg.get("portfolio_feature_count", 3)
+    lstm_hidden = lstm_cfg.get("lstm_hidden", 128)
+    lstm_layers = lstm_cfg.get("lstm_layers", 2)
+
+    # -- Stage 1: Continuous Full Training --
+    env = DummyVecEnv([make_env(df, i, initial_balance=initial_balance, feature_version=feature_version) for i in range(n_envs)])
     env = VecMonitor(env)
     env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.0)
-    
+
     # Eval must use the exact same logic but without reward normalization
-    eval_env = DummyVecEnv([make_env(df, 99)])
+    eval_env = DummyVecEnv([make_env(df, 99, initial_balance=initial_balance, feature_version=feature_version)])
     eval_env = VecMonitor(eval_env)
     eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, clip_obs=10.0)
-    
+
     # Critical: Lock eval Normalization to training Normalization stats
     eval_env.obs_rms = env.obs_rms
     eval_env.training = False
@@ -161,43 +243,48 @@ def train_drl():
     policy_kwargs = dict(
         features_extractor_class=LSTMFeatureExtractor,
         features_extractor_kwargs=dict(
-            features_dim=256,
-            window_size=100,
-            portfolio_feature_count=3,
-            lstm_hidden=128,
-            lstm_layers=2,
+            features_dim=features_dim,
+            window_size=window_size,
+            portfolio_feature_count=portfolio_feature_count,
+            lstm_hidden=lstm_hidden,
+            lstm_layers=lstm_layers,
         ),
         net_arch=[256, 128],
         activation_fn=torch.nn.ReLU
     )
-    
+
+    device_str = 'cuda' if torch.cuda.is_available() else ('mps' if getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available() else 'cpu')
+
     model = PPO(
         "MlpPolicy",
         env,
         policy_kwargs=policy_kwargs,
-        learning_rate=linear_schedule(1e-4), # Lowered 3x for stability
-        n_steps=4096,                        # Increased steps per rollout
-        batch_size=512,                      # Larger batch for smoother gradients
-        n_epochs=10,
-        gamma=0.995,                         # Longer horizon discounting
-        gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=0.005,
+        learning_rate=linear_schedule(learning_rate_val),
+        n_steps=n_steps,
+        batch_size=batch_size,
+        n_epochs=n_epochs,
+        gamma=gamma,
+        gae_lambda=gae_lambda,
+        clip_range=clip_range,
+        ent_coef=ent_coef,
         vf_coef=0.5,
         max_grad_norm=0.5,
-        target_kl=0.01,                      # ADDED target_kl to prevent policy collapse
-        use_sde=True,
-        sde_sample_freq=4,
-        tensorboard_log=os.path.join(LOG_DIR, "drl_joint"),
-        device='cuda' if torch.cuda.is_available() else ('mps' if getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available() else 'cpu'),
+        target_kl=target_kl,
+        use_sde=use_sde,
+        sde_sample_freq=sde_sample_freq,
+        tensorboard_log=os.path.join(LOG_DIR, f"drl_{symbol}" if symbol else "drl_joint"),
+        device=device_str,
         verbose=1,
     )
-    
-    # Eval callback setup
-    best_dir = os.path.join("models", "best_eval_models")
+
+    # Eval callback setup -- use per-symbol directory when training per-symbol
+    if symbol:
+        best_dir = os.path.join(ROOT_DIR, "models", "best_eval_models", symbol)
+    else:
+        best_dir = os.path.join(ROOT_DIR, "models", "best_eval_models")
     os.makedirs(best_dir, exist_ok=True)
     best_vec_path = os.path.join(best_dir, "vec_normalize.pkl")
-    
+
     eval_callback = EvalCallbackSaveVec(
         eval_env=eval_env,
         best_model_save_path=best_dir,
@@ -208,12 +295,12 @@ def train_drl():
         vec_env=env,
         vec_save_path=best_vec_path
     )
-    
+
     grad_callback = LSTMGradientDiagnostics()
-    
-    # ── Train ──
-    logger.info("Starting Stable Training Protocol (Single Stage)")
-    progress_cb = ProgressWriterCallback(total_timesteps, symbols)
+
+    # -- Train --
+    logger.info(f"Starting Training Protocol (Per-Symbol: {symbol})" if symbol else "Starting Training Protocol (Joint)")
+    progress_cb = ProgressWriterCallback(total_timesteps, symbols, symbol_key=symbol)
 
     from stable_baselines3.common.callbacks import BaseCallback as _SB3Base
     class _SB3ProgressBridge(_SB3Base):
@@ -236,56 +323,81 @@ def train_drl():
         "total_timesteps": total_timesteps,
         "progress_pct": 100.0,
         "completed": True,
-    })
+    }, symbol=symbol)
 
     # Save into registry as candidate using EXACTLY the best evaluation model
     logger.info("Building new PPO candidate via ModelRegistry using best_model.zip...")
     try:
         from Python.model_registry import ModelRegistry
         registry = ModelRegistry()
-        
+
         import datetime, json
         src_model = os.path.join(best_dir, "best_model.zip")
         src_vec   = os.path.join(best_dir, "vec_normalize.pkl")
-        
+
         if not os.path.exists(src_model) or not os.path.exists(src_vec):
             logger.error("Could not find best_model.zip or vec_normalize.pkl. Did training actually step?")
             return
 
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        candidate_path = os.path.join(registry.candidates_dir, timestamp)
-        os.makedirs(candidate_path, exist_ok=True)
-        
+        # For per-symbol: save to per_symbol/{SYMBOL}/candidates/
+        # For joint: save to global candidates/
+        if symbol:
+            candidate_path = registry.new_symbol_candidate_dir(symbol, tag="ppo")
+        else:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            candidate_path = os.path.join(registry.candidates_dir, f"ppo_{timestamp}")
+            os.makedirs(candidate_path, exist_ok=True)
+
         # Copy the cleanly evaluated BEST models
         shutil.copy2(src_model, os.path.join(candidate_path, "ppo_trading.zip"))
         shutil.copy2(src_vec, os.path.join(candidate_path, "vec_normalize.pkl"))
-        
+
         # Stage Metadata
         metrics = {
             "type": "ppo",
             "symbols": symbols,
             "timesteps": total_timesteps,
             "source": "EvalCallback best_model.zip + matching VecNormalize",
-            "loss": 0.0, 
-            "win_rate": 0.0, 
-            "date": datetime.datetime.now().isoformat()
+            "loss": 0.0,
+            "win_rate": 0.0,
+            "date": datetime.datetime.now().isoformat(),
         }
-        
+        if symbol:
+            metrics["symbol"] = symbol
+
         with open(os.path.join(candidate_path, "scorecard.json"), "w") as f:
             json.dump(metrics, f, indent=4)
 
-        logger.success(f"✅ Optimal Joint LSTM-PPO Candidate staged to: {candidate_path}")
+        logger.success(f"Optimal LSTM-PPO Candidate staged to: {candidate_path}")
 
         # Register with the model registry and stage as canary for live evaluation
         registry.register_candidate(candidate_path, metrics)
-        promoted = registry.evaluate_and_stage_canary(candidate_path)
-        if promoted:
-            logger.success(f"PPO candidate auto-staged as canary — will be evaluated for champion promotion")
+
+        if symbol:
+            # Stage per-symbol canary directly
+            try:
+                registry.set_canary(candidate_path, symbol=symbol)
+                logger.success(f"Per-symbol PPO candidate auto-staged as canary for {symbol}")
+            except RuntimeError as e:
+                # Symbol mismatch -- the artifact's symbols must match
+                logger.warning(f"Per-symbol canary staging skipped: {e}")
         else:
-            logger.warning(f"PPO candidate saved but did not pass canary gate")
+            promoted = registry.evaluate_and_stage_canary(candidate_path)
+            if promoted:
+                logger.success(f"PPO candidate auto-staged as canary -- will be evaluated for champion promotion")
+            else:
+                logger.warning(f"PPO candidate saved but did not pass canary gate")
 
     except Exception as e:
         logger.error(f"Failed to register PPO candidate model: {e}")
 
 if __name__ == "__main__":
-    train_drl()
+    parser = argparse.ArgumentParser(description="Train DRL (PPO) model")
+    parser.add_argument("--symbol", type=str, default=None,
+                        help="Train per-symbol model (uses configs/{symbol}.yaml)")
+    args = parser.parse_args()
+
+    # Support env var override from start_individual_training.ps1
+    symbol = args.symbol or os.environ.get("AGI_DRL_SYMBOL")
+
+    train_drl(symbol=symbol)

@@ -128,6 +128,42 @@ export default function TrainingScreen({ data, selectedSymbol }) {
         </Panel>
       </div>
 
+      {/* Per-Symbol PPO Training */}
+      {Object.keys(ppo.perSymbol || {}).length > 0 && (
+        <Panel title="Per-Symbol PPO Training" subtitle="Individual model training lanes" icon={Activity}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {Object.entries(ppo.perSymbol).map(([sym, info]) => {
+              const pct = Number(info.progress_pct || 0);
+              const isRunning = info.running;
+              const isDone = info.completed;
+              return (
+                <div key={sym} style={{
+                  padding: 16, borderRadius: 12, border: `1px solid ${isRunning ? "rgba(90,215,255,0.15)" : isDone ? "rgba(57,217,138,0.15)" : "rgba(255,255,255,0.05)"}`,
+                  background: "rgba(255,255,255,0.02)",
+                }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                      <span style={{ fontWeight: 700, fontSize: "1.05rem" }}>{sym}</span>
+                      <span className={`lane-chip ${isRunning ? "tone-pass" : isDone ? "" : ""}`} style={{ textTransform: "uppercase", fontSize: "0.68rem" }}>
+                        {isRunning ? "TRAINING" : isDone ? "COMPLETED" : "STOPPED"}
+                      </span>
+                    </div>
+                    <span style={{ fontFamily: "var(--mono)", fontSize: "1.1rem", fontWeight: 700, color: isDone ? "var(--accent-green)" : "var(--accent-cyan)" }}>
+                      {pct.toFixed(1)}%
+                    </span>
+                  </div>
+                  <ProgressBar
+                    value={pct / 100}
+                    tone={pct > 70 ? "pass" : ""}
+                    meta={`${(info.current_timesteps || 0).toLocaleString()} / ${(info.total_timesteps || 0).toLocaleString()} ts`}
+                  />
+                </div>
+              );
+            })}
+          </div>
+        </Panel>
+      )}
+
       {/* PPO Diagnostics */}
       {data?.ppoDiagnostics?.last_actions && (
         <Panel title="PPO Diagnostics" subtitle="Last model actions per symbol" icon={Activity}>

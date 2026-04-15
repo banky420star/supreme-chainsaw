@@ -80,18 +80,50 @@ _CACHE_MAX = 50                  # decisions per symbol
 
 
 # ---------------------------------------------------------------------------
-# CORS middleware (allow React dev server on any port)
+# CORS middleware (restrict to localhost + localtunnel for security)
 # ---------------------------------------------------------------------------
+_CORS_ALLOWED_ORIGINS = [
+    "http://localhost:4180",
+    "http://127.0.0.1:4180",
+    "https://moneyprinter.loca.lt",
+]
+
 @app.hook("after_request")
 def _cors():
-    response.headers["Access-Control-Allow-Origin"] = "*"
+    origin = request.get_header("Origin", "")
+    if origin in _CORS_ALLOWED_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"] = origin
+    else:
+        response.headers["Access-Control-Allow-Origin"] = "http://localhost:4180"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Vary"] = "Origin"
 
 
 @app.route("<path:path>", method="OPTIONS")
 def _options(path):
     return {}
+
+
+# ---------------------------------------------------------------------------
+# Telegram Mini App — serve the HTML page
+# ---------------------------------------------------------------------------
+_MINI_APP_HTML = None
+
+@app.route("/mini", method=["GET", "POST"])
+def api_mini_app():
+    """Serve the Telegram Mini App HTML page."""
+    global _MINI_APP_HTML
+    if _MINI_APP_HTML is None:
+        mini_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                 "tools", "ui_assets", "telegram_mini_app.html")
+        try:
+            with open(mini_path, "r", encoding="utf-8") as f:
+                _MINI_APP_HTML = f.read()
+        except Exception:
+            _MINI_APP_HTML = "<html><body><h1>Mini App not found</h1></body></html>"
+    response.content_type = "text/html; charset=utf-8"
+    return _MINI_APP_HTML
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +261,7 @@ def _get_mt5_account_and_positions() -> dict:
 
 
 def _read_training_progress():
-    """Read per-trainer progress files."""
+    """Read per-trainer progress files, including per-symbol PPO files."""
     result = {}
     for key in ("lstm", "ppo", "dreamer"):
         path = os.path.join(ROOT, "logs", f"{key}_progress.json")
@@ -243,6 +275,27 @@ def _read_training_progress():
         except Exception:
             pass
         result[key] = {}
+
+    # Merge per-symbol PPO progress files (ppo_{SYMBOL}_progress.json)
+    ppo_per_symbol = {}
+    for fname in os.listdir(os.path.join(ROOT, "logs")) if os.path.isdir(os.path.join(ROOT, "logs")) else []:
+        if fname.startswith("ppo_") and fname.endswith("_progress.json") and fname != "ppo_progress.json":
+            sym = fname[4:-len("_progress.json")]
+            path = os.path.join(ROOT, "logs", fname)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if time.time() - data.get("updated_at", 0) < 600:
+                    ppo_per_symbol[sym] = data
+            except Exception:
+                pass
+    if ppo_per_symbol:
+        # Use the most recently updated per-symbol file as the primary PPO progress
+        latest_sym = max(ppo_per_symbol, key=lambda s: ppo_per_symbol[s].get("updated_at", 0))
+        if ppo_per_symbol[latest_sym].get("running"):
+            result["ppo"] = ppo_per_symbol[latest_sym]
+        result["ppo_per_symbol"] = ppo_per_symbol
+
     return result
 
 
@@ -429,6 +482,7 @@ def api_status():
             "symbol_lane_rows": lane_rows,
             "pipeline_summary": pipeline_summary,
             "lane_summary": lane_summary,
+            "ppo_per_symbol": progress.get("ppo_per_symbol", {}),
         },
         "canary_gate": {
             "ready": bool(canary_id),
@@ -697,17 +751,25 @@ def api_lstm_explanations():
     """Return the last LSTM decision per symbol with top_indicators attribution."""
     results = {}
 
-    for sym, dq in _decision_cache.items():
-        # Find the most recent decision that has top_indicators
-        for d in dq:
-            if "top_indicators" in d:
-                results[sym] = {
-                    "regime": d.get("volatility") or d.get("regime", "UNKNOWN"),
-                    "confidence": d.get("confidence", 0.0),
-                    "top_indicators": d.get("top_indicators", []),
-                    "cached_at": d.get("_cached_at"),
-                }
-                break
+    try:
+        for sym, dq in _decision_cache.items():
+            try:
+                # Find the most recent decision that has top_indicators
+                for d in dq:
+                    if not isinstance(d, dict):
+                        continue
+                    if "top_indicators" in d:
+                        results[sym] = {
+                            "regime": d.get("volatility") or d.get("regime", "UNKNOWN"),
+                            "confidence": d.get("confidence", 0.0),
+                            "top_indicators": d.get("top_indicators", []),
+                            "cached_at": d.get("_cached_at"),
+                        }
+                        break
+            except Exception:
+                continue
+    except Exception:
+        pass
 
     if not results:
         # If no decisions have been cached yet, return empty with explanation
@@ -994,6 +1056,12 @@ def api_control():
             except Exception as e:
                 return _json({"ok": False, "action": action, "error": str(e)}, 500)
         return _json({"ok": True, "action": action, "message": "No active training cycle."})
+
+    if action == "reset_peak_equity":
+        if srv and hasattr(srv, "risk"):
+            srv.risk.reset_peak_equity()
+            return _json({"ok": True, "action": action, "message": f"Peak equity reset to {srv.risk._peak_equity:.2f}"})
+        return _json({"ok": False, "action": action, "error": "No risk engine available"}, 500)
 
     if action == "start_training_cycle":
         if srv and hasattr(srv, "autonomy") and srv.autonomy:

@@ -564,6 +564,7 @@ a { color: var(--accent-cyan); text-decoration: none; }
 
 .lane-chip.tone-pass { color: var(--accent-green); border-color: rgba(57,217,138,0.2); }
 .lane-chip.tone-warn { color: var(--accent-amber); border-color: rgba(243,187,74,0.2); }
+.lane-chip.tone-fail { color: var(--accent-red); border-color: rgba(255,123,143,0.2); }
 
 .lane-reason {
   margin-top: 12px;
