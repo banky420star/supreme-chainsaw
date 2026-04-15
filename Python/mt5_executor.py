@@ -83,6 +83,18 @@ class MT5Executor:
             except Exception:
                 pass
 
+    @staticmethod
+    def _pip_value_per_lot(symbol: str) -> float:
+        """Approximate dollar value per 0.01 lot for SL distance calculation."""
+        sym = symbol.replace("m", "")
+        if sym == "XAUUSD":
+            return 1.0  # ~$1 per pip per 0.01 lot
+        elif sym == "BTCUSD":
+            return 1.0  # ~$1 per point per 0.01 lot
+        else:
+            # FX pairs: ~$0.10 per pip per 0.01 lot
+            return 0.10
+
     def _update_kelly_stats(self, symbol):
         """Refresh per-symbol win rate and PnL stats from MT5 trade history."""
         now = time.time()
@@ -161,17 +173,25 @@ class MT5Executor:
         conviction = min(1.0, max(0.3, abs(exposure) * 20))
 
         # Risk budget: fraction of account we're willing to risk per trade
-        # With $50 account and 1% risk = $0.50 risk per trade
+        # Scale by Kelly half and conviction
         equity = getattr(self.risk, "_current_equity", 50.0) or 50.0
-        risk_pct = float(os.environ.get("AGI_RISK_PERCENT", "1.0")) / 100.0
+        risk_pct = float(os.environ.get("AGI_RISK_PERCENT", "2.0")) / 100.0
         risk_budget = equity * risk_pct * kelly_half * conviction
 
-        # Convert risk budget to lots: lots = risk_budget / (SL_distance * pip_value)
-        # Approximate SL distance as avg_loss (historical), pip_value depends on symbol
+        # Convert risk budget to lots using per-symbol contract size
+        # Each 0.01 lot risks different amounts depending on the symbol:
+        #   XAUUSDm: ~$7.68 per 0.01 lot on SL hit
+        #   BTCUSDm: ~$5.00 per 0.01 lot on SL hit
+        #   EURUSDm: ~$0.24 per 0.01 lot on SL hit (pip value ~$0.10)
+        #   GBPUSDm: ~$0.27 per 0.01 lot on SL hit (pip value ~$0.10)
+        # Use avg_loss per 0.01 lot from trade history as the risk-per-lot
         if avg_loss > 0:
             lots_from_risk = risk_budget / avg_loss
         else:
-            lots_from_risk = min_lots
+            # No loss history — use conservative pip-value estimate
+            pip_value_per_lot = self._pip_value_per_lot(symbol)
+            sl_distance_atr = 2.0  # assume 2x ATR SL
+            lots_from_risk = risk_budget / (sl_distance_atr * pip_value_per_lot) if pip_value_per_lot > 0 else min_lots
 
         # Apply broker minimum and maximum
         lot_size = max(min_lots, min(lots_from_risk, max_lots))
