@@ -5,6 +5,7 @@ Supports multi-position trading: up to N concurrent positions per symbol.
 """
 import sys
 import os
+import time
 from loguru import logger
 
 # ── Audio alert for trade execution (Windows only) ───────────────────
@@ -51,6 +52,12 @@ class MT5Executor:
         self._last_order_meta = {}  # carry context for close orders
         self._last_sl_hit_time = {}  # symbol -> timestamp of last SL hit (cooldown tracking)
 
+        # ── Half-Kelly position sizing state ──
+        self._kelly_win_rate = {}     # symbol -> recent win rate (0-1)
+        self._kelly_avg_win = {}      # symbol -> average winning trade PnL
+        self._kelly_avg_loss = {}     # symbol -> average losing trade PnL (positive)
+        self._kelly_last_update = {}  # symbol -> timestamp of last stats update
+
         if self._is_live:
             try:
                 if not _mt5.initialize():
@@ -75,6 +82,112 @@ class MT5Executor:
                 winsound.Beep(1000, 300)
             except Exception:
                 pass
+
+    def _update_kelly_stats(self, symbol):
+        """Refresh per-symbol win rate and PnL stats from MT5 trade history."""
+        now = time.time()
+        # Only refresh every 5 minutes to avoid hammering MT5
+        if now - self._kelly_last_update.get(symbol, 0) < 300:
+            return
+        self._kelly_last_update[symbol] = now
+
+        if not self._is_live:
+            return
+
+        try:
+            from datetime import datetime, timedelta
+            # Get last 30 days of deals
+            to_dt = datetime.now()
+            from_dt = to_dt - timedelta(days=30)
+            deals = _mt5.history_deals_get(from_dt, to_dt)
+            if not deals:
+                return
+
+            wins_pnl = []
+            losses_pnl = []
+            for d in deals:
+                if d.symbol != symbol or d.entry != 1:  # entry=1 means deal out (closed)
+                    continue
+                if d.profit > 0:
+                    wins_pnl.append(d.profit)
+                elif d.profit < 0:
+                    losses_pnl.append(abs(d.profit))
+
+            total = len(wins_pnl) + len(losses_pnl)
+            if total >= 5:  # Need minimum 5 trades for meaningful stats
+                self._kelly_win_rate[symbol] = len(wins_pnl) / total
+                self._kelly_avg_win[symbol] = sum(wins_pnl) / len(wins_pnl) if wins_pnl else 0
+                self._kelly_avg_loss[symbol] = sum(losses_pnl) / len(losses_pnl) if losses_pnl else 0
+                logger.debug(
+                    f"Kelly stats {symbol}: WR={self._kelly_win_rate[symbol]:.2%} "
+                    f"avg_win=${self._kelly_avg_win[symbol]:.2f} "
+                    f"avg_loss=${self._kelly_avg_loss[symbol]:.2f}"
+                )
+        except Exception as e:
+            logger.debug(f"Kelly stats update failed for {symbol}: {e}")
+
+    def _kelly_lot_size(self, symbol, exposure, min_lots, max_lots):
+        """Calculate lot size using Half-Kelly criterion.
+
+        Kelly fraction: f* = (p*b - q) / b
+        Where: p = win probability, q = 1-p, b = avg_win / avg_loss
+        Half-Kelly: f = f* / 2 (reduces variance, ~75% of full growth)
+
+        Exposure magnitude scales confidence: higher |exposure| = higher conviction.
+        """
+        self._update_kelly_stats(symbol)
+
+        # Default to minimum lots if no stats available
+        wr = self._kelly_win_rate.get(symbol)
+        avg_win = self._kelly_avg_win.get(symbol, 0)
+        avg_loss = self._kelly_avg_loss.get(symbol, 0)
+
+        if wr is None or avg_win <= 0 or avg_loss <= 0:
+            return min(min_lots, max_lots)
+
+        # Kelly fraction: f* = (p * b - q) / b
+        b = avg_win / avg_loss  # reward-to-risk ratio
+        q = 1.0 - wr
+        kelly_full = (wr * b - q) / b
+
+        # Clamp to [0, 1] — negative Kelly means don't trade
+        kelly_full = max(0.0, min(1.0, kelly_full))
+
+        # Half-Kelly (industry standard)
+        kelly_half = kelly_full * 0.5
+
+        # Scale by conviction (|exposure| as signal strength)
+        # exposure is typically 0.001-0.05, normalize to 0.3-1.0 range
+        conviction = min(1.0, max(0.3, abs(exposure) * 20))
+
+        # Risk budget: fraction of account we're willing to risk per trade
+        # With $50 account and 1% risk = $0.50 risk per trade
+        equity = getattr(self.risk, "_current_equity", 50.0) or 50.0
+        risk_pct = float(os.environ.get("AGI_RISK_PERCENT", "1.0")) / 100.0
+        risk_budget = equity * risk_pct * kelly_half * conviction
+
+        # Convert risk budget to lots: lots = risk_budget / (SL_distance * pip_value)
+        # Approximate SL distance as avg_loss (historical), pip_value depends on symbol
+        if avg_loss > 0:
+            lots_from_risk = risk_budget / avg_loss
+        else:
+            lots_from_risk = min_lots
+
+        # Apply broker minimum and maximum
+        lot_size = max(min_lots, min(lots_from_risk, max_lots))
+
+        # Round to broker lot step (0.01 for most symbols)
+        lot_step = 0.01
+        lot_size = round(lot_size / lot_step) * lot_step
+        lot_size = max(min_lots, min(lot_size, max_lots))
+
+        logger.info(
+            f"Kelly sizing {symbol}: f*={kelly_full:.3f} half={kelly_half:.3f} "
+            f"conviction={conviction:.2f} equity=${equity:.2f} "
+            f"risk_budget=${risk_budget:.2f} -> {lot_size:.2f} lots"
+        )
+
+        return lot_size
 
     def get_positions(self, symbol):
         longs = []
@@ -264,8 +377,13 @@ class MT5Executor:
             pass
 
         min_lots = float(os.environ.get("AGI_MIN_LOTS", "0.01"))
-        # Cap lot size to per-symbol maximum
-        lot_size = min(min_lots, sym_max_lots)
+
+        # ── Half-Kelly Position Sizing ──
+        # f* = (p*b - q) / b  where p=win_prob, q=1-p, b=avg_win/avg_loss
+        # Half-Kelly: f = f* / 2 for reduced variance with ~75% of growth
+        lot_size = self._kelly_lot_size(
+            symbol, target_exposure, min_lots, sym_max_lots
+        )
 
         if not self._is_live:
             # Dry-run: just log the intended trade
