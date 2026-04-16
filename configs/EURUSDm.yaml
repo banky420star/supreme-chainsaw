@@ -49,7 +49,7 @@ lstm:
 risk:
   max_drawdown_pct: 5.0
   max_lots: 0.5
-  max_positions_per_symbol: 99
+  max_positions_per_symbol: 3
   sl_atr_mult: 2.0
   tp_atr_mult: 3.0
   trailing_distance_atr: 1.0

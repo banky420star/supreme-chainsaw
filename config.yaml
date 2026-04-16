@@ -17,8 +17,8 @@ risk:
   max_drawdown_pct: 10.0
   max_symbol_exposure: 0.20
   max_total_exposure: 1.0
-  max_open_positions: 99
-  max_positions_per_symbol: 99
+  max_open_positions: 12
+  max_positions_per_symbol: 3
 
 drl:
   total_timesteps: 100000
