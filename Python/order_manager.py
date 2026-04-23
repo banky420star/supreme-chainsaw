@@ -267,8 +267,9 @@ class OrderManager:
         if dollar_profit < trigger_dollars:
             return None
 
-        # Spread buffer to ensure breakeven SL covers costs (0.02% of price)
-        spread_buffer = current_price * 0.0002
+        # Spread buffer to ensure breakeven SL covers costs + spread
+        # Use 0.1% of price as buffer — enough to survive spread + noise
+        spread_buffer = max(current_price * 0.001, atr_value * 0.3)
 
         if is_buy:
             new_sl = round(position.open_price + spread_buffer, 5)

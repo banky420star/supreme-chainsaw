@@ -13,7 +13,7 @@ telegram:
 risk:
   max_daily_loss: 500
   max_hourly_loss: 150
-  max_daily_trades: 100
+  max_daily_trades: 200
   max_lots: 5.0
   max_drawdown_pct: 30.0
   max_symbol_exposure: 0.50
