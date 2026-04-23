@@ -29,11 +29,27 @@ class AutonomyLoop:
         self.canary_max_loss_pct = float(os.environ.get("CANARY_MAX_LOSS_PCT", "10"))  # % of equity
         self.canary_max_dd = float(os.environ.get("CANARY_MAX_DD", "0.12"))
 
-        # Internal canary tracking
+        # Per-symbol canary tracking
+        self._canary_metrics = {}  # symbol -> {start_trade_count, set_time, start_equity}
+
+        # Global canary tracking (legacy, kept for backward compat)
         self._canary_start_trade_count = None
         self._canary_set_time = None
-        self._canary_set_time = None
         self._last_evaluated_candidate = None
+
+        # Discover symbols from config
+        self._symbols = self._load_symbols()
+
+    def _load_symbols(self):
+        """Load trading symbols from config.yaml."""
+        import yaml
+        cfg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml")
+        try:
+            with open(cfg_path, "r") as f:
+                cfg = yaml.safe_load(f) or {}
+            return cfg.get("trading", {}).get("symbols", ["EURUSDm", "GBPUSDm", "XAUUSDm", "BTCUSDm"])
+        except Exception:
+            return ["EURUSDm", "GBPUSDm", "XAUUSDm", "BTCUSDm"]
 
     def _log_incident(self, i_type: str, severity: str, timestamp: str, message: str):
         import json
@@ -127,59 +143,50 @@ class AutonomyLoop:
             logger.info("Autonomy: candidate not promoted to canary (didn't win or failed thresholds).")
 
     def _canary_monitor(self):
-        canary = self._get_canary_dir()
-        if not canary:
+        """Per-symbol canary monitoring. Checks each symbol independently."""
+        for symbol in self._symbols:
+            self._canary_monitor_symbol(symbol)
+
+    def _canary_monitor_symbol(self, symbol: str):
+        """Monitor canary performance for a single symbol."""
+        active = self.registry._read_active()
+        sym_data = active.get("symbols", {}).get(symbol, {})
+        canary_dir = sym_data.get("canary")
+
+        if not canary_dir:
             return
 
-        # Get risk engine reference (handle both AGIServer and older brain shapes)
+        # Get risk engine reference
         risk = getattr(self.brain, 'risk_engine', getattr(self.brain, 'risk', None))
         if risk is None:
-            logger.warning("Autonomy: no risk engine available for canary monitoring")
             return
 
-        # Initialize baseline
-        if self._canary_start_trade_count is None:
-            self._canary_start_trade_count = risk.daily_trades
-            self._canary_set_time = time.time()
+        # Initialize per-symbol tracking
+        if symbol not in self._canary_metrics:
+            self._canary_metrics[symbol] = {
+                "start_trade_count": risk.daily_trades,
+                "set_time": time.time(),
+                "start_equity": getattr(risk, '_current_equity', 100.0),
+            }
 
-        trades_since = risk.daily_trades - self._canary_start_trade_count
+        metrics = self._canary_metrics[symbol]
+        trades_since = risk.daily_trades - metrics["start_trade_count"]
 
-        # Pull TRUE PnL from MT5 if available (Windows only)
-        realized = 0.0
-        try:
-            if sys.platform == "win32":
-                import MetaTrader5 as mt5
-                import pytz
-                if mt5 is not None and mt5.initialize():
-                    tz = pytz.timezone("Etc/UTC")
-                    now_utc = datetime.datetime.now(tz)
-                    lookback = now_utc - datetime.timedelta(days=7)
-                    deals = mt5.history_deals_get(lookback, now_utc)
-                    if deals:
-                        realized = sum(deal.profit for deal in deals if deal.entry == mt5.DEAL_ENTRY_OUT)
-            else:
-                # On Mac, use the risk engine's tracked PnL as proxy
-                realized = risk.realized_pnl_today
-        except Exception as e:
-            logger.warning(f"Autonomy PnL check failed: {e}")
-            realized = risk.realized_pnl_today
+        # Pull PnL for this symbol from MT5
+        realized = self._get_symbol_pnl(symbol, risk)
 
         dd = float(risk.current_dd) / 100.0
-
-        # Scale canary max loss to current equity (percentage-based)
-        equity = getattr(risk, 'account_equity', None) or getattr(risk, '_current_equity', None) or 100.0
+        equity = getattr(risk, '_current_equity', None) or 100.0
         canary_max_loss = equity * (self.canary_max_loss_pct / 100.0)
-        logger.info(f"Canary monitor: equity=${equity:.2f}, max_loss=${canary_max_loss:.2f} ({self.canary_max_loss_pct}%), realized=${realized:.2f}, dd={dd:.3f}")
 
         # Rollback conditions
         if realized <= -canary_max_loss or dd >= self.canary_max_dd:
-            logger.error(f"🔴 Canary rollback: realized=${realized:.2f} >= -${canary_max_loss:.2f} (max {self.canary_max_loss_pct}% of ${equity:.2f}), dd={dd:.3f}")
-            self._log_incident("learning", "fail", "Just now", f"[RECURSIVE PENALTY] Canary model rolled back instantly upon hitting max limit (DD: {dd:.3f}). Parameter configuration flagged for suppressed probabilities.")
-            self.registry.rollback_to_champion()
-            self._canary_start_trade_count = None
-            self._canary_set_time = None
+            logger.error(f"🔴 [{symbol}] Canary rollback: realized=${realized:.2f}, dd={dd:.3f}")
+            self._log_incident("learning", "fail", "Just now",
+                f"[{symbol}] Canary rolled back (DD: {dd:.3f}, PnL: ${realized:.2f})")
+            self.registry.clear_canary(symbol)
+            self._canary_metrics.pop(symbol, None)
 
-            # Force Brain to reload champion
             if hasattr(self.brain, '_load_ppo_from_registry'):
                 self.brain._load_ppo_from_registry()
             elif hasattr(self.brain, 'brain') and hasattr(self.brain.brain, '_load_ppo_from_registry'):
@@ -188,56 +195,96 @@ class AutonomyLoop:
 
         # Promotion conditions
         if trades_since >= self.canary_min_trades and realized >= 0:
-            logger.success(f"🟢 Canary promoted: trades_since={trades_since} realized={realized:.2f} dd={dd:.3f}")
-            self._log_incident("learning", "pass", "Just now", f"[AUTO-PROMOTION] Canary outperformed live metrics over {trades_since} cycles. Model hot-swapped to new champion.")
-            self.registry.promote_canary_to_champion()
-            self._canary_start_trade_count = None
-            self._canary_set_time = None
+            logger.success(f"🟢 [{symbol}] Canary promoted: trades={trades_since} PnL=${realized:.2f}")
+            self._log_incident("learning", "pass", "Just now",
+                f"[{symbol}] Canary promoted after {trades_since} trades, PnL=${realized:.2f}")
+            self.registry.promote_canary_to_champion(symbol)
+            self._canary_metrics.pop(symbol, None)
 
             if hasattr(self.brain, '_load_ppo_from_registry'):
                 self.brain._load_ppo_from_registry()
             elif hasattr(self.brain, 'brain') and hasattr(self.brain.brain, '_load_ppo_from_registry'):
                 self.brain.brain._load_ppo_from_registry()
-            
+
             self._export_state()
+
+    def _get_symbol_pnl(self, symbol: str, risk) -> float:
+        """Get realized PnL for a specific symbol from MT5 history."""
+        realized = 0.0
+        try:
+            if sys.platform == "win32":
+                import MetaTrader5 as mt5
+                if mt5 is not None and mt5.initialize():
+                    import pytz
+                    tz = pytz.timezone("Etc/UTC")
+                    now_utc = datetime.datetime.now(tz)
+                    lookback = now_utc - datetime.timedelta(days=7)
+                    deals = mt5.history_deals_get(lookback, now_utc)
+                    if deals:
+                        realized = sum(
+                            deal.profit for deal in deals
+                            if deal.entry == mt5.DEAL_ENTRY_OUT and deal.symbol == symbol
+                        )
+        except Exception as e:
+            logger.debug(f"Autonomy: symbol PnL check failed for {symbol}: {e}")
+            realized = risk.realized_pnl_today
+        return realized
 
     def _export_state(self):
         """Broadcasts the real-time interior brain state to a JSON file for the API Bridge."""
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         state_path = os.path.join(root, "live_state.json")
-        
+
         # Pull real metrics from the brain and its sub-components
         risk = getattr(self.brain, 'risk_engine', getattr(self.brain, 'risk', None))
         active = self.registry._read_active()
-        
+
+        # Per-symbol canary state
+        symbols_state = {}
+        for sym in self._symbols:
+            sym_data = active.get("symbols", {}).get(sym, {})
+            metrics = self._canary_metrics.get(sym, {})
+            symbols_state[sym] = {
+                "champion": sym_data.get("champion"),
+                "canary": sym_data.get("canary"),
+                "canary_pnl": self._get_symbol_pnl(sym, risk) if risk else 0,
+                "canary_set_time": metrics.get("set_time"),
+                "canary_trades": (
+                    risk.daily_trades - metrics.get("start_trade_count", 0)
+                    if risk and "start_trade_count" in metrics else 0
+                ),
+            }
+
         state = {
             "timestamp": time.time(),
             "registry": {
                 "champion": active.get("champion"),
-                "canary": active.get("canary")
+                "canary": active.get("canary"),
             },
+            "symbols": symbols_state,
             "trading": {
                 "account": {
                     "balance": getattr(risk, "account_balance", 0) if risk else 0,
-                    "equity": getattr(risk, "account_equity", 0) if risk else 0,
-                    "floatingPnl": getattr(risk, "floating_pnl", 0) if risk else 0,
+                    "equity": getattr(risk, "_current_equity", 0) if risk else 0,
+                    "floatingPnl": getattr(risk, "_mt5_profit", 0) if risk else 0,
                     "realizedToday": getattr(risk, "realized_pnl_today", 0) if risk else 0,
                 },
                 "risk": {
                     "drawdownPct": getattr(risk, "current_dd", 0) if risk else 0,
-                    "canTrade": True
+                    "canTrade": risk.can_trade() if risk else True,
+                    "haltReason": getattr(risk, "_halt_reason", "") if risk else "",
                 }
             },
             "training": {
                 "active_canary": active.get("canary") is not None,
-                "cycles_completed": 0 # Would be tracked in persistence
+                "cycles_completed": 0
             }
         }
-        
+
         try:
             with open(state_path, 'w') as f:
                 json.dump(state, f, indent=2)
-        except:
+        except Exception:
             pass
 
     async def nightly_training_loop(self):
