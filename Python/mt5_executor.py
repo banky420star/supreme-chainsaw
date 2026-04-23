@@ -200,38 +200,27 @@ class MT5Executor:
             from datetime import datetime, timezone
             utc_hour = datetime.now(timezone.utc).hour
 
-            # Determine which session the current hour falls in
-            active_session = None
+            # Determine which sessions COVER this hour (regardless of enabled/disabled)
+            # Overlaps: 0-8=Asian, 7-16=London, 12-21=New York
+            covering_sessions = []
             if 0 <= utc_hour < 8:
-                active_session = "asian"
-            elif 7 <= utc_hour < 16:
-                active_session = "london"
-            elif 12 <= utc_hour < 21:
-                active_session = "new_york"
-            # Hours not covered by any session (21-24 UTC) = no session
-            # But also check overlaps: 7-8 is both asian and london, 12-16 is both london and NY
+                covering_sessions.append("asian")
+            if 7 <= utc_hour < 16:
+                covering_sessions.append("london")
+            if 12 <= utc_hour < 21:
+                covering_sessions.append("new_york")
 
-            # Check all overlapping sessions
-            allowed = False
-            matching_sessions = []
-            if 0 <= utc_hour < 8 and sessions.get("asian", True):
-                allowed = True
-                matching_sessions.append("asian")
-            if 7 <= utc_hour < 16 and sessions.get("london", True):
-                allowed = True
-                matching_sessions.append("london")
-            if 12 <= utc_hour < 21 and sessions.get("new_york", True):
-                allowed = True
-                matching_sessions.append("new_york")
-
-            # If no session covers this hour, allow trading (edge case)
-            if not matching_sessions:
+            # Hours 21-24 UTC: no session covers — allow trading (edge case)
+            if not covering_sessions:
                 return True, "ok"
 
-            if allowed:
-                return True, "ok"
+            # Check if at least one covering session is enabled
+            for session in covering_sessions:
+                if sessions.get(session, True):
+                    return True, "ok"
 
-            return False, f"outside_trading_session (utc_hour={utc_hour})"
+            # All covering sessions are disabled — block trading
+            return False, f"outside_trading_session (utc_hour={utc_hour}, covering={covering_sessions})"
 
         except Exception as e:
             logger.debug(f"Session filter check failed for {symbol}: {e}")

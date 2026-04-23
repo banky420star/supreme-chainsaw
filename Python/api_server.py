@@ -1016,6 +1016,7 @@ def api_perf():
     srv = _server_ref
     equity_curve = []
     pnl_curve = []
+    confidence_curve = []
 
     if srv and hasattr(srv, "risk"):
         try:
@@ -1024,16 +1025,37 @@ def api_perf():
         except Exception:
             pass
 
+    # Build confidence curve from recent decisions
+    try:
+        decisions_log = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "logs", "decisions.jsonl"
+        )
+        if os.path.exists(decisions_log):
+            with open(decisions_log, "r") as f:
+                lines = f.readlines()[-300:]  # Last 300 decisions
+            for line in lines:
+                try:
+                    d = json.loads(line.strip())
+                    conf = d.get("confidence", 0)
+                    confidence_curve.append(float(conf))
+                except (json.JSONDecodeError, ValueError):
+                    pass
+    except Exception:
+        pass
+
     # Fallback to file-based history if server has no data yet
     if not equity_curve:
         equity_curve = hist.get("equity", [])
     if not pnl_curve:
         pnl_curve = hist.get("pnl", [])
+    if not confidence_curve:
+        confidence_curve = hist.get("confidence", [])
 
     return _json({
         "equity_curve": equity_curve,
         "pnl_curve": pnl_curve,
-        "confidence_curve": hist.get("confidence", []),
+        "confidence_curve": confidence_curve,
         "lstm_loss_curve": hist.get("lstmLoss", []),
     })
 

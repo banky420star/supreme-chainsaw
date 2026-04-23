@@ -128,8 +128,6 @@ def gather_closed_trades(days_back: int = 7) -> list[dict]:
                 "model_version": model_version,
             })
         return trades
-    finally:
-        mt5.shutdown()
 
 
 def load_decision_log(hours_back: int = 168) -> list[dict]:
@@ -158,16 +156,23 @@ def load_decision_log(hours_back: int = 168) -> list[dict]:
 
 
 def match_trade_to_decision(trade: dict, decisions: list[dict]) -> dict | None:
-    """Find the decision that led to a trade by matching symbol and time proximity.
+    """Find the decision that led to a trade by matching symbol, direction, and time proximity.
 
-    The decision was made BEFORE the trade was opened, so we look for
-    decisions for this symbol close to the trade's open time (not close time).
-    We search up to 24 hours before close to cover longer-held positions.
+    Matches on: (a) symbol, (b) side/direction alignment (BUY trade matches BUY
+    decision, SELL matches SELL), (c) closest prior timestamp within 24 hours
+    of the trade's open time.  Filters out mismatched directions.  Returns the
+    matched decision record or None.
     """
     symbol = trade["symbol"]
-    close_time_str = trade["close_time"]
+    trade_side = trade.get("side", "")  # "BUY" or "SELL"
+
+    # Prefer open_time (when the position was actually entered) over close_time.
+    # Fall back to close_time if open_time is missing.
+    time_str = trade.get("open_time") or trade.get("close_time", "")
+    if not time_str:
+        return None
     try:
-        close_dt = datetime.fromisoformat(close_time_str)
+        ref_dt = datetime.fromisoformat(time_str)
     except (ValueError, TypeError):
         return None
 
@@ -177,21 +182,196 @@ def match_trade_to_decision(trade: dict, decisions: list[dict]) -> dict | None:
     for d in decisions:
         if d.get("symbol") != symbol:
             continue
+
+        # Direction alignment: BUY trade matches BUY decision, SELL matches SELL
+        decision_action = d.get("action", "")
+        if trade_side and decision_action and decision_action != trade_side:
+            continue
+
         ts = d.get("timestamp", "")
         if not ts:
             continue
         try:
             dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            # Decision must be BEFORE the trade closed, and within 24 hours
-            # (covers trades held from minutes to hours)
-            diff = (close_dt - dt).total_seconds()
-            if 0 < diff < 86400 and diff < best_dt_diff:  # Within 24h before close
+            # Decision must be BEFORE the trade opened, and within 24 hours
+            diff = (ref_dt - dt).total_seconds()
+            if 0 < diff < 86400 and diff < best_dt_diff:
                 best = d
                 best_dt_diff = diff
         except (ValueError, TypeError):
             continue
 
     return best
+
+
+# ── Config helper ─────────────────────────────────────────────────────
+
+def _load_max_spread_bps() -> float:
+    """Load max_spread_bps from project config.yaml (risk section)."""
+    try:
+        import yaml
+        cfg_path = os.path.join(_BASE, "config.yaml")
+        if os.path.exists(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            return float(cfg.get("risk", {}).get("max_spread_bps", 50))
+    except Exception:
+        pass
+    return 50.0
+
+
+# ── Outcome Tagging ───────────────────────────────────────────────────
+
+def assign_outcome_tags(trade: dict, decision: dict = None) -> list[str]:
+    """Analyze a closed trade and return a list of outcome tags.
+
+    Tags describe *why* a trade turned out the way it did, using both the
+    trade result and the original decision context.  This is a focused,
+    complementary set to the existing annotate_trade() tags.
+    """
+    tags = []
+    profit = trade.get("profit", 0)
+    trade_side = trade.get("side", "")
+
+    # --- signal_correct / signal_wrong ---
+    if decision is not None:
+        decision_action = decision.get("action", "")
+        direction_matched = (
+            trade_side == decision_action
+            if (trade_side and decision_action)
+            else False
+        )
+        if profit > 0 and direction_matched:
+            tags.append("signal_correct")
+        if profit < 0 and not direction_matched and decision_action not in ("HOLD", ""):
+            tags.append("signal_wrong")
+
+    # --- market_reversal ---
+    # Heuristic: trade hit SL but had been in profit at some point.
+    # MT5 deals don't carry intraday high/low, so we approximate by
+    # checking if SL was hit while the trade ended with a net profit
+    # (trailing SL locked gains) or if the close reason is SL with a
+    # very small loss relative to hold time (price went up then reversed).
+    if trade.get("is_sl"):
+        if profit > 0:
+            # Trailing SL locked in gains — price went favorably then reversed
+            tags.append("market_reversal")
+        elif profit < 0:
+            hold_min = trade.get("hold_minutes")
+            # If the trade was held for a reasonable time before SL, likely a reversal
+            if hold_min is not None and hold_min > 30:
+                tags.append("market_reversal")
+
+    # --- sl_too_tight ---
+    hold_min = trade.get("hold_minutes")
+    if trade.get("is_sl") and hold_min is not None and hold_min <= 5:
+        tags.append("sl_too_tight")
+
+    # --- tp_hit ---
+    if trade.get("is_tp"):
+        tags.append("tp_hit")
+
+    # --- low_confidence ---
+    if decision is not None:
+        confidence = decision.get("confidence", 0)
+        if confidence < 0.65:
+            tags.append("low_confidence")
+
+    # --- high_volatility_regime ---
+    if decision is not None:
+        regime = decision.get("lstm_regime", "") or decision.get("regime", "")
+        if regime == "HIGH_VOLATILITY":
+            tags.append("high_volatility_regime")
+
+    # --- spread_too_wide ---
+    entry_spread = trade.get("entry_spread_bps")
+    if entry_spread is not None:
+        try:
+            if float(entry_spread) > _load_max_spread_bps():
+                tags.append("spread_too_wide")
+        except (ValueError, TypeError):
+            pass
+
+    # --- entered_late ---
+    if decision is not None:
+        dec_ts = decision.get("timestamp", "")
+        entry_ts = trade.get("open_time", "")
+        if dec_ts and entry_ts:
+            try:
+                dec_dt = datetime.fromisoformat(dec_ts.replace("Z", "+00:00"))
+                entry_dt = datetime.fromisoformat(entry_ts)
+                latency = (entry_dt - dec_dt).total_seconds()
+                if latency > 60:
+                    tags.append("entered_late")
+            except (ValueError, TypeError):
+                pass
+
+    # --- overtraded ---
+    # Requires external context (list of all trades); set by enrich_reviews().
+    if trade.get("_overtraded"):
+        tags.append("overtraded")
+
+    return tags
+
+
+def enrich_reviews(trades: list, decisions: list) -> list[dict]:
+    """Match each trade to its decision, assign outcome tags, return enriched records.
+
+    Each record contains the original trade dict plus:
+      - "decision_context": matched decision or None
+      - "outcome_tags": list of outcome tag strings from assign_outcome_tags
+    """
+    # Pre-compute per-symbol trade counts in 1-hour windows to detect overtrading.
+    # For each trade, count how many other trades for the same symbol fell within
+    # the prior hour of that trade's close time.
+    trade_close_times: dict[str, list[datetime]] = {}
+    for t in trades:
+        sym = t.get("symbol", "")
+        ts_str = t.get("close_time", "")
+        if not ts_str:
+            continue
+        try:
+            dt = datetime.fromisoformat(ts_str)
+            trade_close_times.setdefault(sym, []).append(dt)
+        except (ValueError, TypeError):
+            continue
+
+    enriched = []
+    for trade in trades:
+        decision = match_trade_to_decision(trade, decisions)
+
+        # Detect overtrading: >5 trades for the same symbol in the hour before close
+        sym = trade.get("symbol", "")
+        ts_str = trade.get("close_time", "")
+        is_overtraded = False
+        if sym in trade_close_times and ts_str:
+            try:
+                close_dt = datetime.fromisoformat(ts_str)
+                one_hour_ago = close_dt - timedelta(hours=1)
+                count_in_hour = sum(
+                    1 for dt in trade_close_times[sym]
+                    if one_hour_ago <= dt <= close_dt
+                )
+                if count_in_hour > 5:
+                    is_overtraded = True
+            except (ValueError, TypeError):
+                pass
+        trade_copy = dict(trade)
+        trade_copy["_overtraded"] = is_overtraded
+
+        outcome_tags = assign_outcome_tags(trade_copy, decision)
+
+        # Remove the internal flag before storing
+        trade_copy.pop("_overtraded", None)
+
+        record = {
+            **trade_copy,
+            "decision_context": decision,
+            "outcome_tags": outcome_tags,
+        }
+        enriched.append(record)
+
+    return enriched
 
 
 def annotate_trade(trade: dict, decision: dict | None) -> list[str]:
