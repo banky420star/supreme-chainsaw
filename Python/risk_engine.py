@@ -110,6 +110,8 @@ class RiskEngine:
 
     def record_trade(self):
         self.daily_trades += 1
+        # Reset consecutive error count on successful trade
+        self.error_count = 0
 
     def record_pnl(self, pnl: float):
         self.realized_pnl_today += pnl
@@ -117,15 +119,27 @@ class RiskEngine:
             self.halt = True
             logger.error(f"🛑 KILL SWITCH: Daily loss ${self.realized_pnl_today:.2f} exceeded limit ${self.max_daily_loss}")
 
-    def record_error(self):
-        self.error_count += 1
-        if self.error_count >= 3:
-            self.halt = True
-            logger.error(f"🛑 KILL SWITCH: {self.error_count} consecutive errors")
+    def record_error(self, critical: bool = True):
+        """Record an error. Only critical errors increment the counter for kill switch.
+        Non-critical errors (market closed, insufficient margin, etc.) are logged but don't trigger halt.
+        """
+        if critical:
+            self.error_count += 1
+            if self.error_count >= 3:
+                self.halt = True
+                logger.error(f"🛑 KILL SWITCH: {self.error_count} consecutive errors")
+        # Always log the error
+        logger.warning(f"RiskEngine: error recorded (critical={critical}, count={self.error_count})")
 
     def can_trade(self) -> bool:
         if self.halt:
             return False
         if self.daily_trades >= self.max_daily_trades:
+            return False
+        # Margin call protection: if free margin is dangerously low, stop trading
+        # to prevent broker stop-outs (force liquidation)
+        free_margin = getattr(self, "_mt5_free_margin", None)
+        if free_margin is not None and free_margin < 5.0:
+            logger.warning(f"RiskEngine: free margin \${free_margin:.2f} below \$5 — pausing trades to prevent stop-out")
             return False
         return True

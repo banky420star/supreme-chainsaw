@@ -5,7 +5,9 @@ Supports multi-position trading: up to N concurrent positions per symbol.
 """
 import sys
 import os
+import json
 import time
+from datetime import datetime, timezone
 from loguru import logger
 
 # ── Audio alert for trade execution (Windows only) ───────────────────
@@ -71,6 +73,130 @@ class MT5Executor:
             logger.success("MT5Executor: LIVE mode — connected to MetaTrader 5")
         else:
             logger.info("MT5Executor: DRY-RUN mode — trades will be logged only")
+
+        # ── Execution log ────────────────────────────────────────────────
+        _base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self._exec_log_path = os.path.join(_base, "logs", "executions.jsonl")
+        os.makedirs(os.path.dirname(self._exec_log_path), exist_ok=True)
+
+        # ── Reference to AGIServer for live_armed check (set externally) ──
+        self._server_ref = None
+
+    def set_server_ref(self, server):
+        """Set reference to AGIServer for live_armed and other runtime checks."""
+        self._server_ref = server
+
+    def _preflight_check(self, symbol: str, side: str, lots: float) -> tuple:
+        """
+        Pre-flight validation before sending any order.
+        Returns (allowed: bool, reason: str).
+        """
+        # 1. Check live mode is armed
+        if self._server_ref and hasattr(self._server_ref, "live"):
+            if self._server_ref.live and not getattr(self._server_ref, "live_armed", False):
+                return False, "live_mode_not_armed"
+
+        # 2. Verify symbol is in allowed list
+        if self._server_ref and hasattr(self._server_ref, "symbols"):
+            if symbol not in self._server_ref.symbols:
+                return False, f"symbol_not_allowed ({symbol})"
+
+        # 3. Check spread under threshold (per-symbol config)
+        spread_ok, spread_reason = self._check_spread_guard(symbol)
+        if not spread_ok:
+            return False, spread_reason
+
+        # 4. Verify lot size within symbol cap
+        try:
+            import yaml
+            config_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "configs", f"{symbol}.yaml"
+            )
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
+                    sym_cfg = yaml.safe_load(f)
+                max_lots = sym_cfg.get("risk", {}).get("max_lots", 1.0)
+                if lots > max_lots:
+                    return False, f"lot_size_exceeds_cap ({lots} > {max_lots})"
+        except Exception:
+            pass
+
+        # 5. Verify margin is sufficient (live mode only)
+        if self._is_live and _mt5 is not None:
+            try:
+                account = _mt5.account_info()
+                if account:
+                    # Use MT5's actual margin calculation for the symbol/lot size
+                    symbol_info = _mt5.symbol_info(symbol)
+                    if symbol_info:
+                        # MT5 provides margin_required for 1 lot; scale by actual lots
+                        # margin_initial is for 1 lot in the account currency
+                        margin_per_lot = getattr(symbol_info, 'margin_initial', 0) or getattr(symbol_info, 'margin_maintenance', 0)
+                        if margin_per_lot > 0:
+                            required_margin = margin_per_lot * lots
+                        else:
+                            # Fallback: use trade_mode and contract_size to estimate
+                            # For forex with 1:100 leverage, ~$1000 per standard lot
+                            # For micro lots (0.01), ~$10 — but broker may offer higher leverage
+                            contract_size = getattr(symbol_info, 'trade_contract_size', 100000)
+                            leverage_ratio = getattr(account, 'leverage', 100)
+                            # Margin = contract_size * lots / leverage
+                            required_margin = (contract_size * lots) / leverage_ratio
+
+                        if account.margin_free < required_margin:
+                            return False, f"insufficient_margin (free={account.margin_free:.2f}, required={required_margin:.2f})"
+            except Exception:
+                pass
+
+        return True, "ok"
+
+    def _check_spread_guard(self, symbol: str) -> tuple:
+        """
+        Check if current spread is within the per-symbol threshold.
+        Returns (ok: bool, reason: str).
+        """
+        max_spread_bps = 50  # default
+        try:
+            import yaml
+            config_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "configs", f"{symbol}.yaml"
+            )
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
+                    sym_cfg = yaml.safe_load(f)
+                max_spread_bps = sym_cfg.get("risk", {}).get("max_spread_bps", 50)
+        except Exception:
+            pass
+
+        if not self._is_live or _mt5 is None:
+            return True, "ok"
+
+        try:
+            tick = _mt5.symbol_info_tick(symbol)
+            if tick is None:
+                return False, f"no_tick_data ({symbol})"
+            spread = tick.ask - tick.bid
+            # For FX: spread in points (5th decimal for 5-digit brokers)
+            # For XAU/BTC: spread in raw price
+            point = _mt5.symbol_info(symbol)
+            if point:
+                spread_bps = (spread / point.point) if point.point > 0 else 0
+                if spread_bps > max_spread_bps:
+                    return False, f"spread_too_wide ({spread_bps:.1f} > {max_spread_bps} bps)"
+        except Exception as e:
+            logger.warning(f"Spread guard check failed for {symbol}: {e}")
+
+        return True, "ok"
+
+    def _log_execution(self, record: dict):
+        """Append execution intent record to logs/executions.jsonl."""
+        try:
+            with open(self._exec_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, default=str) + "\n")
+        except Exception as e:
+            logger.warning(f"Failed to write execution log: {e}")
 
     @staticmethod
     def _play_trade_alert():
@@ -139,11 +265,11 @@ class MT5Executor:
             logger.debug(f"Kelly stats update failed for {symbol}: {e}")
 
     def _kelly_lot_size(self, symbol, exposure, min_lots, max_lots):
-        """Calculate lot size using Half-Kelly criterion.
+        """Calculate lot size using Full Kelly criterion.
 
         Kelly fraction: f* = (p*b - q) / b
         Where: p = win probability, q = 1-p, b = avg_win / avg_loss
-        Half-Kelly: f = f* / 2 (reduces variance, ~75% of full growth)
+        Full Kelly: use the entire Kelly fraction for maximum growth.
 
         Exposure magnitude scales confidence: higher |exposure| = higher conviction.
         """
@@ -165,18 +291,41 @@ class MT5Executor:
         # Clamp to [0, 1] — negative Kelly means don't trade
         kelly_full = max(0.0, min(1.0, kelly_full))
 
-        # Half-Kelly (industry standard)
-        kelly_half = kelly_full * 0.5
+        # Full Kelly (aggressive sizing for maximum growth)
+        kelly_used = kelly_full
 
         # Scale by conviction (|exposure| as signal strength)
         # exposure is typically 0.001-0.05, normalize to 0.3-1.0 range
         conviction = min(1.0, max(0.3, abs(exposure) * 20))
 
         # Risk budget: fraction of account we're willing to risk per trade
-        # Scale by Kelly half and conviction
-        equity = getattr(self.risk, "_current_equity", 50.0) or 50.0
+        # Use BALANCE (realized) not equity (includes floating P&L) for sizing.
+        # Floating profits from one symbol should NOT inflate sizing on others.
+        # E.g. XAUUSDm up $200 floating -> Kelly shouldn't size EURUSDm at 1.0 lots
+        balance = getattr(self.risk, "_mt5_balance", None)
+        if balance is None or balance <= 0:
+            # Fall back to equity only if balance unavailable
+            balance = getattr(self.risk, "_current_equity", None)
+        if balance is None or balance <= 0:
+            balance = 50.0  # fallback for dry-run or missing account info
+
+        # Compound growth: scale ramps up as balance grows
+        # Under $50: very conservative (0.3x) to protect tiny accounts
+        # $50-$200: linear ramp from 0.3x to 0.8x
+        # $200-$1000: linear ramp from 0.8x to 1.0x
+        # Above $1000: full Kelly (1.0x)
+        if balance < 50:
+            equity_scale = 0.3
+        elif balance < 200:
+            equity_scale = 0.3 + 0.5 * ((balance - 50) / 150)  # 0.3 to 0.8
+        elif balance < 1000:
+            equity_scale = 0.8 + 0.2 * ((balance - 200) / 800)  # 0.8 to 1.0
+        else:
+            equity_scale = 1.0
+        kelly_used = kelly_used * equity_scale
+
         risk_pct = float(os.environ.get("AGI_RISK_PERCENT", "2.0")) / 100.0
-        risk_budget = equity * risk_pct * kelly_half * conviction
+        risk_budget = balance * risk_pct * kelly_used * conviction
 
         # Convert risk budget to lots using per-symbol contract size
         # Each 0.01 lot risks different amounts depending on the symbol:
@@ -193,8 +342,15 @@ class MT5Executor:
             sl_distance_atr = 2.0  # assume 2x ATR SL
             lots_from_risk = risk_budget / (sl_distance_atr * pip_value_per_lot) if pip_value_per_lot > 0 else min_lots
 
+        # Hard cap: max risk per trade = 2% of balance (regardless of Kelly)
+        # This prevents disasters like 1.0 lots on a $40 account
+        max_risk_dollars = balance * 0.02
+        if avg_loss > 0 and lot_size > 0:
+            max_lots_by_risk = max_risk_dollars / avg_loss
+            lot_size = min(lot_size, max_lots_by_risk)
+
         # Apply broker minimum and maximum
-        lot_size = max(min_lots, min(lots_from_risk, max_lots))
+        lot_size = max(min_lots, min(lot_size, max_lots))
 
         # Round to broker lot step (0.01 for most symbols)
         lot_step = 0.01
@@ -202,9 +358,9 @@ class MT5Executor:
         lot_size = max(min_lots, min(lot_size, max_lots))
 
         logger.info(
-            f"Kelly sizing {symbol}: f*={kelly_full:.3f} half={kelly_half:.3f} "
-            f"conviction={conviction:.2f} equity=${equity:.2f} "
-            f"risk_budget=${risk_budget:.2f} -> {lot_size:.2f} lots"
+            f"Kelly sizing {symbol}: f*={kelly_full:.3f} used={kelly_used:.3f} "
+            f"conviction={conviction:.2f} balance=${balance:.2f} scale={equity_scale:.2f} "
+            f"risk_budget=${risk_budget:.2f} max_risk=${max_risk_dollars:.2f} -> {lot_size:.2f} lots"
         )
 
         return lot_size
@@ -376,11 +532,26 @@ class MT5Executor:
         # Skip trade if a high-impact news event is imminent or just released
         if self._check_news_blackout(symbol):
             logger.info(f"{symbol}: trade skipped — news blackout active")
+            self._log_execution({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "symbol": symbol, "side": "BUY" if target_exposure > 0 else "SELL",
+                "lot_size": 0, "allowed": False, "reason": "news_blackout_active",
+            })
             return
 
-        # Load per-symbol risk config
+        # ── Pre-flight checks ────────────────────────────────────────────
+        # Load per-symbol risk config FIRST so preflight uses the right caps
         sym_max_lots = max_lots
         sym_max_positions = max_positions_per_symbol
+
+        # For very small accounts (< $50), limit to 1 position per symbol to prevent overexposure
+        # Above $50, allow up to config max (typically 3)
+        equity = getattr(self.risk, "_current_equity", None)
+        if equity is None or equity <= 0:
+            equity = 50.0
+        small_account = equity < 50
+        if small_account:
+            sym_max_positions = 1
         try:
             import yaml
             config_path = os.path.join(
@@ -396,11 +567,29 @@ class MT5Executor:
         except Exception:
             pass
 
+        # Apply small account caps AFTER loading config so they don't get clobbered
+        if small_account:
+            sym_max_positions = 1
+            sym_max_lots = min(sym_max_lots, 0.01)
+
+        direction = "BUY" if target_exposure > 0 else "SELL"
+        allowed, preflight_reason = self._preflight_check(
+            symbol, direction, sym_max_lots
+        )
+        if not allowed:
+            logger.warning(f"{symbol}: preflight check FAILED — {preflight_reason}")
+            self._log_execution({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "symbol": symbol, "side": direction,
+                "lot_size": 0, "allowed": False, "reason": preflight_reason,
+            })
+            return
+
         min_lots = float(os.environ.get("AGI_MIN_LOTS", "0.01"))
 
-        # ── Half-Kelly Position Sizing ──
+        # ── Full Kelly Position Sizing ──
         # f* = (p*b - q) / b  where p=win_prob, q=1-p, b=avg_win/avg_loss
-        # Half-Kelly: f = f* / 2 for reduced variance with ~75% of growth
+        # Full Kelly: use entire Kelly fraction for maximum growth
         lot_size = self._kelly_lot_size(
             symbol, target_exposure, min_lots, sym_max_lots
         )
@@ -443,6 +632,13 @@ class MT5Executor:
             self.open_position(symbol, _mt5.ORDER_TYPE_BUY, lot_size, order_meta=order_meta)
             self.risk.record_trade()
             logger.info(f"Opened long #{n_longs + 1}/{sym_max_positions} for {symbol} ({lot_size} lots)")
+            self._log_execution({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "symbol": symbol, "side": "BUY", "lot_size": lot_size,
+                "allowed": True, "reason": "ok",
+                "magic": self._magic_for_order(symbol, order_meta or {}, request_kind="open"),
+                "order_meta": order_meta,
+            })
         else:
             if n_shorts >= sym_max_positions:
                 logger.debug(f"{symbol}: max short positions reached ({n_shorts}/{sym_max_positions})")
@@ -457,6 +653,13 @@ class MT5Executor:
             self.open_position(symbol, _mt5.ORDER_TYPE_SELL, lot_size, order_meta=order_meta)
             self.risk.record_trade()
             logger.info(f"Opened short #{n_shorts + 1}/{sym_max_positions} for {symbol} ({lot_size} lots)")
+            self._log_execution({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "symbol": symbol, "side": "SELL", "lot_size": lot_size,
+                "allowed": True, "reason": "ok",
+                "magic": self._magic_for_order(symbol, order_meta or {}, request_kind="open"),
+                "order_meta": order_meta,
+            })
 
     def close_positions(self, positions, order_meta=None):
         if not self._is_live:
@@ -481,7 +684,9 @@ class MT5Executor:
             result = _mt5.order_send(request)
             if result.retcode != _mt5.TRADE_RETCODE_DONE:
                 logger.error(f"Close position failed for {p.symbol} ticket={p.ticket}: retcode={result.retcode}")
-                self.risk.record_error()
+                # Only critical if retcode indicates a real problem, not market-closed or margin
+                critical = result.retcode not in (10018, 10019, 10020, 10021, 10030, 13108)
+                self.risk.record_error(critical=critical)
             else:
                 # Record SL hit time for cooldown tracking
                 if p.sl > 0 and p.profit < 0:
@@ -506,7 +711,7 @@ class MT5Executor:
         tick = _mt5.symbol_info_tick(symbol)
         if tick is None:
             logger.error(f"Cannot get tick for {symbol}")
-            self.risk.record_error()
+            self.risk.record_error(critical=False)  # Non-critical: market data issue
             return
 
         # Compute ATR-based SL/TP defaults
@@ -560,7 +765,11 @@ class MT5Executor:
         result = _mt5.order_send(request)
         if result.retcode != _mt5.TRADE_RETCODE_DONE:
             logger.error(f"MT5 order failed: retcode={result.retcode}")
-            self.risk.record_error()
+            # Only critical for unexpected errors. Common non-critical retcodes:
+            # 10018=market_closed, 10019=no_prices, 10030=invalid_volume
+            # 10020=no_quote, 10021=requote, 13108=disabled
+            critical = result.retcode not in (10018, 10019, 10020, 10021, 10030, 13108)
+            self.risk.record_error(critical=critical)
         else:
             # Play audio alert on successful trade execution
             self._play_trade_alert()
@@ -569,9 +778,9 @@ class MT5Executor:
     def _min_sl_for_symbol(symbol):
         """Minimum SL distance (in price units) per symbol type.
         Prevents stop-outs from noise/spread during low-ATR periods."""
-        # Gold: min $10 distance (XAUUSD ~4800, $10 = ~0.2%)
+        # Gold: min $50 distance (XAUUSD ~4800, $50 = ~1%) — gold is volatile
         if "XAU" in symbol.upper():
-            return 10.0
+            return 50.0
         # BTC: min $500 distance (BTC ~75000, $500 = ~0.67%)
         if "BTC" in symbol.upper():
             return 500.0
