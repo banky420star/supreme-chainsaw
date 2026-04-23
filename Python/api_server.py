@@ -96,7 +96,7 @@ def _cors():
     else:
         response.headers["Access-Control-Allow-Origin"] = "http://localhost:4180"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Control-Token"
     response.headers["Vary"] = "Origin"
 
 
@@ -1026,9 +1026,23 @@ def api_perf():
     })
 
 
+# ── Protected control actions requiring a control token ──────────────────
+_PROTECTED_ACTIONS = {
+    "promote_canary", "rollback_canary", "rollback_champion",
+    "restart_server", "start_training_cycle", "stop_training_cycle",
+    "emergency_stop", "clear_emergency_stop",
+}
+
+_CONTROL_TOKEN = os.environ.get("AGI_CONTROL_TOKEN", "")
+
+
 @app.post("/api/control")
 def api_control():
-    """Accept control commands from the React UI (no token required)."""
+    """Accept control commands from the React UI.
+
+    Protected actions require the X-Control-Token header to match
+    the AGI_CONTROL_TOKEN environment variable.
+    """
     try:
         payload = request.json or {}
     except Exception:
@@ -1036,9 +1050,43 @@ def api_control():
     action = payload.get("action", "unknown")
     logger.info(f"API control action received: {action}")
 
+    # ── Token auth for protected actions ────────────────────────────────
+    if action in _PROTECTED_ACTIONS:
+        token = request.get_header("X-Control-Token", "").strip()
+        if _CONTROL_TOKEN and token != _CONTROL_TOKEN:
+            logger.warning(f"Control action '{action}' rejected — invalid/missing token")
+            return _json({"ok": False, "action": action, "error": "control token required"}, 403)
+
     srv = _server_ref
 
-    # Handle UI-specific actions directly (bypass token-gated handle_command)
+    # ── Emergency stop / clear ──────────────────────────────────────────
+    if action == "emergency_stop":
+        if srv and hasattr(srv, "risk"):
+            srv.risk.halt = True
+            logger.critical("EMERGENCY STOP ACTIVATED via API — all trading halted")
+            # Optionally close all open positions if executor is available
+            if hasattr(srv, "executor") and srv.executor:
+                try:
+                    srv.executor.close_all_positions()
+                    logger.info("All open positions closed during emergency stop")
+                except Exception as e:
+                    logger.warning(f"Failed to close positions during emergency stop: {e}")
+            try:
+                srv.telegram.risk_event("EMERGENCY STOP", "All trading halted via API")
+            except Exception:
+                pass
+            return _json({"ok": True, "action": action, "message": "Emergency stop activated. All trading halted.", "halted": True})
+        return _json({"ok": False, "action": action, "error": "No risk engine available"}, 500)
+
+    if action == "clear_emergency_stop":
+        if srv and hasattr(srv, "risk"):
+            srv.risk.halt = False
+            srv.risk._consecutive_errors = 0
+            logger.info("Emergency stop CLEARED via API — trading resumed")
+            return _json({"ok": True, "action": action, "message": "Emergency stop cleared. Trading resumed.", "halted": False})
+        return _json({"ok": False, "action": action, "error": "No risk engine available"}, 500)
+
+    # ── Standard UI actions ─────────────────────────────────────────────
     if action == "restart_server":
         return _json({"ok": True, "action": action, "message": "Server is running. Use system-level restart to restart."})
 
@@ -1072,11 +1120,16 @@ def api_control():
         return _json({"ok": True, "action": action, "message": "Trade memory rebuild queued."})
 
     if action == "promote_canary":
+        symbol = payload.get("symbol")
         if srv and hasattr(srv, "autonomy") and srv.autonomy:
             try:
                 from Python.model_registry import ModelRegistry
-                ModelRegistry().promote_canary()
-                return _json({"ok": True, "action": action, "message": "Canary promoted to champion."})
+                registry = ModelRegistry()
+                if symbol:
+                    registry.promote_canary_to_champion(symbol=symbol)
+                else:
+                    registry.promote_canary()
+                return _json({"ok": True, "action": action, "symbol": symbol or "global", "message": "Canary promoted to champion."})
             except Exception as e:
                 return _json({"ok": False, "action": action, "error": str(e)}, 500)
         return _json({"ok": True, "action": action, "message": "No canary to promote."})
@@ -1085,11 +1138,16 @@ def api_control():
         return _json({"ok": True, "action": action, "message": "Data ingest triggered."})
 
     if action in ("rollback_canary", "rollback_champion"):
+        symbol = payload.get("symbol")
         if srv and hasattr(srv, "autonomy") and srv.autonomy:
             try:
                 from Python.model_registry import ModelRegistry
-                ModelRegistry().rollback_canary()
-                return _json({"ok": True, "action": action, "message": "Canary rolled back."})
+                registry = ModelRegistry()
+                if symbol:
+                    registry.clear_canary(symbol=symbol)
+                else:
+                    registry.rollback_canary()
+                return _json({"ok": True, "action": action, "symbol": symbol or "global", "message": "Canary rolled back."})
             except Exception as e:
                 return _json({"ok": False, "action": action, "error": str(e)}, 500)
         return _json({"ok": True, "action": action, "message": "No canary to rollback."})
@@ -1139,6 +1197,7 @@ def _build_status_summary() -> dict:
         "can_trade": srv.risk.can_trade() if srv and hasattr(srv, "risk") else False,
         "uptime_sec": int(time.time() - srv.start_time) if srv and hasattr(srv, "start_time") else 0,
         "mode": "LIVE" if (srv and getattr(srv, "live", False)) else "DRY-RUN",
+        "live_armed": srv.live_armed if srv and hasattr(srv, "live_armed") else False,
     }
 
 
@@ -1148,6 +1207,26 @@ def _build_status_summary() -> dict:
 @app.get("/api/health")
 def api_health():
     return _json({"status": "ok", "pid": os.getpid(), "time": time.time()})
+
+
+@app.get("/api/emergency_status")
+def api_emergency_status():
+    """Return whether emergency stop is active and why."""
+    srv = _server_ref
+    halted = False
+    reason = ""
+    if srv and hasattr(srv, "risk"):
+        halted = srv.risk.halt
+        if halted:
+            reasons = []
+            if srv.risk.realized_pnl_today < -srv.risk.max_daily_loss:
+                reasons.append(f"daily_loss_exceeded (${srv.risk.realized_pnl_today:.2f} < -${srv.risk.max_daily_loss:.2f})")
+            if getattr(srv.risk, "_consecutive_errors", 0) >= 3:
+                reasons.append("3_consecutive_errors")
+            if not reasons:
+                reasons.append("manual_or_emergency_stop")
+            reason = "; ".join(reasons)
+    return _json({"halted": halted, "reason": reason, "daily_trades": _safe_risk("daily_trades", 0), "realized_pnl": _safe_risk("realized_pnl_today", 0.0)})
 
 
 # ═══════════════════════════════════════════════════════════════════════════

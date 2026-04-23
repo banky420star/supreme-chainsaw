@@ -91,11 +91,12 @@ class ModelRegistry:
         """
         return self.get_active_model(symbol=symbol, prefer_canary=prefer_canary)
 
-    def set_canary(self, version_dir: str, symbol: str = None):
+    def set_canary(self, version_dir: str, symbol: str = None, policy: dict = None):
         """
         Set canary model.
         If symbol is provided, sets per-symbol canary (with symbol artifact validation).
         Otherwise sets global canary.
+        Optionally stores canary_policy for later validation during promotion.
         """
         active = self._read_active()
         if symbol is not None:
@@ -108,12 +109,17 @@ class ModelRegistry:
                 )
             self._ensure_symbol_entry(active, symbol)
             active["symbols"][symbol]["canary"] = version_dir
+            # Store canary policy if provided
+            if policy:
+                active["symbols"][symbol]["canary_policy"] = policy
             self._write_active(active)
-            logger.warning(f"Per-symbol canary set for {symbol}: {version_dir}")
+            logger.warning(f"Per-symbol canary set for {symbol}: {version_dir} (policy={'provided' if policy else 'existing'})")
         else:
             active["canary"] = version_dir
+            if policy:
+                active["canary_policy"] = policy
             self._write_active(active)
-            logger.warning(f"Global canary set: {version_dir}")
+            logger.warning(f"Global canary set: {version_dir} (policy={'provided' if policy else 'existing'})")
 
     def promote_canary_to_champion(self, symbol: str = None):
         """
@@ -423,13 +429,22 @@ class ModelRegistry:
         """
         Check if canary metrics meet the promotion thresholds in policy.
         Metrics must have been recorded (at least 'trades' key) before promotion is allowed.
+        If no policy is set, requires a minimum of 10 trades as a safety floor.
         """
         # Metrics must be recorded before promotion is allowed
         if not state or "trades" not in state:
             return False
 
         if not policy:
-            return True  # No policy thresholds to check beyond having metrics
+            # No explicit policy: enforce a minimum trade count safety floor
+            min_trades_default = 10
+            if state.get("trades", 0) < min_trades_default:
+                logger.warning(
+                    f"Canary validation: no policy set, but only {state.get('trades', 0)} trades "
+                    f"(need {min_trades_default} minimum). Set canary_policy in config to customize."
+                )
+                return False
+            return True
 
         min_trades = policy.get("min_trades", 0)
         min_pnl = policy.get("min_realized_pnl", float("-inf"))
@@ -476,6 +491,38 @@ class ModelRegistry:
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=2)
         logger.info(f"Candidate registered: {candidate_dir}")
+
+    def cleanup_old_candidates(self, symbol: str = None, keep: int = 3):
+        """
+        Remove old candidate directories, keeping only the `keep` most recent.
+        If symbol is provided, cleans per-symbol candidates. Otherwise global.
+        """
+        import shutil
+
+        if symbol is not None:
+            candidates_dir = self.symbol_candidates_dir(symbol)
+        else:
+            candidates_dir = self.candidates_dir
+
+        if not os.path.isdir(candidates_dir):
+            return
+
+        # List candidate dirs sorted by modification time (newest first)
+        entries = []
+        for entry in os.listdir(candidates_dir):
+            full = os.path.join(candidates_dir, entry)
+            if os.path.isdir(full):
+                entries.append((full, os.path.getmtime(full)))
+
+        entries.sort(key=lambda x: x[1], reverse=True)
+
+        # Remove entries beyond the keep limit
+        for path, _ in entries[keep:]:
+            try:
+                shutil.rmtree(path)
+                logger.info(f"Cleaned up old candidate: {path}")
+            except Exception as e:
+                logger.warning(f"Failed to clean up candidate {path}: {e}")
 
     def save_candidate(self, state_dict, metrics: dict, model_type: str = "lstm") -> str:
         """

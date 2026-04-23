@@ -47,8 +47,13 @@ class AGIServer:
 
     def __init__(self, live: bool = False):
         self.live = live
+        self.live_armed = False  # Must be explicitly armed even in live mode
         if live:
             os.environ["AGI_IS_LIVE"] = "1"
+            # Auto-arm if explicit arm is not required
+            if os.environ.get("AGI_REQUIRE_EXPLICIT_LIVE_ARM", "true").lower() != "true":
+                self.live_armed = True
+                logger.info("Live mode auto-armed (AGI_REQUIRE_EXPLICIT_LIVE_ARM=false)")
 
         # Initialize MT5 if available
         if _mt5 is not None and live:
@@ -62,6 +67,7 @@ class AGIServer:
         self.risk = RiskEngine()
         self.risk_supervisor = RiskSupervisor()
         self.executor = MT5Executor(self.risk)
+        self.executor.set_server_ref(self)  # Wire server ref for preflight checks
         self.brain = HybridBrain(self.risk, self.executor)
         self.risk_engine = self.risk  # Alias for AutonomyLoop compatibility
         self.order_manager = OrderManager(self.executor)
@@ -123,6 +129,13 @@ class AGIServer:
         command = request.get("action", "").lower()
         symbol = request.get("symbol", self.symbols[0])
 
+        if command == "arm_live":
+            return self._arm_live()
+        elif command == "disarm_live":
+            self.live_armed = False
+            logger.warning("Live mode DISARMED")
+            return {"ok": True, "action": "DISARM_LIVE", "live_armed": False}
+
         if command == "predict":
             return self._handle_predict(symbol)
         elif command == "trade":
@@ -133,6 +146,22 @@ class AGIServer:
             return self._handle_risk_status()
         else:
             return {"error": f"Unknown command: {command}", "action": "ERROR"}
+
+    def _arm_live(self) -> dict:
+        """Arm live trading mode. Requires AGI_LIVE_ENABLED=true env var AND self.live=True."""
+        if not self.live:
+            return {"ok": False, "action": "ARM_LIVE", "error": "Server not started in live mode (--live flag required)"}
+        live_enabled = os.environ.get("AGI_LIVE_ENABLED", "false").lower() == "true"
+        require_explicit = os.environ.get("AGI_REQUIRE_EXPLICIT_LIVE_ARM", "true").lower() == "true"
+        if require_explicit and not live_enabled:
+            return {"ok": False, "action": "ARM_LIVE", "error": "AGI_LIVE_ENABLED env var must be 'true' to arm live trading"}
+        self.live_armed = True
+        logger.success("LIVE TRADING ARMED — orders will now be sent to MT5")
+        try:
+            self.telegram.risk_event("LIVE ARMED", "Live trading has been explicitly armed via API")
+        except Exception:
+            pass
+        return {"ok": True, "action": "ARM_LIVE", "live_armed": True}
 
     def _handle_predict(self, symbol: str) -> dict:
         """Get prediction without executing."""
@@ -324,7 +353,16 @@ class AGIServer:
         logger.info(f"Auto-trade loop started (every {self._trade_interval}s, symbols={self.symbols})")
         # Initial delay to let models load
         time.sleep(15)
+        _last_armed_log = 0
         while True:
+            # In live mode, refuse to trade unless explicitly armed
+            if self.live and not self.live_armed:
+                now = time.time()
+                if now - _last_armed_log > 60:
+                    logger.warning("Live mode active but NOT ARMED — skipping trades. Send 'arm_live' action to enable.")
+                    _last_armed_log = now
+                time.sleep(self._trade_interval)
+                continue
             for symbol in self.symbols:
                 try:
                     result = self._handle_trade(symbol)
@@ -396,6 +434,7 @@ def main(live=False):
     try:
         from Python.autonomy_loop import AutonomyLoop
         autonomy = AutonomyLoop(server)
+        server.autonomy = autonomy  # Wire for API control actions
 
         async def run_autonomy():
             await autonomy.start()

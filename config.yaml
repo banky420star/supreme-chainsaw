@@ -11,14 +11,17 @@ telegram:
   chat_id: "${TELEGRAM_CHAT_ID}"
 
 risk:
-  max_daily_loss: 99999
-  max_daily_trades: 9999
-  max_lots: 100.0
-  max_drawdown_pct: 10.0
-  max_symbol_exposure: 0.20
-  max_total_exposure: 1.0
+  max_daily_loss: 500
+  max_hourly_loss: 150
+  max_daily_trades: 100
+  max_lots: 5.0
+  max_drawdown_pct: 30.0
+  max_symbol_exposure: 0.50
+  max_total_exposure: 2.0
   max_open_positions: 12
   max_positions_per_symbol: 3
+  max_spread_bps: 80
+  max_slippage_points: 20
 
 drl:
   total_timesteps: 100000

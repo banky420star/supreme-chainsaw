@@ -26,7 +26,7 @@ class AutonomyLoop:
 
         # Canary rules
         self.canary_min_trades = int(os.environ.get("CANARY_MIN_TRADES", "10"))
-        self.canary_max_loss = float(os.environ.get("CANARY_MAX_LOSS", "75"))
+        self.canary_max_loss_pct = float(os.environ.get("CANARY_MAX_LOSS_PCT", "10"))  # % of equity
         self.canary_max_dd = float(os.environ.get("CANARY_MAX_DD", "0.12"))
 
         # Internal canary tracking
@@ -166,9 +166,14 @@ class AutonomyLoop:
 
         dd = float(risk.current_dd) / 100.0
 
+        # Scale canary max loss to current equity (percentage-based)
+        equity = getattr(risk, 'account_equity', None) or getattr(risk, '_current_equity', None) or 100.0
+        canary_max_loss = equity * (self.canary_max_loss_pct / 100.0)
+        logger.info(f"Canary monitor: equity=${equity:.2f}, max_loss=${canary_max_loss:.2f} ({self.canary_max_loss_pct}%), realized=${realized:.2f}, dd={dd:.3f}")
+
         # Rollback conditions
-        if realized <= -self.canary_max_loss or dd >= self.canary_max_dd:
-            logger.error(f"🔴 Canary rollback: realized={realized:.2f} dd={dd:.3f}")
+        if realized <= -canary_max_loss or dd >= self.canary_max_dd:
+            logger.error(f"🔴 Canary rollback: realized=${realized:.2f} >= -${canary_max_loss:.2f} (max {self.canary_max_loss_pct}% of ${equity:.2f}), dd={dd:.3f}")
             self._log_incident("learning", "fail", "Just now", f"[RECURSIVE PENALTY] Canary model rolled back instantly upon hitting max limit (DD: {dd:.3f}). Parameter configuration flagged for suppressed probabilities.")
             self.registry.rollback_to_champion()
             self._canary_start_trade_count = None
@@ -236,17 +241,21 @@ class AutonomyLoop:
             pass
 
     async def nightly_training_loop(self):
-        """Triggers the RL training engine every night at midnight."""
+        """Triggers the RL training engine periodically (every 2 hours or at midnight)."""
+        # Use AGI_TRAIN_INTERVAL_HOURS env var, default 2 hours for continuous training
+        train_interval_hours = float(os.environ.get("AGI_TRAIN_INTERVAL_HOURS", "2"))
+        train_interval_sec = train_interval_hours * 3600
+
+        # Initial delay: 5 minutes after startup to let models warm up
+        await asyncio.sleep(300)
+
         while True:
-            now = datetime.datetime.now()
-            next_midnight = datetime.datetime(now.year, now.month, now.day, 23, 59, 59)
-            seconds_to_midnight = (next_midnight - now).total_seconds()
-
-            logger.debug(f"Next Nightly Retraining scheduled in {int(seconds_to_midnight/3600)} hours.")
-            await asyncio.sleep(seconds_to_midnight + 60)
-
             if self.enable_train:
+                logger.info(f"Autonomy: Starting training cycle (retraining every {train_interval_hours:.1f}h)")
                 await self._train_candidate()
+
+            logger.info(f"Autonomy: Next training in {train_interval_hours:.1f} hours")
+            await asyncio.sleep(train_interval_sec)
 
     async def start(self):
         logger.warning("🤖 AutonomyLoop started (train → evaluate → canary → promote/rollback).")

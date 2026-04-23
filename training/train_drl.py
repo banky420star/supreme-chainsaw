@@ -374,10 +374,11 @@ def train_drl(symbol: str | None = None):
         registry.register_candidate(candidate_path, metrics)
 
         if symbol:
-            # Stage per-symbol canary directly
+            # Stage per-symbol canary directly, with canary_policy from per-symbol config
             try:
-                registry.set_canary(candidate_path, symbol=symbol)
-                logger.success(f"Per-symbol PPO candidate auto-staged as canary for {symbol}")
+                canary_policy = sym_cfg.get("canary_policy", {}) if symbol else {}
+                registry.set_canary(candidate_path, symbol=symbol, policy=canary_policy)
+                logger.success(f"Per-symbol PPO candidate auto-staged as canary for {symbol} (policy={canary_policy})")
             except RuntimeError as e:
                 # Symbol mismatch -- the artifact's symbols must match
                 logger.warning(f"Per-symbol canary staging skipped: {e}")
@@ -395,9 +396,28 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train DRL (PPO) model")
     parser.add_argument("--symbol", type=str, default=None,
                         help="Train per-symbol model (uses configs/{symbol}.yaml)")
+    parser.add_argument("--joint", action="store_true", default=False,
+                        help="Train joint model on all symbols (legacy mode). Default is per-symbol.")
     args = parser.parse_args()
 
     # Support env var override from start_individual_training.ps1
     symbol = args.symbol or os.environ.get("AGI_DRL_SYMBOL")
 
-    train_drl(symbol=symbol)
+    if args.joint and not symbol:
+        # Explicit joint training on all symbols
+        train_drl(symbol=None)
+    elif symbol:
+        # Per-symbol training for a specific symbol
+        train_drl(symbol=symbol)
+    else:
+        # Default: train per-symbol for ALL configured symbols sequentially
+        with open(os.path.join(ROOT_DIR, "config.yaml")) as f:
+            cfg = yaml.safe_load(f)
+        all_symbols = cfg.get("trading", {}).get("symbols", ["EURUSDm"])
+        logger.info(f"Per-symbol training for all configured symbols: {all_symbols}")
+        for sym in all_symbols:
+            try:
+                train_drl(symbol=sym)
+            except Exception as e:
+                logger.error(f"Training failed for {sym}: {e}")
+                continue

@@ -42,10 +42,10 @@ class HybridBrain:
         if confidence_threshold is not None:
             self.confidence_threshold = confidence_threshold
         else:
-            self.confidence_threshold = float(os.environ.get("AGI_DEADZONE_CONFIDENCE", "0.85"))
+            self.confidence_threshold = float(os.environ.get("AGI_DEADZONE_CONFIDENCE", "0.99"))
 
-        # Canary lot multiplier (reduce risk for unproven models)
-        self.canary_lot_mult = float(os.environ.get("CANARY_LOT_MULT", "0.25"))
+        # Canary lot multiplier (full sizing for canary models)
+        self.canary_lot_mult = float(os.environ.get("CANARY_LOT_MULT", "1.0"))
 
         # Per-symbol PPO bias correction
         # Track running mean of PPO outputs per symbol so we can center them
@@ -156,11 +156,13 @@ class HybridBrain:
         # Check per-symbol cache first
         if symbol in self._per_symbol_ppo:
             cached = self._per_symbol_ppo[symbol]
+            model_type = "per_symbol_canary" if cached.get("is_canary") else "per_symbol_champion"
+            logger.debug(f"[{symbol}] PPO resolved from cache: {cached.get('model_dir', 'unknown')} (type={model_type})")
             return (
                 cached["ppo"],
                 cached.get("vec_env"),
                 cached.get("is_canary", False),
-                "canary" if cached.get("is_canary") else "per_symbol_champion",
+                model_type,
             )
 
         # Try loading per-symbol model
@@ -172,14 +174,18 @@ class HybridBrain:
             global_model = registry.get_active_model(symbol=None, prefer_canary=True)
             if per_symbol["model_dir"] != global_model:
                 self._per_symbol_ppo[symbol] = per_symbol
+                model_type = "per_symbol_canary" if per_symbol["is_canary"] else "per_symbol_champion"
+                logger.info(f"[{symbol}] PPO resolved: {per_symbol['model_dir']} (type={model_type})")
                 return (
                     per_symbol["ppo"],
                     per_symbol.get("vec_env"),
                     per_symbol["is_canary"],
-                    "canary" if per_symbol["is_canary"] else "per_symbol_champion",
+                    model_type,
                 )
 
         # Fall back to global model
+        model_type = "global_canary" if self._is_canary else "global_champion"
+        logger.info(f"[{symbol}] PPO resolved: global fallback (type={model_type}, version={self._model_version})")
         return (
             self.ppo_model,
             self.vec_env,
@@ -385,15 +391,26 @@ class HybridBrain:
         # Models can develop a systematic directional bias (e.g. always outputting +0.005).
         # We subtract the per-symbol running mean so the signal is centered around zero,
         # allowing both BUY and SELL signals to emerge from the residual.
+        # IMPORTANT: The correction strength is controlled by AGI_BIAS_STRENGTH:
+        #   0.0 = no correction (raw signal passes through)
+        #   0.5 = cap bias at 50% of raw signal (moderate centering)
+        #   1.0 = full correction (subtract entire EMA bias)
+        # For aggressive trading, use 0.0 or low values to preserve signal strength.
         ppo_bias = self._update_ppo_bias(symbol, ppo_action)
-        ppo_corrected = ppo_action - ppo_bias
-        result["ppo_bias"] = round(float(ppo_bias), 6)
+        bias_strength = float(os.environ.get("AGI_BIAS_STRENGTH", "0.0"))
+        # Apply bias strength: 0 = no correction, 1 = full correction
+        max_bias = abs(ppo_action) * bias_strength
+        ppo_bias_applied = max(-max_bias, min(ppo_bias, max_bias)) if abs(ppo_action) > 0.0001 else ppo_bias * bias_strength
+        ppo_corrected = ppo_action - ppo_bias_applied
+        result["ppo_bias"] = round(float(ppo_bias_applied), 6)
+        result["ppo_bias_raw"] = round(float(ppo_bias), 6)
         result["ppo_corrected_action"] = round(float(ppo_corrected), 6)
 
         if abs(ppo_bias) > 0.001:
             logger.info(
                 f"{symbol}: PPO bias correction | raw={ppo_action:.6f} "
-                f"bias={ppo_bias:.6f} corrected={ppo_corrected:.6f}"
+                f"bias_raw={ppo_bias:.6f} bias_applied={ppo_bias_applied:.6f} corrected={ppo_corrected:.6f} "
+                f"strength={bias_strength}"
             )
 
         # Use bias-corrected action for all downstream steps
@@ -410,9 +427,9 @@ class HybridBrain:
 
         # Per-regime action thresholds (minimum PPO conviction to enter)
         _regime_thresholds = {
-            "LOW_VOLATILITY": 0.005,    # Low vol: still need meaningful signal
-            "MED_VOLATILITY": 0.002,    # Med vol: standard entry threshold
-            "HIGH_VOLATILITY": float(os.environ.get("AGI_HIGH_VOL_MIN_ACTION", "0.01")),  # High vol: strong conviction only
+            "LOW_VOLATILITY": float(os.environ.get("AGI_LOW_VOL_MIN_ACTION", "0.001")),    # Low vol: small signal ok
+            "MED_VOLATILITY": float(os.environ.get("AGI_MED_VOL_MIN_ACTION", "0.001")),    # Med vol: small signal ok
+            "HIGH_VOLATILITY": float(os.environ.get("AGI_HIGH_VOL_MIN_ACTION", "0.002")),  # High vol: still need conviction
         }
         regime_min_action = _regime_thresholds.get(lstm_signal, 0.005)
 
@@ -453,7 +470,7 @@ class HybridBrain:
 
         # ── Step 7: Determine Action ──
         # Sub-threshold: if exposure is too small, treat as HOLD
-        action_threshold = float(os.environ.get("AGI_ACTION_THRESHOLD", "0.02"))
+        action_threshold = float(os.environ.get("AGI_ACTION_THRESHOLD", "0.001"))
         if abs(exposure) < action_threshold:
             result["action"] = "HOLD"
             result["exposure"] = 0.0
@@ -523,12 +540,39 @@ class HybridBrain:
     # ── Decision history & logging helpers ──────────────────────────
 
     def _record_decision(self, decision: dict):
-        """Append decision to ring buffer, JSONL log, and API cache."""
+        """Append decision to ring buffer, JSONL log, and API cache.
+
+        Enriches the decision with structured audit fields before logging.
+        """
         self._decision_history.append(decision)
+
+        # Build enriched audit record for JSONL
+        audit_record = {
+            "timestamp": decision.get("timestamp", ""),
+            "symbol": decision.get("symbol", "UNKNOWN"),
+            "raw_ppo_action": decision.get("ppo_raw_action", []),
+            "corrected_ppo_action": decision.get("ppo_corrected_action", 0.0),
+            "ppo_primary_action": decision.get("ppo_primary_action", 0.0),
+            "ppo_bias": decision.get("ppo_bias", 0.0),
+            "regime": decision.get("lstm_regime", "UNKNOWN"),
+            "confidence": decision.get("confidence", 0.0),
+            "threshold_hit": decision.get("pre_threshold_exposure", 0.0),
+            "reason": decision.get("reason", ""),
+            "action": decision.get("action", "HOLD"),
+            "target_exposure": decision.get("exposure", 0.0),
+            "model_path": decision.get("model_version", ""),
+            "model_version": decision.get("model_version", ""),
+            "is_canary": decision.get("is_canary", False),
+            "canary_scale": decision.get("canary_scale", 1.0),
+            "vol_scale": decision.get("vol_scale", 1.0),
+            "risk_can_trade": decision.get("risk_can_trade", False),
+            "risk_dd_pct": decision.get("risk_dd_pct", 0.0),
+            "regime_trailing": decision.get("regime_trailing", {}),
+        }
 
         try:
             with open(self._decision_log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(decision, default=str) + "\n")
+                f.write(json.dumps(audit_record, default=str) + "\n")
         except Exception as e:
             logger.warning(f"Failed to write decision log: {e}")
 
@@ -628,6 +672,6 @@ class HybridBrain:
                 risk_supervisor.mark_trade(symbol)
         except Exception as e:
             logger.error(f"Execution error for {symbol}: {e}")
-            self.risk.record_error()
+            self.risk.record_error(critical=False)  # Don't trigger kill switch for execution errors
 
         return decision
