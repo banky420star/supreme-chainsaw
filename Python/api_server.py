@@ -322,11 +322,18 @@ def api_status():
 
     # ── Risk engine live values ──
     halt = _safe_risk("halt", False)
+    halt_reason = _safe_risk("_halt_reason", "")
     daily_trades = _safe_risk("daily_trades", 0)
     realized_pnl = _safe_risk("realized_pnl_today", 0.0)
     current_dd = _safe_risk("current_dd", 0.0)
     peak_equity = _safe_risk("_peak_equity", 0.0)
     current_equity = _safe_risk("_current_equity", 0.0)
+    max_daily_loss = _safe_risk("max_daily_loss", 500)
+    max_hourly_loss = _safe_risk("max_hourly_loss", 150)
+    max_daily_trades = _safe_risk("max_daily_trades", 200)
+    max_drawdown_pct = _safe_risk("max_drawdown_pct", 8.0)
+    max_open_positions = _safe_risk("max_open_positions", 8)
+    max_positions_per_symbol = _safe_risk("max_positions_per_symbol", 2)
     can_trade = False
     if srv and hasattr(srv, "risk"):
         try:
@@ -507,13 +514,18 @@ def api_status():
         "mode": mode,
         "risk": {
             "halt": halt,
+            "halt_reason": halt_reason,
             "daily_trades": daily_trades,
-            "max_daily_trades": _safe_risk("max_daily_trades", 20),
+            "max_daily_trades": max_daily_trades,
             "realized_pnl": realized_pnl,
-            "max_daily_loss": _safe_risk("max_daily_loss", 500),
+            "max_daily_loss": max_daily_loss,
+            "max_hourly_loss": max_hourly_loss,
             "current_dd": current_dd,
+            "max_drawdown_pct": max_drawdown_pct,
             "peak_equity": peak_equity,
             "current_equity": current_equity,
+            "max_open_positions": max_open_positions,
+            "max_positions_per_symbol": max_positions_per_symbol,
             "can_trade": can_trade,
         },
         "trade_review": _get_trade_review_summary(),
@@ -1191,6 +1203,7 @@ def _build_status_summary() -> dict:
     return {
         "timestamp": time.time(),
         "halt": _safe_risk("halt", False),
+        "halt_reason": _safe_risk("_halt_reason", ""),
         "daily_trades": _safe_risk("daily_trades", 0),
         "realized_pnl": _safe_risk("realized_pnl_today", 0.0),
         "current_dd": _safe_risk("current_dd", 0.0),

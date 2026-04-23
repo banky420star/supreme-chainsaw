@@ -53,6 +53,8 @@ class MT5Executor:
         self._is_live = _mt5 is not None and sys.platform == "win32"
         self._last_order_meta = {}  # carry context for close orders
         self._last_sl_hit_time = {}  # symbol -> timestamp of last SL hit (cooldown tracking)
+        self._last_spread_spike_time = {}  # symbol -> timestamp of last spread spike rejection
+        self._last_failed_signal_time = {}  # symbol -> timestamp of last failed signal
 
         # ── Half-Kelly position sizing state ──
         self._kelly_win_rate = {}     # symbol -> recent win rate (0-1)
@@ -104,7 +106,20 @@ class MT5Executor:
         # 3. Check spread under threshold (per-symbol config)
         spread_ok, spread_reason = self._check_spread_guard(symbol)
         if not spread_ok:
+            self._last_spread_spike_time[symbol] = time.time()
             return False, spread_reason
+
+        # 3b. Spread spike cooldown: wait 2 min after a spread rejection
+        last_spread_spike = self._last_spread_spike_time.get(symbol, 0)
+        if last_spread_spike > 0 and (time.time() - last_spread_spike) < 120:
+            remaining = 120 - (time.time() - last_spread_spike)
+            return False, f"spread_spike_cooldown ({remaining:.0f}s remaining)"
+
+        # 3c. Failed signal cooldown: wait 5 min after a preflight failure
+        last_failed = self._last_failed_signal_time.get(symbol, 0)
+        if last_failed > 0 and (time.time() - last_failed) < 300:
+            remaining = 300 - (time.time() - last_failed)
+            return False, f"failed_signal_cooldown ({remaining:.0f}s remaining)"
 
         # 4. Verify lot size within symbol cap
         try:
@@ -578,6 +593,7 @@ class MT5Executor:
         )
         if not allowed:
             logger.warning(f"{symbol}: preflight check FAILED — {preflight_reason}")
+            self._last_failed_signal_time[symbol] = time.time()
             self._log_execution({
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "symbol": symbol, "side": direction,
