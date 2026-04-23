@@ -64,3 +64,7 @@ risk:
   profit_banding_pct: 0.25
 symbol: XAUUSDm
 timeframe: M5
+trading_sessions:
+  london: true
+  new_york: true
+  asian: true

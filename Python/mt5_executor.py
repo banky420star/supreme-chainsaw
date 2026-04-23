@@ -103,6 +103,11 @@ class MT5Executor:
             if symbol not in self._server_ref.symbols:
                 return False, f"symbol_not_allowed ({symbol})"
 
+        # 2b. Check trading session filter
+        session_ok, session_reason = self._check_session_filter(symbol)
+        if not session_ok:
+            return False, session_reason
+
         # 3. Check spread under threshold (per-symbol config)
         spread_ok, spread_reason = self._check_spread_guard(symbol)
         if not spread_ok:
@@ -165,6 +170,72 @@ class MT5Executor:
                 pass
 
         return True, "ok"
+
+    def _check_session_filter(self, symbol: str) -> tuple:
+        """Check if current UTC hour falls within allowed trading sessions.
+
+        Sessions (UTC):
+        - Asian: 00:00-08:00
+        - London: 07:00-16:00
+        - New York: 12:00-21:00
+
+        Returns (ok: bool, reason: str).
+        """
+        try:
+            import yaml
+            config_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "configs", f"{symbol}.yaml"
+            )
+            if not os.path.exists(config_path):
+                return True, "ok"  # No config = all sessions allowed
+
+            with open(config_path, "r") as f:
+                sym_cfg = yaml.safe_load(f) or {}
+
+            sessions = sym_cfg.get("trading_sessions", {})
+            if not sessions:
+                return True, "ok"  # No session filter = all allowed
+
+            from datetime import datetime, timezone
+            utc_hour = datetime.now(timezone.utc).hour
+
+            # Determine which session the current hour falls in
+            active_session = None
+            if 0 <= utc_hour < 8:
+                active_session = "asian"
+            elif 7 <= utc_hour < 16:
+                active_session = "london"
+            elif 12 <= utc_hour < 21:
+                active_session = "new_york"
+            # Hours not covered by any session (21-24 UTC) = no session
+            # But also check overlaps: 7-8 is both asian and london, 12-16 is both london and NY
+
+            # Check all overlapping sessions
+            allowed = False
+            matching_sessions = []
+            if 0 <= utc_hour < 8 and sessions.get("asian", True):
+                allowed = True
+                matching_sessions.append("asian")
+            if 7 <= utc_hour < 16 and sessions.get("london", True):
+                allowed = True
+                matching_sessions.append("london")
+            if 12 <= utc_hour < 21 and sessions.get("new_york", True):
+                allowed = True
+                matching_sessions.append("new_york")
+
+            # If no session covers this hour, allow trading (edge case)
+            if not matching_sessions:
+                return True, "ok"
+
+            if allowed:
+                return True, "ok"
+
+            return False, f"outside_trading_session (utc_hour={utc_hour})"
+
+        except Exception as e:
+            logger.debug(f"Session filter check failed for {symbol}: {e}")
+            return True, "ok"
 
     def _check_spread_guard(self, symbol: str) -> tuple:
         """

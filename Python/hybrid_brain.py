@@ -474,6 +474,27 @@ class HybridBrain:
         result["canary_scale"] = canary_scale
         result["pre_threshold_exposure"] = round(float(exposure), 6)
 
+        # ── Step 6b: Confidence-Based Scaling ──
+        # Scale exposure by confidence level to reduce size on weak signals
+        # <0.60 = HOLD, 0.60-0.75 = min_lot, 0.75-0.90 = medium, >0.90 = aggressive
+        confidence = lstm_confidence  # 0-1 from LSTM
+        if confidence < 0.60:
+            confidence_band = "hold"
+            conf_scale = 0.0
+        elif confidence < 0.75:
+            confidence_band = "min_lot"
+            conf_scale = 0.5
+        elif confidence < 0.90:
+            confidence_band = "medium"
+            conf_scale = 0.75
+        else:
+            confidence_band = "aggressive"
+            conf_scale = 1.0
+
+        exposure *= conf_scale
+        result["confidence_band"] = confidence_band
+        result["confidence_scale"] = conf_scale
+
         # ── Step 7: Determine Action ──
         # Sub-threshold: if exposure is too small, treat as HOLD
         action_threshold = float(os.environ.get("AGI_ACTION_THRESHOLD", "0.001"))
