@@ -10,6 +10,7 @@ Decision flow:
   6. Canary scaling: reduce position size when running a canary model
   7. Final signal passed to executor for trade reconciliation
 """
+import glob as _glob
 import json
 import os
 import sys
@@ -61,6 +62,11 @@ class HybridBrain:
         _base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self._decision_log_path = os.path.join(_base, "logs", "decisions.jsonl")
         os.makedirs(os.path.dirname(self._decision_log_path), exist_ok=True)
+
+        # Decision log rotation thresholds
+        self._decision_log_max_bytes = int(os.environ.get("AGI_DECISION_LOG_MAX_MB", "10")) * 1024 * 1024
+        self._decision_log_max_lines = int(os.environ.get("AGI_DECISION_LOG_MAX_LINES", "100000"))
+        self._decision_log_max_archives = int(os.environ.get("AGI_DECISION_LOG_MAX_ARCHIVES", "2"))
 
         # Device
         try:
@@ -539,30 +545,95 @@ class HybridBrain:
 
     # ── Decision history & logging helpers ──────────────────────────
 
+    def _rotate_decision_log(self):
+        """Check decision log size and rotate if it exceeds thresholds.
+
+        Rotation renames the current log to ``decisions_archive_{timestamp}.jsonl``
+        and starts a fresh file. At most ``_decision_log_max_archives`` archive
+        files are kept — the oldest is deleted when the limit is exceeded.
+
+        Both byte-size (default 10 MB) and line-count (default 100 000) thresholds
+        are checked; rotation triggers when *either* is exceeded.
+        """
+        log_path = self._decision_log_path
+        if not os.path.exists(log_path):
+            return
+
+        try:
+            file_size = os.path.getsize(log_path)
+        except OSError:
+            return
+
+        # Fast path: if under byte threshold skip line counting
+        needs_rotation = file_size >= self._decision_log_max_bytes
+
+        if not needs_rotation:
+            try:
+                with open(log_path, "r", encoding="utf-8") as f:
+                    line_count = sum(1 for _ in f)
+                if line_count >= self._decision_log_max_lines:
+                    needs_rotation = True
+            except Exception:
+                return
+
+        if not needs_rotation:
+            return
+
+        # Rotate: rename current log to archive
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        log_dir = os.path.dirname(log_path)
+        archive_path = os.path.join(log_dir, f"decisions_archive_{ts}.jsonl")
+
+        try:
+            os.rename(log_path, archive_path)
+            logger.info(f"Decision log rotated to {archive_path}")
+        except OSError as e:
+            logger.warning(f"Failed to rotate decision log: {e}")
+            return
+
+        # Prune old archives, keeping at most _decision_log_max_archives
+        try:
+            archive_pattern = os.path.join(log_dir, "decisions_archive_*.jsonl")
+            archives = sorted(_glob.glob(archive_pattern))
+            while len(archives) > self._decision_log_max_archives:
+                oldest = archives.pop(0)
+                os.remove(oldest)
+                logger.info(f"Pruned old decision archive: {oldest}")
+        except Exception as e:
+            logger.warning(f"Failed to prune decision archives: {e}")
+
     def _record_decision(self, decision: dict):
         """Append decision to ring buffer, JSONL log, and API cache.
 
         Enriches the decision with structured audit fields before logging.
+        Automatically rotates the log file when it exceeds size/line thresholds.
         """
         self._decision_history.append(decision)
 
-        # Build enriched audit record for JSONL
+        # Rotate log before writing if thresholds exceeded
+        self._rotate_decision_log()
+
+        # Build enriched audit record for JSONL — all required fields present
         audit_record = {
             "timestamp": decision.get("timestamp", ""),
             "symbol": decision.get("symbol", "UNKNOWN"),
             "raw_ppo_action": decision.get("ppo_raw_action", []),
-            "corrected_ppo_action": decision.get("ppo_corrected_action", 0.0),
-            "ppo_primary_action": decision.get("ppo_primary_action", 0.0),
-            "ppo_bias": decision.get("ppo_bias", 0.0),
+            "corrected_action": decision.get("ppo_corrected_action", 0.0),
+            "bias": decision.get("ppo_bias", 0.0),
             "regime": decision.get("lstm_regime", "UNKNOWN"),
             "confidence": decision.get("confidence", 0.0),
-            "threshold_hit": decision.get("pre_threshold_exposure", 0.0),
+            "threshold": decision.get("pre_threshold_exposure", 0.0),
             "reason": decision.get("reason", ""),
-            "action": decision.get("action", "HOLD"),
             "target_exposure": decision.get("exposure", 0.0),
             "model_path": decision.get("model_version", ""),
             "model_version": decision.get("model_version", ""),
             "is_canary": decision.get("is_canary", False),
+            "lot_size": decision.get("lot_size", 0.0),
+            "sl": decision.get("sl", 0.0),
+            "tp": decision.get("tp", 0.0),
+            # Preserved for backward-compat; these were in the original schema
+            "ppo_primary_action": decision.get("ppo_primary_action", 0.0),
+            "action": decision.get("action", "HOLD"),
             "canary_scale": decision.get("canary_scale", 1.0),
             "vol_scale": decision.get("vol_scale", 1.0),
             "risk_can_trade": decision.get("risk_can_trade", False),
