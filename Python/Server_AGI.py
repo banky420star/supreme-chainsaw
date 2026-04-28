@@ -6,6 +6,16 @@ Usage:
   python -m Python.Server_AGI          # dry-run dev mode
   python -m Python.Server_AGI --live   # live trading (Windows + MT5 only)
 """
+# Fix numpy compatibility BEFORE any other imports:
+# PPO models saved with numpy 2.x reference numpy._core but numpy 1.x uses numpy.core.
+import sys as _sys
+import numpy as _np
+if not hasattr(_np, '_core'):
+    import numpy.core as _np_core
+    _sys.modules['numpy._core'] = _np_core
+    _sys.modules['numpy._core.numeric'] = _np_core.numeric
+    _sys.modules['numpy._core._multiarray_umath'] = _np_core._multiarray_umath
+
 import os
 import sys
 import time
@@ -34,6 +44,8 @@ from Python.hybrid_brain import HybridBrain
 from Python.data_feed import get_latest_data, fetch_training_data
 from Python.api_server import start_api_server, cache_decision
 from Python.order_manager import OrderManager
+from Python.event_guard import EventGuard
+from Python.portfolio_allocator import PortfolioAllocator
 from alerts.telegram_alerts import TelegramAlerter
 
 # ── Logging ─────────────────────────────────────────────────────────
@@ -55,6 +67,17 @@ class AGIServer:
                 self.live_armed = True
                 logger.info("Live mode auto-armed (AGI_REQUIRE_EXPLICIT_LIVE_ARM=false)")
 
+        # Load config first so components can use it
+        import yaml
+        config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml")
+        try:
+            with open(config_path) as f:
+                self.cfg = yaml.safe_load(f)
+            self.symbols = self.cfg.get("trading", {}).get("symbols", ["EURUSD"])
+        except Exception:
+            self.cfg = {}
+            self.symbols = ["EURUSD"]
+
         # Initialize MT5 if available
         if _mt5 is not None and live:
             if not _mt5.initialize():
@@ -65,7 +88,7 @@ class AGIServer:
 
         # Core components
         self.risk = RiskEngine()
-        self.risk_supervisor = RiskSupervisor()
+        self.risk_supervisor = RiskSupervisor(self.cfg)
         self.executor = MT5Executor(self.risk)
         self.executor.set_server_ref(self)  # Wire server ref for preflight checks
         self.brain = HybridBrain(self.risk, self.executor)
@@ -77,18 +100,15 @@ class AGIServer:
         self.port = int(os.environ.get("AGI_PORT", "9090"))
         self.token = os.environ.get("AGI_TOKEN", "").strip()
 
-        # Trading symbols from config
-        import yaml
-        config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml")
-        try:
-            with open(config_path) as f:
-                cfg = yaml.safe_load(f)
-            self.symbols = cfg.get("trading", {}).get("symbols", ["EURUSD"])
-        except Exception:
-            self.symbols = ["EURUSD"]
+        # Event volatility guard — blocks/flattens during news events
+        self.event_guard = EventGuard(self.cfg, log_dir=LOG_DIR)
+
+        # Portfolio allocator — dynamic risk budget per symbol
+        alloc_cfg = (self.cfg or {}).get("portfolio", {})
+        self.portfolio_allocator = PortfolioAllocator(alloc_cfg, self.symbols)
 
         # Telegram alerter
-        tel_cfg = (cfg or {}).get("telegram", {}) if isinstance(cfg, dict) else {}
+        tel_cfg = (self.cfg or {}).get("telegram", {}) if isinstance(self.cfg, dict) else {}
         tel_token = os.environ.get("TELEGRAM_TOKEN", "") or str(tel_cfg.get("token", "")).strip()
         tel_chat = os.environ.get("TELEGRAM_CHAT_ID", "") or str(tel_cfg.get("chat_id", "")).strip()
         self.telegram = TelegramAlerter(tel_token or None, tel_chat or None)
@@ -116,6 +136,11 @@ class AGIServer:
         self._trail_thread = threading.Thread(target=self._trailing_stop_loop, daemon=True)
         self._trail_thread.start()
 
+        # Start PPO position review loop in background (every 5 min)
+        self._review_interval = int(os.environ.get("AGI_REVIEW_INTERVAL_SEC", "300"))
+        self._review_thread = threading.Thread(target=self._position_review_loop, daemon=True)
+        self._review_thread.start()
+
         # Start Telegram heartbeat in background
         self._hb_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
         self._hb_thread.start()
@@ -135,6 +160,10 @@ class AGIServer:
             self.live_armed = False
             logger.warning("Live mode DISARMED")
             return {"ok": True, "action": "DISARM_LIVE", "live_armed": False}
+        elif command == "unblock":
+            return self._unblock()
+        elif command == "reset_risk":
+            return self._unblock()
 
         if command == "predict":
             return self._handle_predict(symbol)
@@ -163,6 +192,53 @@ class AGIServer:
             pass
         return {"ok": True, "action": "ARM_LIVE", "live_armed": True}
 
+    def _unblock(self) -> dict:
+        """Unblock the risk engine — clear halt, reset daily counters, and reset peak equity.
+        This is the hard-wired unblock that always works."""
+        prev_halt = self.risk.halt
+        prev_reason = self.risk.get_halt_reason()
+
+        # Clear halt state
+        self.risk.halt = False
+        self.risk._halt_reason = ""
+        self.risk.error_count = 0
+
+        # Reset daily loss tracking so we don't immediately re-halt
+        self.risk.realized_pnl_today = 0.0
+        self.risk.daily_trades = 0
+        self.risk._hourly_pnl.clear()
+
+        # Reset peak equity to current so drawdown % recalculates fresh
+        try:
+            import MetaTrader5 as mt5
+            if mt5.initialize():
+                info = mt5.account_info()
+                if info and info.equity > 0:
+                    self.risk._peak_equity = info.equity
+                    self.risk._current_equity = info.equity
+                    logger.info(f"Peak equity reset to ${info.equity:.2f}")
+                mt5.shutdown()
+        except Exception:
+            pass
+
+        logger.success(
+            f"UNBLOCK: risk engine cleared (was halted={prev_halt}, reason={prev_reason}). "
+            f"Trading resumed."
+        )
+        try:
+            self.telegram.risk_event("UNBLOCK", f"Risk halt cleared. Was: {prev_reason}. Trading resumed.")
+        except Exception:
+            pass
+
+        return {
+            "ok": True,
+            "action": "UNBLOCK",
+            "was_halted": prev_halt,
+            "was_reason": prev_reason,
+            "halt": False,
+            "message": "Risk engine unblocked. Trading resumed.",
+        }
+
     def _handle_predict(self, symbol: str) -> dict:
         """Get prediction without executing."""
         try:
@@ -183,13 +259,23 @@ class AGIServer:
             if df is None or df.empty or len(df) < 100:
                 return {"error": f"Insufficient data for {symbol}", "action": "ERROR"}
 
+            # Get portfolio allocation multiplier for this symbol
+            equity = getattr(self.risk, "_current_equity", 0) or 0
+            lot_multiplier = self.portfolio_allocator.get_lot_multiplier(symbol, equity)
+
             decision = self.brain.live_trade(
                 symbol, df,
                 risk_supervisor=self.risk_supervisor,
-                max_positions_per_symbol=int(os.environ.get("AGI_MAX_POS_PER_SYMBOL", "5"))
+                max_positions_per_symbol=int(os.environ.get("AGI_MAX_POS_PER_SYMBOL", "5")),
+                lot_multiplier=lot_multiplier,
             )
             result = decision if decision else {"action": "HOLD", "reason": "risk_blocked"}
             cache_decision(symbol, result)
+
+            # Record trade result for portfolio allocator performance tracking
+            pnl = result.get("pnl", 0.0)
+            if pnl != 0.0:
+                self.portfolio_allocator.record_trade_result(symbol, pnl)
 
             # Send Telegram alert for executed trades
             action = result.get("action", "HOLD")
@@ -235,8 +321,13 @@ class AGIServer:
             "daily_trades": self.risk.daily_trades,
             "max_daily_trades": self.risk.max_daily_trades,
             "realized_pnl": self.risk.realized_pnl_today,
-            "max_daily_loss": self.risk.max_daily_loss,
-            "current_dd": self.risk.current_dd,
+            "max_daily_loss": round(self.risk.max_daily_loss, 2),
+            "max_hourly_loss": round(self.risk.max_hourly_loss, 2),
+            "max_daily_loss_pct": self.risk.max_daily_loss_pct,
+            "max_hourly_loss_pct": self.risk.max_hourly_loss_pct,
+            "risk_per_trade_pct": self.risk.risk_per_trade_pct,
+            "current_dd": round(self.risk.current_dd, 2),
+            "equity": round(self.risk._current_equity, 2),
             "can_trade": self.risk.can_trade(),
         }
 
@@ -365,14 +456,158 @@ class AGIServer:
                 continue
             for symbol in self.symbols:
                 try:
+                    # EventGuard check — block trades during event windows
+                    gate = self.event_guard.check(
+                        symbol, exposure=0.0, lots=0.0,
+                        mt5_executor=self.executor if self.live else None
+                    )
+                    if not gate.allowed:
+                        logger.info(f"EVENT-GUARD blocked {symbol}: {gate.reason}")
+                        cache_decision(symbol, {"action": "HOLD", "reason": f"event_guard: {gate.reason}"})
+                        continue
+
+                    # Flatten positions before major events if configured
+                    if self.event_guard.should_flatten(symbol) and self.live:
+                        logger.info(f"EVENT-GUARD flattening {symbol} positions")
+                        try:
+                            self.executor.close_all_positions(symbol)
+                        except Exception as e:
+                            logger.warning(f"EVENT-GUARD flatten error for {symbol}: {e}")
+
                     result = self._handle_trade(symbol)
                     action = result.get("action", "UNKNOWN") if result else "ERROR"
                     reason = result.get("reason", "") if result else ""
                     exposure = result.get("exposure", 0.0) if result else 0.0
                     logger.info(f"AUTO-TRADE {symbol}: {action} | exposure={exposure:.4f} | {reason}")
+
+                    # Apply EventGuard size multipliers to the decision
+                    if result and action in ("BUY", "SELL") and gate.exposure_mult != 1.0:
+                        result["exposure"] = result.get("exposure", 0.0) * gate.exposure_mult
+                        logger.info(f"EVENT-GUARD size adjustment for {symbol}: "
+                                    f"exposure x{gate.exposure_mult} (phase={gate.phase})")
                 except Exception as e:
                     logger.warning(f"Auto-trade error for {symbol}: {e}")
             time.sleep(self._trade_interval)
+
+    def _position_review_loop(self):
+        """Background thread: every 5 minutes, evaluate all open positions against PPO.
+        If PPO now says opposite direction or HOLD for a position's symbol, close it.
+        This ensures positions are always aligned with current model signals.
+        """
+        logger.info(f"Position review loop started (every {self._review_interval}s)")
+        time.sleep(60)  # Wait for initial data load
+
+        while True:
+            try:
+                if not self.live or _mt5 is None:
+                    time.sleep(self._review_interval)
+                    continue
+
+                if not _mt5.initialize():
+                    time.sleep(self._review_interval)
+                    continue
+
+                try:
+                    positions = _mt5.positions_get()
+                    if not positions:
+                        _mt5.shutdown()
+                        time.sleep(self._review_interval)
+                        continue
+
+                    # Group positions by symbol
+                    by_symbol = {}
+                    for p in positions:
+                        if p.symbol not in by_symbol:
+                            by_symbol[p.symbol] = []
+                        by_symbol[p.symbol].append(p)
+
+                    for symbol, sym_positions in by_symbol.items():
+                        try:
+                            # Get PPO prediction for this symbol
+                            df = fetch_training_data(symbol, period="5d", interval="5m")
+                            if df is None or df.empty or len(df) < 100:
+                                continue
+
+                            decision = self.brain.decide(symbol, df)
+                            if decision is None:
+                                continue
+
+                            ppo_action = decision.get("action", "HOLD")
+                            ppo_exposure = decision.get("exposure", 0.0)
+
+                            for p in sym_positions:
+                                pos_side = "BUY" if p.type == 0 else "SELL"
+                                pos_pnl = float(p.profit) if hasattr(p, 'profit') else 0.0
+
+                                should_close = False
+                                close_reason = ""
+
+                                # Close if PPO says opposite direction
+                                if ppo_action == "BUY" and pos_side == "SELL":
+                                    should_close = True
+                                    close_reason = f"PPO flipped to BUY (short losing ${pos_pnl:.2f})"
+                                elif ppo_action == "SELL" and pos_side == "BUY":
+                                    should_close = True
+                                    close_reason = f"PPO flipped to SELL (long losing ${pos_pnl:.2f})"
+
+                                # Close losing positions if PPO says HOLD
+                                elif ppo_action == "HOLD" and pos_pnl < 0:
+                                    should_close = True
+                                    close_reason = f"PPO says HOLD (position losing ${pos_pnl:.2f})"
+
+                                if should_close:
+                                    logger.info(
+                                        f"POSITION REVIEW: closing {symbol} #{p.ticket} "
+                                        f"{pos_side} {p.volume:.2f}lots — {close_reason}"
+                                    )
+                                    # Close the position
+                                    close_type = _mt5.ORDER_TYPE_BUY if p.type == 1 else _mt5.ORDER_TYPE_SELL
+                                    tick = _mt5.symbol_info_tick(symbol)
+                                    if tick:
+                                        close_price = tick.bid if p.type == 0 else tick.ask
+                                        request = {
+                                            "action": _mt5.TRADE_ACTION_DEAL,
+                                            "symbol": symbol,
+                                            "volume": p.volume,
+                                            "type": close_type,
+                                            "position": p.ticket,
+                                            "price": close_price,
+                                            "comment": "PPO_REVIEW",
+                                        }
+                                        result = _mt5.order_send(request)
+                                        if result.retcode == _mt5.TRADE_RETCODE_DONE:
+                                            logger.success(
+                                                f"POSITION REVIEW CLOSED: {symbol} #{p.ticket} "
+                                                f"PnL=${pos_pnl:.2f} — {close_reason}"
+                                            )
+                                            try:
+                                                self.telegram.trade(
+                                                    symbol=symbol,
+                                                    action=f"REVIEW_CLOSE_{pos_side}",
+                                                    exposure=0,
+                                                    confidence=0,
+                                                    balance=getattr(self.risk, "_mt5_balance", 0) or 0,
+                                                    equity=getattr(self.risk, "_current_equity", 0) or 0,
+                                                    free_margin=getattr(self.risk, "_mt5_free_margin", 0) or 0,
+                                                    tag=close_reason,
+                                                )
+                                            except Exception:
+                                                pass
+                                        else:
+                                            logger.warning(
+                                                f"POSITION REVIEW close failed: {symbol} #{p.ticket} "
+                                                f"retcode={result.retcode}"
+                                            )
+                        except Exception as e:
+                            logger.warning(f"Position review error for {symbol}: {e}")
+
+                finally:
+                    _mt5.shutdown()
+
+            except Exception as e:
+                logger.warning(f"Position review loop error: {e}")
+
+            time.sleep(self._review_interval)
 
     def run_socket_server(self):
         """Run the TCP socket server for n8n bridge communication."""

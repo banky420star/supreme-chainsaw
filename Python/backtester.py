@@ -2,6 +2,16 @@
 Backtester — runs PPO on historical data using the SAME TradingEnv used in training.
 This is the only sane way to gate model promotions unless you implement broker-grade execution simulation.
 """
+# Fix numpy compatibility: models saved with numpy 2.x reference numpy._core
+# but numpy 1.x uses numpy.core. Create module aliases so pickle can find them.
+import sys as _sys
+import numpy as _np
+if not hasattr(_np, '_core'):
+    import numpy.core as _np_core
+    _sys.modules['numpy._core'] = _np_core
+    _sys.modules['numpy._core.numeric'] = _np_core.numeric
+    _sys.modules['numpy._core._multiarray_umath'] = _np_core._multiarray_umath
+
 import os
 import sys
 import json

@@ -62,6 +62,11 @@ class MT5Executor:
         self._kelly_avg_loss = {}     # symbol -> average losing trade PnL (positive)
         self._kelly_last_update = {}  # symbol -> timestamp of last stats update
 
+        # ── Cached broker parameters (read once, not per-trade) ──────────────
+        self._min_lots = float(os.environ.get("AGI_MIN_LOTS", "0.01"))
+        self._default_lot_step = 0.02  # fallback if broker doesn't provide volume_step
+        self._mt5_has_calendar = hasattr(_mt5, "calendar_country") if _mt5 else False
+
         if self._is_live:
             try:
                 if not _mt5.initialize():
@@ -296,6 +301,175 @@ class MT5Executor:
             # FX pairs: ~$0.10 per pip per 0.01 lot
             return 0.10
 
+    def compute_risk_adjusted_lots(self, symbol, exposure, confidence_scale=1.0):
+        """Compute lots based on risk-per-trade percentage and ATR stop distance.
+
+        Formula: lots = (equity * risk_pct / 100) / (SL_distance * pip_value)
+        This scales automatically from $50 to $250K+.
+
+        Falls back to Kelly sizing if ATR is unavailable.
+        """
+        risk_pct = getattr(self.risk, 'risk_per_trade_pct', 1.0)
+        equity = getattr(self.risk, '_current_equity', 0)
+        if equity <= 0:
+            equity = 50.0
+
+        # Get ATR-based SL distance
+        atr = self._get_raw_atr(symbol)
+        if atr <= 0:
+            # Fall back to Kelly
+            min_lots = self._min_lots
+            sym_max_lots = self._get_symbol_max_lots(symbol)
+            return self._kelly_lot_size(symbol, exposure, min_lots, sym_max_lots)
+
+        # Load per-symbol ATR multiplier for SL
+        sl_mult = self._get_symbol_sl_mult(symbol)
+        sl_distance = atr * sl_mult
+
+        # Dollar risk for this trade
+        max_risk_dollars = equity * risk_pct / 100.0
+
+        # Get pip value from MT5 tick data
+        pip_value = self._get_tick_pip_value(symbol)
+        if pip_value <= 0:
+            pip_value = self._pip_value_per_lot(symbol)
+
+        # Lots = risk_dollars / (sl_distance_in_pips * pip_value_per_pip_per_lot)
+        # Convert SL distance to pips, then multiply by pip value
+        min_lots = self._min_lots
+        tick_size = self._get_tick_size(symbol)
+
+        # For small accounts: cap SL distance to what equity can afford
+        # (same logic as open_position — prevents gold/BTC ATR SLs from blocking trades)
+        if equity < 100 and sl_distance > 0:
+            max_sl_equity_pct_local = 15.0
+            max_risk_dollars_local = equity * max_sl_equity_pct_local / 100.0
+            if pip_value > 0 and tick_size > 0:
+                max_sl_dist = max_risk_dollars_local / (min_lots * pip_value / tick_size) if min_lots > 0 else sl_distance
+                min_sl_floor = max(0.00005 * 2, self._min_sl_for_symbol(symbol) * 0.04)
+                if max_sl_dist > min_sl_floor and sl_distance > max_sl_dist:
+                    sl_distance = max_sl_dist
+
+        if tick_size > 0:
+            sl_pips = sl_distance / tick_size
+            lots = max_risk_dollars / (sl_pips * pip_value)
+        else:
+            lots = min_lots  # safe fallback
+
+        # Scale by confidence
+        lots *= confidence_scale
+
+        # Clamp to per-symbol max
+        sym_max_lots = self._get_symbol_max_lots(symbol)
+        lots = max(min_lots, min(lots, sym_max_lots))
+
+        # ── Max SL equity cap: no single trade should risk more than X% of equity ──
+        max_sl_equity_pct = getattr(self.risk, 'max_sl_equity_pct', 10.0)
+        # For small accounts (<$100), raise the cap to 15% to allow trading
+        if equity < 100:
+            max_sl_equity_pct = max(max_sl_equity_pct, 15.0)
+        max_sl_dollars = equity * max_sl_equity_pct / 100.0
+        if tick_size > 0 and pip_value > 0 and lots > 0:
+            actual_risk_dollars = lots * sl_pips * pip_value
+            if actual_risk_dollars > max_sl_dollars * 1.01 and actual_risk_dollars > 0:
+                # Calculate the safe lot size for this equity cap
+                safe_lots = max_sl_dollars / (sl_pips * pip_value)
+                if safe_lots < min_lots:
+                    # Even minimum lots exceeds the equity risk cap — SKIP this trade entirely
+                    logger.warning(
+                        f"ATR sizing {symbol}: SKIP — min_lots {min_lots} risks "
+                        f"${min_lots * sl_pips * pip_value:.2f} > {max_sl_equity_pct}% equity "
+                        f"(${max_sl_dollars:.2f}). Safe lots={safe_lots:.4f}. "
+                        f"Account too small for this symbol."
+                    )
+                    return 0.0
+                lots = safe_lots
+                lots = min(lots, sym_max_lots)
+                logger.info(
+                    f"ATR sizing {symbol}: SL equity cap triggered — "
+                    f"risk ${actual_risk_dollars:.2f} > {max_sl_equity_pct}% (${max_sl_dollars:.2f}), "
+                    f"reduced to {lots:.2f} lots"
+                )
+
+        # Round to lot step (read from broker if available)
+        lot_step = self._get_lot_step(symbol)
+        lots = round(lots / lot_step) * lot_step
+        lots = max(min_lots, min(lots, sym_max_lots))
+
+        logger.info(
+            f"ATR sizing {symbol}: equity=${equity:.2f} risk_pct={risk_pct}% "
+            f"atr={atr:.5f} sl_dist={sl_distance:.5f} risk=${max_risk_dollars:.2f} "
+            f"-> {lots:.2f} lots"
+        )
+        return lots
+
+    def _get_symbol_max_lots(self, symbol: str) -> float:
+        """Get max lots from per-symbol config."""
+        try:
+            config_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "configs", f"{symbol}.yaml"
+            )
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
+                    sym_cfg = yaml.safe_load(f)
+                return float(sym_cfg.get("risk", {}).get("max_lots", 1.0))
+        except Exception:
+            pass
+        return 1.0
+
+    def _get_lot_step(self, symbol: str) -> float:
+        """Get lot step from broker symbol info, fallback to default."""
+        try:
+            if self._is_live:
+                info = _mt5.symbol_info(symbol)
+                if info and getattr(info, "volume_step", 0) > 0:
+                    return float(info.volume_step)
+        except Exception:
+            pass
+        return self._default_lot_step
+
+    def _get_symbol_sl_mult(self, symbol: str) -> float:
+        """Get SL ATR multiplier from per-symbol config."""
+        try:
+            config_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "configs", f"{symbol}.yaml"
+            )
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
+                    sym_cfg = yaml.safe_load(f)
+                return float(sym_cfg.get("risk", {}).get("sl_atr_mult", 2.0))
+        except Exception:
+            pass
+        return 2.0
+
+    def _get_tick_pip_value(self, symbol: str) -> float:
+        """Get tick value per lot from MT5 symbol info."""
+        if not self._is_live or _mt5 is None:
+            return 0.0
+        try:
+            info = _mt5.symbol_info(symbol)
+            if info is None:
+                return 0.0
+            tick_value = getattr(info, 'trade_tick_value', 0)
+            return float(tick_value) if tick_value else 0.0
+        except Exception:
+            return 0.0
+
+    def _get_tick_size(self, symbol: str) -> float:
+        """Get tick size from MT5 symbol info."""
+        if not self._is_live or _mt5 is None:
+            return 0.0
+        try:
+            info = _mt5.symbol_info(symbol)
+            if info is None:
+                return 0.0
+            tick_size = getattr(info, 'trade_tick_size', 0)
+            return float(tick_size) if tick_size else 0.0
+        except Exception:
+            return 0.0
+
     def _update_kelly_stats(self, symbol):
         """Refresh per-symbol win rate and PnL stats from MT5 trade history."""
         now = time.time()
@@ -417,9 +591,15 @@ class MT5Executor:
             sl_distance_atr = 2.0  # assume 2x ATR SL
             lots_from_risk = risk_budget / (sl_distance_atr * pip_value_per_lot) if pip_value_per_lot > 0 else min_lots
 
-        # Hard cap: max risk per trade = 2% of balance (regardless of Kelly)
+        # Start from Kelly-risk-derived lot size
+        lot_size = lots_from_risk
+
+        # Hard cap: max risk per trade = max_sl_equity_pct% of balance (regardless of Kelly)
         # This prevents disasters like 1.0 lots on a $40 account
-        max_risk_dollars = balance * 0.02
+        max_sl_equity_pct = getattr(self.risk, 'max_sl_equity_pct', 10.0)
+        if balance < 100:
+            max_sl_equity_pct = max(max_sl_equity_pct, 15.0)
+        max_risk_dollars = balance * max_sl_equity_pct / 100.0
         if avg_loss > 0 and lot_size > 0:
             max_lots_by_risk = max_risk_dollars / avg_loss
             lot_size = min(lot_size, max_lots_by_risk)
@@ -427,8 +607,8 @@ class MT5Executor:
         # Apply broker minimum and maximum
         lot_size = max(min_lots, min(lot_size, max_lots))
 
-        # Round to broker lot step (0.01 for most symbols)
-        lot_step = 0.01
+        # Round to broker lot step
+        lot_step = self._get_lot_step(symbol)
         lot_size = round(lot_size / lot_step) * lot_step
         lot_size = max(min_lots, min(lot_size, max_lots))
 
@@ -534,6 +714,8 @@ class MT5Executor:
             if not currencies:
                 currencies = None
 
+            if not self._mt5_has_calendar:
+                return False
             countries = _mt5.calendar_country()
             if not countries:
                 return False
@@ -575,7 +757,7 @@ class MT5Executor:
             return False
 
         except Exception as e:
-            logger.warning(f"News blackout check failed for {symbol}: {e}")
+            logger.debug(f"News blackout check failed for {symbol}: {e}")
             return False
 
     def reconcile_exposure(self, symbol, target_exposure, max_lots, max_positions_per_symbol=5,
@@ -618,15 +800,8 @@ class MT5Executor:
         # Load per-symbol risk config FIRST so preflight uses the right caps
         sym_max_lots = max_lots
         sym_max_positions = max_positions_per_symbol
+        sym_min_lots = self._min_lots
 
-        # For very small accounts (< $50), limit to 1 position per symbol to prevent overexposure
-        # Above $50, allow up to config max (typically 3)
-        equity = getattr(self.risk, "_current_equity", None)
-        if equity is None or equity <= 0:
-            equity = 50.0
-        small_account = equity < 50
-        if small_account:
-            sym_max_positions = 1
         try:
             import yaml
             config_path = os.path.join(
@@ -639,13 +814,73 @@ class MT5Executor:
                 risk_cfg = sym_cfg.get("risk", {})
                 sym_max_lots = risk_cfg.get("max_lots", max_lots)
                 sym_max_positions = risk_cfg.get("max_positions_per_symbol", max_positions_per_symbol)
+                sym_min_lots = float(risk_cfg.get("min_lots", self._min_lots))
         except Exception:
             pass
+
+        # ── Per-symbol minimum equity check ─────────────────────────────────
+        # Reject trades on symbols where even the minimum lot size would risk
+        # more than max_sl_equity_pct of equity. E.g. XAUUSDm 0.01 lots risks $18+
+        # on a $22 account — 80%+ of equity, which exceeds the 10% cap.
+        min_lots = sym_min_lots
+        equity = getattr(self.risk, "_current_equity", None)
+        if equity is None or equity <= 0:
+            equity = 50.0
+        max_sl_equity_pct = getattr(self.risk, 'max_sl_equity_pct', 10.0)
+        # For small accounts (<$100), raise the cap to 15% to allow trading
+        if equity < 100:
+            max_sl_equity_pct = max(max_sl_equity_pct, 15.0)
+        max_sl_dollars = equity * max_sl_equity_pct / 100.0
+
+        # Calculate SL distance for this symbol to estimate min risk
+        sl_mult = self._get_symbol_sl_mult(symbol)
+        raw_atr = self._get_raw_atr(symbol)
+        if raw_atr > 0 and max_sl_dollars > 0:
+            sl_distance = raw_atr * sl_mult
+            # Apply same min SL floor as open_position to avoid passing trades that will be blocked
+            if equity < 100:
+                min_sl_floor = max(0.00005 * 2, self._min_sl_for_symbol(symbol) * 0.04)
+            else:
+                min_sl_floor = max(0.00005 * 3, self._min_sl_for_symbol(symbol))
+            if sl_distance < min_sl_floor:
+                sl_distance = min_sl_floor
+            # For small accounts: cap SL distance to what equity can afford
+            if equity < 100 and sl_distance > min_sl_floor:
+                tick_sz = self._get_tick_size(symbol)
+                pip_val = self._get_tick_pip_value(symbol) or self._pip_value_per_lot(symbol)
+                if tick_sz > 0 and pip_val > 0 and min_lots > 0:
+                    max_sl_dist = max_sl_dollars / (min_lots * pip_val / tick_sz)
+                    if sl_distance > max_sl_dist and max_sl_dist > min_sl_floor:
+                        sl_distance = max_sl_dist
+            pip_value = self._get_tick_pip_value(symbol) or self._pip_value_per_lot(symbol)
+            tick_size = self._get_tick_size(symbol)
+            if pip_value > 0 and tick_size > 0:
+                sl_pips = sl_distance / tick_size
+                min_risk = min_lots * sl_pips * pip_value
+                if min_risk > max_sl_dollars * 1.01:  # 1% buffer for rounding
+                    logger.warning(
+                        f"{symbol}: SKIP — min_lots {min_lots} risks ${min_risk:.2f} > "
+                        f"{max_sl_equity_pct}% equity (${max_sl_dollars:.2f}). "
+                        f"Account too small for this symbol."
+                    )
+                    self._log_execution({
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "symbol": symbol, "side": "BUY" if target_exposure > 0 else "SELL",
+                        "lot_size": 0, "allowed": False,
+                        "reason": f"equity_too_small_for_symbol (min_risk=${min_risk:.2f} > {max_sl_equity_pct}%=${max_sl_dollars:.2f})",
+                    })
+                    return
+
+        # For very small accounts (< $50), limit to 1 position per symbol to prevent overexposure
+        # Above $50, allow up to config max (typically 3)
+        small_account = equity < 50
+        if small_account:
+            sym_max_positions = 1
 
         # Apply small account caps AFTER loading config so they don't get clobbered
         if small_account:
             sym_max_positions = 1
-            sym_max_lots = min(sym_max_lots, 0.01)
+            sym_max_lots = min(sym_max_lots, self._min_lots)
 
         direction = "BUY" if target_exposure > 0 else "SELL"
         allowed, preflight_reason = self._preflight_check(
@@ -661,14 +896,12 @@ class MT5Executor:
             })
             return
 
-        min_lots = float(os.environ.get("AGI_MIN_LOTS", "0.01"))
+        min_lots = self._min_lots
 
-        # ── Full Kelly Position Sizing ──
-        # f* = (p*b - q) / b  where p=win_prob, q=1-p, b=avg_win/avg_loss
-        # Full Kelly: use entire Kelly fraction for maximum growth
-        lot_size = self._kelly_lot_size(
-            symbol, target_exposure, min_lots, sym_max_lots
-        )
+        # ── ATR-Based Risk-Adjusted Sizing (primary) ──
+        # Uses risk_per_trade_pct from risk engine + ATR stop distance
+        # Falls back to Kelly criterion if ATR unavailable
+        lot_size = self.compute_risk_adjusted_lots(symbol, target_exposure)
 
         if not self._is_live:
             # Dry-run: just log the intended trade
@@ -691,6 +924,7 @@ class MT5Executor:
             return
 
         is_buy = target_exposure > 0
+        hedging_enabled = os.environ.get("AGI_HEDGING_ENABLED", "true").lower() == "true"
 
         if is_buy:
             # If we already have long positions, don't add more unless under the limit
@@ -699,43 +933,45 @@ class MT5Executor:
                 logger.debug(f"{symbol}: max long positions reached ({n_longs}/{sym_max_positions})")
                 return
 
-            # Close any opposing short positions first
-            if n_shorts > 0:
+            # Close opposing short positions ONLY if hedging is disabled
+            if not hedging_enabled and n_shorts > 0:
                 self.close_positions(shorts, order_meta=order_meta)
                 logger.info(f"Closed {n_shorts} short position(s) for {symbol}")
 
             # Open ONE new long position
-            self.open_position(symbol, _mt5.ORDER_TYPE_BUY, lot_size, order_meta=order_meta)
-            self.risk.record_trade()
-            logger.info(f"Opened long #{n_longs + 1}/{sym_max_positions} for {symbol} ({lot_size} lots)")
-            self._log_execution({
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "symbol": symbol, "side": "BUY", "lot_size": lot_size,
-                "allowed": True, "reason": "ok",
-                "magic": self._magic_for_order(symbol, order_meta or {}, request_kind="open"),
-                "order_meta": order_meta,
-            })
+            opened = self.open_position(symbol, _mt5.ORDER_TYPE_BUY, lot_size, order_meta=order_meta)
+            if opened:
+                self.risk.record_trade()
+                logger.info(f"Opened long #{n_longs + 1}/{sym_max_positions} for {symbol} ({lot_size} lots)")
+                self._log_execution({
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "symbol": symbol, "side": "BUY", "lot_size": lot_size,
+                    "allowed": True, "reason": "ok",
+                    "magic": self._magic_for_order(symbol, order_meta or {}, request_kind="open"),
+                    "order_meta": order_meta,
+                })
         else:
             if n_shorts >= sym_max_positions:
                 logger.debug(f"{symbol}: max short positions reached ({n_shorts}/{sym_max_positions})")
                 return
 
-            # Close any opposing long positions first
-            if n_longs > 0:
+            # Close opposing long positions ONLY if hedging is disabled
+            if not hedging_enabled and n_longs > 0:
                 self.close_positions(longs, order_meta=order_meta)
                 logger.info(f"Closed {n_longs} long position(s) for {symbol}")
 
             # Open ONE new short position
-            self.open_position(symbol, _mt5.ORDER_TYPE_SELL, lot_size, order_meta=order_meta)
-            self.risk.record_trade()
-            logger.info(f"Opened short #{n_shorts + 1}/{sym_max_positions} for {symbol} ({lot_size} lots)")
-            self._log_execution({
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "symbol": symbol, "side": "SELL", "lot_size": lot_size,
-                "allowed": True, "reason": "ok",
-                "magic": self._magic_for_order(symbol, order_meta or {}, request_kind="open"),
-                "order_meta": order_meta,
-            })
+            opened = self.open_position(symbol, _mt5.ORDER_TYPE_SELL, lot_size, order_meta=order_meta)
+            if opened:
+                self.risk.record_trade()
+                logger.info(f"Opened short #{n_shorts + 1}/{sym_max_positions} for {symbol} ({lot_size} lots)")
+                self._log_execution({
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "symbol": symbol, "side": "SELL", "lot_size": lot_size,
+                    "allowed": True, "reason": "ok",
+                    "magic": self._magic_for_order(symbol, order_meta or {}, request_kind="open"),
+                    "order_meta": order_meta,
+                })
 
     def close_positions(self, positions, order_meta=None):
         if not self._is_live:
@@ -781,26 +1017,49 @@ class MT5Executor:
             self.close_positions(list(positions))
 
     def open_position(self, symbol, order_type, volume, order_meta=None):
+        """Open a position. Returns True on success, False on abort/failure, None when not live."""
         if not self._is_live:
-            return
+            return None
 
         tick = _mt5.symbol_info_tick(symbol)
         if tick is None:
             logger.error(f"Cannot get tick for {symbol}")
             self.risk.record_error(critical=False)  # Non-critical: market data issue
-            return
+            return False
 
         # Compute ATR-based SL/TP defaults
         sl_distance, tp_distance = self._compute_atr_sl_tp(symbol)
 
         # Enforce minimum SL distance to prevent instant SL hits on tight ATR periods
         # Minimum SL: at least spread * 3 to avoid being stopped out by noise
+        # For small accounts (<$100), use a tighter floor (spread * 2) to allow trading
         spread = tick.ask - tick.bid
-        min_sl = max(spread * 3, self._min_sl_for_symbol(symbol))
+        equity = getattr(self.risk, "_current_equity", 0) or 50.0
+        if equity < 100:
+            # Small accounts: use tighter SL to allow trading
+            # FX: 0.003*0.33=0.001 (~10 pips), Gold: $50*0.04=$2, BTC: $500*0.04=$20
+            min_sl = max(spread * 2, self._min_sl_for_symbol(symbol) * 0.04)
+        else:
+            min_sl = max(spread * 3, self._min_sl_for_symbol(symbol))
         if 0 < sl_distance < min_sl:
             logger.warning(f"{symbol}: ATR SL={sl_distance:.5f} too tight, widening to min={min_sl:.5f}")
             sl_distance = min_sl
-        # Scale TP proportionally if SL was widened
+
+        # For small accounts (<$100): cap SL distance to what equity can afford
+        # This prevents gold/BTC ATR-based SLs ($20-500) from exceeding risk cap
+        if equity < 100 and sl_distance > min_sl:
+            max_sl_equity_pct_local = 15.0  # same as the cap we use below
+            max_risk_dollars = equity * max_sl_equity_pct_local / 100.0
+            tick_sz = self._get_tick_size(symbol)
+            pip_val = self._get_tick_pip_value(symbol) or self._pip_value_per_lot(symbol)
+            if tick_sz > 0 and pip_val > 0 and volume > 0:
+                max_sl_distance = max_risk_dollars / (volume * pip_val / tick_sz)
+                if sl_distance > max_sl_distance and max_sl_distance > min_sl:
+                    logger.info(f"{symbol}: Small-account SL cap: ${sl_distance:.2f} -> ${max_sl_distance:.2f} "
+                                f"(max risk ${max_risk_dollars:.2f} = {max_sl_equity_pct_local}% of ${equity:.2f})")
+                    sl_distance = max_sl_distance
+
+        # Scale TP proportionally if SL was adjusted
         if tp_distance > 0 and sl_distance > 0:
             tp_distance = max(tp_distance, sl_distance * 1.5)
 
@@ -813,6 +1072,48 @@ class MT5Executor:
         else:
             sl = round(entry_price + sl_distance, 5) if sl_distance > 0 else 0
             tp = round(entry_price - tp_distance, 5) if tp_distance > 0 else 0
+
+        # ── Final safety: cap SL risk at max_sl_equity_pct% of equity ──
+        # For small accounts (<$100), raise the cap to 15% to allow trading
+        max_sl_equity_pct = getattr(self.risk, 'max_sl_equity_pct', 10.0)
+        if equity < 100:
+            max_sl_equity_pct = max(max_sl_equity_pct, 15.0)
+        equity = getattr(self.risk, '_current_equity', 0) or 50.0
+        max_sl_dollars = equity * max_sl_equity_pct / 100.0
+        if sl > 0 and sl_distance > 0:
+            pip_val = self._get_tick_pip_value(symbol) or self._pip_value_per_lot(symbol)
+            tick_sz = self._get_tick_size(symbol)
+            if pip_val > 0 and tick_sz > 0:
+                sl_pips = sl_distance / tick_sz
+                actual_risk = volume * sl_pips * pip_val
+                if actual_risk > max_sl_dollars * 1.01:  # 1% buffer for rounding
+                    # Calculate safe volume
+                    safe_volume = max_sl_dollars / (sl_pips * pip_val)
+                    min_lots = self._min_lots
+                    if safe_volume < min_lots:
+                        # Even minimum lots exceeds equity risk cap — ABORT this trade
+                        logger.warning(
+                            f"SL equity cap ABORT: {symbol} min_lots {min_lots} risks "
+                            f"${min_lots * sl_pips * pip_val:.2f} > {max_sl_equity_pct}% equity "
+                            f"(${max_sl_dollars:.2f}). Safe vol={safe_volume:.4f}. "
+                            f"Account too small for this symbol."
+                        )
+                        self.risk.record_error(critical=False)
+                        return False
+                    lot_step = self._get_lot_step(symbol)
+                    safe_volume = round(safe_volume / lot_step) * lot_step
+                    # DO NOT floor safe_volume back to min_lots — that defeats the equity cap
+                    # If safe_volume rounded down to 0, abort instead
+                    if safe_volume < lot_step:
+                        logger.warning(
+                            f"SL equity cap: {symbol} safe_volume {safe_volume:.4f} < lot_step {lot_step}, ABORT"
+                        )
+                        return False
+                    logger.warning(
+                        f"SL equity cap: {symbol} risk ${actual_risk:.2f} > {max_sl_equity_pct}% (${max_sl_dollars:.2f}), "
+                        f"reduced volume {volume:.2f} -> {safe_volume:.2f}"
+                    )
+                    volume = safe_volume
 
         # Magic number and comment for trade identification
         meta = order_meta or {}
@@ -846,18 +1147,21 @@ class MT5Executor:
             # 10020=no_quote, 10021=requote, 13108=disabled
             critical = result.retcode not in (10018, 10019, 10020, 10021, 10030, 13108)
             self.risk.record_error(critical=critical)
+            return False
         else:
             # Play audio alert on successful trade execution
             self._play_trade_alert()
+            return True
 
     @staticmethod
     def _min_sl_for_symbol(symbol):
         """Minimum SL distance (in price units) per symbol type.
-        Prevents stop-outs from noise/spread during low-ATR periods."""
-        # Gold: min $50 distance (XAUUSD ~4800, $50 = ~1%) — gold is volatile
+        Prevents stop-outs from noise/spread during low-ATR periods.
+        These are BASE values — small accounts use a fraction via open_position()."""
+        # Gold: base $50, but small accounts use $2 via 0.04x multiplier
         if "XAU" in symbol.upper():
             return 50.0
-        # BTC: min $500 distance (BTC ~75000, $500 = ~0.67%)
+        # BTC: base $500, but small accounts use $20 via 0.04x multiplier
         if "BTC" in symbol.upper():
             return 500.0
         # ETH: min $30

@@ -1064,7 +1064,7 @@ def api_perf():
 _PROTECTED_ACTIONS = {
     "promote_canary", "rollback_canary", "rollback_champion",
     "restart_server", "start_training_cycle", "stop_training_cycle",
-    "emergency_stop", "clear_emergency_stop",
+    "emergency_stop", "clear_emergency_stop", "unblock", "arm_live",
 }
 
 _CONTROL_TOKEN = os.environ.get("AGI_CONTROL_TOKEN", "")
@@ -1119,6 +1119,31 @@ def api_control():
             logger.info("Emergency stop CLEARED via API — trading resumed")
             return _json({"ok": True, "action": action, "message": "Emergency stop cleared. Trading resumed.", "halted": False})
         return _json({"ok": False, "action": action, "error": "No risk engine available"}, 500)
+
+    # ── Unblock: Hard-reset risk engine halt and reset counters ──
+    if action == "unblock":
+        if srv and hasattr(srv, "_unblock"):
+            result = srv._unblock()
+            return _json(result)
+        elif srv and hasattr(srv, "risk"):
+            # Fallback: directly reset risk engine
+            prev_halt = srv.risk.halt
+            prev_reason = srv.risk.get_halt_reason() if hasattr(srv.risk, 'get_halt_reason') else ""
+            srv.risk.halt = False
+            srv.risk._halt_reason = ""
+            srv.risk.error_count = 0
+            srv.risk.realized_pnl_today = 0.0
+            srv.risk.daily_trades = 0
+            logger.success(f"UNBLOCK via API: risk engine cleared (was halted={prev_halt}, reason={prev_reason})")
+            return _json({"ok": True, "action": "unblock", "was_halted": prev_halt, "was_reason": prev_reason, "halt": False, "message": "Risk engine unblocked via API."})
+        return _json({"ok": False, "action": action, "error": "No risk engine available"}, 500)
+
+    # ── Arm live: Enable live trading ──
+    if action == "arm_live":
+        if srv and hasattr(srv, "_arm_live"):
+            result = srv._arm_live()
+            return _json(result)
+        return _json({"ok": False, "action": action, "error": "Server not available"}, 500)
 
     # ── Standard UI actions ─────────────────────────────────────────────
     if action == "restart_server":

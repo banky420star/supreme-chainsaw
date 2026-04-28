@@ -10,6 +10,16 @@ Decision flow:
   6. Canary scaling: reduce position size when running a canary model
   7. Final signal passed to executor for trade reconciliation
 """
+# Fix numpy compatibility: models saved with numpy 2.x reference numpy._core
+# but numpy 1.x uses numpy.core. Create module aliases so pickle can find them.
+import sys as _sys
+import numpy as _np
+if not hasattr(_np, '_core'):
+    import numpy.core as _np_core
+    _sys.modules['numpy._core'] = _np_core
+    _sys.modules['numpy._core.numeric'] = _np_core.numeric
+    _sys.modules['numpy._core._multiarray_umath'] = _np_core._multiarray_umath
+
 import glob as _glob
 import json
 import os
@@ -27,7 +37,7 @@ import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
-from Python.feature_pipeline import build_env_feature_matrix, ENGINEERED_V2
+from Python.feature_pipeline import build_env_feature_matrix, ENGINEERED_V2, ENGINEERED_V3, feature_count_for_version
 
 
 class HybridBrain:
@@ -88,9 +98,23 @@ class HybridBrain:
         # Per-symbol PPO model cache: symbol -> {"ppo": PPO, "vec_env": VecNormalize, "is_canary": bool}
         self._per_symbol_ppo: dict[str, dict] = {}
 
+        # Per-symbol feature version tracking (v2 vs v3) for observation building
+        self._per_symbol_feature_version: dict[str, str] = {}
+
         self._model_version = "fallback"
         self._load_ppo_from_registry()
         self._load_lstm()
+
+        # News sentiment engine
+        from Python.news_sentiment import NewsSentimentEngine
+        _cfg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml")
+        try:
+            import yaml
+            with open(_cfg_path) as f:
+                _cfg = yaml.safe_load(f) or {}
+        except Exception:
+            _cfg = {}
+        self.sentiment_engine = NewsSentimentEngine(_cfg.get("news_sentiment", {}))
 
         # _model_version is set inside _load_ppo_from_registry() from the
         # actual model directory name (e.g. ppo_20260412_115739).
@@ -102,6 +126,30 @@ class HybridBrain:
                 self._model_version = "champion"
 
         logger.success(f"HybridBrain initialized on {self.device.upper()} | canary={self._is_canary}")
+
+    @staticmethod
+    def _feature_version_from_obs(obs_dim: int) -> str:
+        """Determine feature version from observation space dimension.
+        Formula: obs_dim = window_size(100) * n_features + portfolio_features
+        v2: 100 * 21 + 3 = 2103, v3: 100 * 25 + 3 = 2503
+        Threshold: if obs_dim >= 100 * 25, it must be v3 or higher.
+        """
+        if obs_dim >= 100 * feature_count_for_version(ENGINEERED_V3):
+            return ENGINEERED_V3
+        return ENGINEERED_V2
+
+    @staticmethod
+    def _feature_version_for_model(ppo_model) -> str:
+        """Detect feature version from a loaded PPO model's observation space."""
+        try:
+            obs_shape = ppo_model.observation_space.shape
+            obs_dim = obs_shape[0] if obs_shape else 2103
+            return HybridBrain._feature_version_from_obs(obs_dim)
+        except Exception:
+            return ENGINEERED_V2
+
+    # Track per-symbol feature versions so decide() uses the right one
+    # (instance variable, set in __init__)
 
     def _load_ppo_for_symbol(self, symbol: str) -> dict | None:
         """
@@ -125,10 +173,14 @@ class HybridBrain:
                 return None
 
             ppo = PPO.load(model_path, device=self.device)
+            # Detect feature version from model observation space
+            fv = self._feature_version_for_model(ppo)
+            logger.info(f"[{symbol}] Detected feature version {fv} (obs_dim={ppo.observation_space.shape[0]})")
+
             vec_env = None
             if os.path.exists(vec_path):
                 from drl.trading_env import TradingEnv
-                dummy = DummyVecEnv([lambda: TradingEnv(feature_version=ENGINEERED_V2)])
+                dummy = DummyVecEnv([lambda fv=fv: TradingEnv(feature_version=fv)])
                 vec_env = VecNormalize.load(vec_path, dummy)
                 vec_env.training = False
                 vec_env.norm_reward = False
@@ -139,12 +191,13 @@ class HybridBrain:
                 is_canary = (active.get("canary") is not None and
                              active_dir == active.get("canary"))
 
-            logger.success(f"Per-symbol PPO loaded for {symbol}: {active_dir} (canary={is_canary})")
+            logger.success(f"Per-symbol PPO loaded for {symbol}: {active_dir} (canary={is_canary}, fv={fv})")
             return {
                 "ppo": ppo,
                 "vec_env": vec_env,
                 "is_canary": is_canary,
                 "model_dir": active_dir,
+                "feature_version": fv,
             }
 
         except Exception as e:
@@ -163,7 +216,10 @@ class HybridBrain:
         if symbol in self._per_symbol_ppo:
             cached = self._per_symbol_ppo[symbol]
             model_type = "per_symbol_canary" if cached.get("is_canary") else "per_symbol_champion"
-            logger.debug(f"[{symbol}] PPO resolved from cache: {cached.get('model_dir', 'unknown')} (type={model_type})")
+            # Store feature version for this symbol
+            fv = cached.get("feature_version", ENGINEERED_V2)
+            self._per_symbol_feature_version[symbol] = fv
+            logger.debug(f"[{symbol}] PPO resolved from cache: {cached.get('model_dir', 'unknown')} (type={model_type}, fv={fv})")
             return (
                 cached["ppo"],
                 cached.get("vec_env"),
@@ -180,8 +236,10 @@ class HybridBrain:
             global_model = registry.get_active_model(symbol=None, prefer_canary=True)
             if per_symbol["model_dir"] != global_model:
                 self._per_symbol_ppo[symbol] = per_symbol
+                fv = per_symbol.get("feature_version", ENGINEERED_V2)
+                self._per_symbol_feature_version[symbol] = fv
                 model_type = "per_symbol_canary" if per_symbol["is_canary"] else "per_symbol_champion"
-                logger.info(f"[{symbol}] PPO resolved: {per_symbol['model_dir']} (type={model_type})")
+                logger.info(f"[{symbol}] PPO resolved: {per_symbol['model_dir']} (type={model_type}, fv={fv})")
                 return (
                     per_symbol["ppo"],
                     per_symbol.get("vec_env"),
@@ -189,9 +247,11 @@ class HybridBrain:
                     model_type,
                 )
 
-        # Fall back to global model
+        # Fall back to global model — detect feature version from global PPO
+        fv = self._feature_version_for_model(self.ppo_model) if self.ppo_model else ENGINEERED_V2
+        self._per_symbol_feature_version[symbol] = fv
         model_type = "global_canary" if self._is_canary else "global_champion"
-        logger.info(f"[{symbol}] PPO resolved: global fallback (type={model_type}, version={self._model_version})")
+        logger.info(f"[{symbol}] PPO resolved: global fallback (type={model_type}, version={self._model_version}, fv={fv})")
         return (
             self.ppo_model,
             self.vec_env,
@@ -204,6 +264,19 @@ class HybridBrain:
         Load PPO model + VecNormalize from the model registry (champion or canary).
         If symbol is provided, tries per-symbol champion/canary first, then global.
         """
+        # Fix numpy compatibility: models saved with numpy 2.x reference numpy._core
+        # but numpy 1.x uses numpy.core. Create the alias so pickle can find it.
+        try:
+            import numpy as _np
+            if not hasattr(_np, '_core'):
+                import sys
+                import numpy.core as _np_core
+                sys.modules['numpy._core'] = _np_core
+                sys.modules['numpy._core.numeric'] = _np_core.numeric
+                sys.modules['numpy._core._multiarray_umath'] = _np_core._multiarray_umath
+        except Exception:
+            pass
+
         try:
             from Python.model_registry import ModelRegistry
             registry = ModelRegistry()
@@ -230,13 +303,14 @@ class HybridBrain:
                     logger.success(f"PPO loaded from registry: {active_dir}")
 
                     if os.path.exists(vec_path):
-                        # Build a dummy env matching the trained model's obs/action spaces
+                        # Detect feature version from model observation space
+                        fv = self._feature_version_for_model(self.ppo_model)
                         from drl.trading_env import TradingEnv
-                        dummy = DummyVecEnv([lambda: TradingEnv(feature_version=ENGINEERED_V2)])
+                        dummy = DummyVecEnv([lambda fv=fv: TradingEnv(feature_version=fv)])
                         self.vec_env = VecNormalize.load(vec_path, dummy)
                         self.vec_env.training = False
                         self.vec_env.norm_reward = False
-                        logger.success("VecNormalize loaded from registry")
+                        logger.success(f"VecNormalize loaded from registry (feature_version={fv})")
                 else:
                     logger.warning(f"No ppo_trading.zip in {active_dir}")
 
@@ -255,8 +329,9 @@ class HybridBrain:
                     logger.success(f"PPO loaded from fallback: {model_path}")
 
                     if os.path.exists(vec_path):
+                        fv = self._feature_version_for_model(self.ppo_model)
                         from drl.trading_env import TradingEnv
-                        dummy = DummyVecEnv([lambda: TradingEnv(feature_version=ENGINEERED_V2)])
+                        dummy = DummyVecEnv([lambda fv=fv: TradingEnv(feature_version=fv)])
                         self.vec_env = VecNormalize.load(vec_path, dummy)
                         self.vec_env.training = False
                         self.vec_env.norm_reward = False
@@ -372,7 +447,7 @@ class HybridBrain:
         ppo_model, ppo_vec_env, ppo_is_canary, ppo_model_version = self._get_ppo_for_symbol(symbol)
         if ppo_model is not None and len(df) >= 100:
             try:
-                obs = self._build_observation(df)
+                obs = self._build_observation(df, symbol=symbol)
                 if obs is not None:
                     # Apply VecNormalize if available
                     if ppo_vec_env is not None:
@@ -399,11 +474,12 @@ class HybridBrain:
         # allowing both BUY and SELL signals to emerge from the residual.
         # IMPORTANT: The correction strength is controlled by AGI_BIAS_STRENGTH:
         #   0.0 = no correction (raw signal passes through)
-        #   0.5 = cap bias at 50% of raw signal (moderate centering)
-        #   1.0 = full correction (subtract entire EMA bias)
-        # For aggressive trading, use 0.0 or low values to preserve signal strength.
+        #   0.3 = light centering (preserves most signal, reduces constant offset)
+        #   0.5 = moderate centering (cap bias at 50% of raw signal)
+        #   1.0 = full correction (subtract entire EMA bias) — DANGEROUS: kills all signal
+        # Default 0.3 preserves signal strength while reducing constant directional bias.
         ppo_bias = self._update_ppo_bias(symbol, ppo_action)
-        bias_strength = float(os.environ.get("AGI_BIAS_STRENGTH", "0.0"))
+        bias_strength = float(os.environ.get("AGI_BIAS_STRENGTH", "0.3"))
         # Apply bias strength: 0 = no correction, 1 = full correction
         max_bias = abs(ppo_action) * bias_strength
         ppo_bias_applied = max(-max_bias, min(ppo_bias, max_bias)) if abs(ppo_action) > 0.0001 else ppo_bias * bias_strength
@@ -422,6 +498,54 @@ class HybridBrain:
         # Use bias-corrected action for all downstream steps
         ppo_action = ppo_corrected
 
+        # ── Step 4b: Trend-Direction Alignment ──
+        # PPO models have a systematic BUY bias (always outputting positive values).
+        # To allow SELL/hedging signals, we use price momentum to determine trade direction:
+        #   - If price is falling (bearish momentum) and PPO says BUY, flip to SELL
+        #   - If price is rising (bullish momentum) and PPO says BUY, keep BUY
+        #   - If PPO says SELL (negative after bias correction), keep SELL
+        # This enables hedging: we short in downtrends while the PPO magnitude
+        # determines position size.
+        trend_lookback = int(os.environ.get("AGI_TREND_LOOKBACK", "20"))  # bars for momentum calc
+        trend_flip_enabled = os.environ.get("AGI_TREND_FLIP_ENABLED", "true").lower() == "true"
+
+        if trend_flip_enabled and len(df) >= trend_lookback + 1:
+            try:
+                close_prices = df["close"].values
+                recent_close = close_prices[-1]
+                past_close = close_prices[-(trend_lookback + 1)]
+                momentum_pct = (recent_close - past_close) / past_close if past_close != 0 else 0.0
+
+                # Determine market direction from price momentum
+                if momentum_pct < -0.0001:
+                    # Falling market — flip BUY signal to SELL for hedging
+                    if ppo_action > 0:
+                        ppo_action = -abs(ppo_action)
+                        result["trend_flip"] = "bearish_flip"
+                        result["momentum_pct"] = round(float(momentum_pct), 6)
+                        logger.debug(
+                            f"{symbol}: TREND-FLIP bearish | momentum={momentum_pct:.4%} | "
+                            f"flipped BUY→SELL"
+                        )
+                    # SELL signal in bearish market — keep it, amplify slightly
+                    else:
+                        result["trend_flip"] = "bearish_align"
+                        result["momentum_pct"] = round(float(momentum_pct), 6)
+                elif momentum_pct > 0.0001:
+                    # Rising market — BUY signals align, SELL signals are contrarian
+                    if ppo_action < 0:
+                        result["trend_flip"] = "bullish_contrarian"
+                        result["momentum_pct"] = round(float(momentum_pct), 6)
+                    else:
+                        result["trend_flip"] = "bullish_align"
+                        result["momentum_pct"] = round(float(momentum_pct), 6)
+                else:
+                    result["trend_flip"] = "flat"
+                    result["momentum_pct"] = round(float(momentum_pct), 6)
+            except Exception as e:
+                logger.debug(f"{symbol}: trend-direction calc failed ({e})")
+                result["trend_flip"] = "error"
+
         # ── Step 5: Volatility-Scaled Exposure (Per-Regime Strategy) ──
         # Each regime has a distinct trading strategy:
         #   LOW_VOL:  Conservative scalping — tight entries, small size, quick exits
@@ -432,10 +556,11 @@ class HybridBrain:
         # _regime_to_risk_scalar: HIGH=0.55, MED=0.80, LOW=0.95, unknown=0.75
 
         # Per-regime action thresholds (minimum PPO conviction to enter)
+        # Lowered from 0.001/0.002 to 0.0001 to allow XAUUSDm's small-magnitude signals through
         _regime_thresholds = {
-            "LOW_VOLATILITY": float(os.environ.get("AGI_LOW_VOL_MIN_ACTION", "0.001")),    # Low vol: small signal ok
-            "MED_VOLATILITY": float(os.environ.get("AGI_MED_VOL_MIN_ACTION", "0.001")),    # Med vol: small signal ok
-            "HIGH_VOLATILITY": float(os.environ.get("AGI_HIGH_VOL_MIN_ACTION", "0.002")),  # High vol: still need conviction
+            "LOW_VOLATILITY": float(os.environ.get("AGI_LOW_VOL_MIN_ACTION", "0.0001")),
+            "MED_VOLATILITY": float(os.environ.get("AGI_MED_VOL_MIN_ACTION", "0.0001")),
+            "HIGH_VOLATILITY": float(os.environ.get("AGI_HIGH_VOL_MIN_ACTION", "0.0001")),
         }
         regime_min_action = _regime_thresholds.get(lstm_signal, 0.005)
 
@@ -464,6 +589,21 @@ class HybridBrain:
             self._record_decision(result)
             return result
 
+        # ── Step 5.5: Sentiment Adjustment (News + Fear & Greed) ──
+        # Apply sentiment-based exposure modifier from news, events, and FGI
+        sentiment_data = self.sentiment_engine.compute_exposure_modifier(symbol)
+        sentiment_mult = sentiment_data.get("exposure_mult", 1.0)
+        exposure *= sentiment_mult
+        result["sentiment"] = sentiment_data.get("sentiment", 0.0)
+        result["fgi"] = sentiment_data.get("fgi", 50)
+        result["sentiment_reason"] = sentiment_data.get("reason", "neutral")
+        if abs(sentiment_mult - 1.0) > 0.01:
+            logger.info(
+                f"[HybridBrain] {symbol}: sentiment adj x{sentiment_mult:.2f} | "
+                f"sent={sentiment_data.get('sentiment',0):.2f} fgi={sentiment_data.get('fgi',50)} "
+                f"reason={sentiment_data.get('reason','neutral')}"
+            )
+
         # ── Step 6: Canary Risk Scaling ──
         canary_scale = 1.0
         if ppo_is_canary:
@@ -476,15 +616,16 @@ class HybridBrain:
 
         # ── Step 6b: Confidence-Based Scaling ──
         # Scale exposure by confidence level to reduce size on weak signals
-        # <0.60 = HOLD, 0.60-0.75 = min_lot, 0.75-0.90 = medium, >0.90 = aggressive
+        # <0.40 = HOLD, 0.40-0.60 = min_lot, 0.60-0.80 = medium, >0.80 = aggressive
+        # Lowered from 0.60/0.75/0.90 to allow per-symbol models with lower confidence to trade
         confidence = lstm_confidence  # 0-1 from LSTM
-        if confidence < 0.60:
+        if confidence < 0.40:
             confidence_band = "hold"
             conf_scale = 0.0
-        elif confidence < 0.75:
+        elif confidence < 0.60:
             confidence_band = "min_lot"
             conf_scale = 0.5
-        elif confidence < 0.90:
+        elif confidence < 0.80:
             confidence_band = "medium"
             conf_scale = 0.75
         else:
@@ -497,7 +638,8 @@ class HybridBrain:
 
         # ── Step 7: Determine Action ──
         # Sub-threshold: if exposure is too small, treat as HOLD
-        action_threshold = float(os.environ.get("AGI_ACTION_THRESHOLD", "0.001"))
+        # Lowered from 0.001 to 0.0001 to match regime thresholds
+        action_threshold = float(os.environ.get("AGI_ACTION_THRESHOLD", "0.0001"))
         if abs(exposure) < action_threshold:
             result["action"] = "HOLD"
             result["exposure"] = 0.0
@@ -681,10 +823,10 @@ class HybridBrain:
         """Return a copy of the recent decision ring buffer."""
         return list(self._decision_history)
 
-    def _build_observation(self, df: pd.DataFrame) -> np.ndarray | None:
+    def _build_observation(self, df: pd.DataFrame, symbol: str = None) -> np.ndarray | None:
         """
-        Build the observation vector matching TradingEnv engineered_v2 format:
-        [window_size * 21 features] + [3 portfolio state features] = (2103,)
+        Build the observation vector matching the model's expected feature version.
+        Detects feature version from the per-symbol model or falls back to global.
         """
         try:
             window_size = 100
@@ -703,8 +845,13 @@ class HybridBrain:
                     end=pd.Timestamp.utcnow(), periods=len(feed_df), freq="5min", tz="UTC"
                 )
 
-            # Build the feature matrix via the feature pipeline (engineered_v2: 21 features)
-            feature_matrix = build_env_feature_matrix(feed_df, feature_version=ENGINEERED_V2)
+            # Use the correct feature version for this symbol's model
+            fv = self._per_symbol_feature_version.get(symbol, ENGINEERED_V2)
+            feature_matrix = build_env_feature_matrix(
+                feed_df, feature_version=fv,
+                sentiment_engine=getattr(self, 'sentiment_engine', None),
+                symbol=symbol,
+            )
 
             if len(feature_matrix) < window_size:
                 logger.warning(f"Not enough data for observation: {len(feature_matrix)} < {window_size}")
@@ -725,29 +872,42 @@ class HybridBrain:
             return None
 
     def live_trade(self, symbol: str, df: pd.DataFrame, max_lots: float = None,
-                   risk_supervisor=None, max_positions_per_symbol: int = 5):
+                   risk_supervisor=None, max_positions_per_symbol: int = 5,
+                   lot_multiplier: float = 1.0):
         """
         Full live trading loop: decide → execute.
         Each cycle can open a new position (up to max_positions_per_symbol).
+
+        lot_multiplier: portfolio allocator scaling factor (0.1-2.0).
         """
+        # Always compute the decision first (needed for bias tracking)
+        decision = self.decide(symbol, df)
+        if decision is None:
+            return None
+
         if not self.risk.can_trade():
-            logger.debug(f"{symbol}: Risk engine blocked trading")
-            return
+            logger.debug(f"{symbol}: Risk engine blocked trading (decision was {decision.get('action', 'UNKNOWN')})")
+            decision["action"] = "HOLD"
+            decision["reason"] = "risk_blocked"
+            return decision
 
         # RiskSupervisor circuit breaker check
         if risk_supervisor is not None:
             decision_rs = risk_supervisor.can_trade(symbol)
             if not decision_rs.allowed:
                 logger.warning(f"{symbol}: RiskSupervisor blocked trading — {decision_rs.reason}")
-                return
+                decision["action"] = "HOLD"
+                decision["reason"] = f"supervisor_blocked: {decision_rs.reason}"
+                return decision
 
         if max_lots is None:
             max_lots = self.risk.max_lots
 
-        decision = self.decide(symbol, df)
-
         if decision["action"] == "HOLD":
             return decision
+
+        # Apply portfolio allocator lot multiplier
+        effective_max_lots = max_lots * lot_multiplier
 
         # Execute via MT5 or dry-run executor
         try:
@@ -756,7 +916,7 @@ class HybridBrain:
                 "model_version": decision.get("model_version", ""),
             }
             self.executor.reconcile_exposure(
-                symbol, decision["exposure"], max_lots,
+                symbol, decision["exposure"], effective_max_lots,
                 max_positions_per_symbol=max_positions_per_symbol,
                 order_meta=order_meta,
             )

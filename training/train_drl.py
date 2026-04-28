@@ -1,4 +1,14 @@
 import sys, os, argparse
+
+# Fix numpy compatibility: models saved with numpy 2.x reference numpy._core
+# but numpy 1.x uses numpy.core. Create module aliases so pickle can find them.
+import numpy as _np
+if not hasattr(_np, '_core'):
+    import numpy.core as _np_core
+    sys.modules['numpy._core'] = _np_core
+    sys.modules['numpy._core.numeric'] = _np_core.numeric
+    sys.modules['numpy._core._multiarray_umath'] = _np_core._multiarray_umath
+
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from training.progress_writer import update_training_progress

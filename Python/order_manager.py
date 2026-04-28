@@ -18,6 +18,9 @@ from typing import Optional
 import yaml
 from loguru import logger
 
+# Cached broker parameters (read once at module load)
+_MIN_LOTS = float(os.environ.get("AGI_MIN_LOTS", "0.01"))
+
 # Conditional MT5 import
 _mt5 = None
 if os.name == "nt":
@@ -60,11 +63,12 @@ def _load_symbol_risk_config(symbol: str) -> dict:
         "tp_atr_mult": 3.0,
         "trailing_trigger_atr": 1.0,
         "trailing_distance_atr": 1.0,
-        "breakeven_trigger_dollars": 5.0,
-        "scale_out_1_dollars": 5.0,
-        "scale_out_2_dollars": 10.0,
+        "breakeven_risk_mult": 1.0,    # Move SL to entry at 1x initial risk
+        "scale_out_1_risk_mult": 1.25,  # Close 1/4 at 1.25x initial risk
+        "scale_out_2_risk_mult": 2.0,   # Close 1/4 at 2.0x initial risk
+        "scale_out_3_risk_mult": 3.0,   # Close 1/4 at 3.0x initial risk
         "profit_banding_pct": 0.30,
-        "max_lots": 0.01,
+        "max_lots": 0.02,
         "max_positions_per_symbol": 2,
         "max_drawdown_pct": 10.0,
     }
@@ -99,13 +103,24 @@ class ManagedPosition:
     partial_close_done: bool = False
 
     # Multi-level scale-out tracking
-    scale_out_level: int = 0  # 0=none, 1=first close, 2=second close, 3=runner trailing
+    scale_out_level: int = 0  # 0=none, 1-N=scale out levels, N+1=runner trailing
     scale_out_1_done: bool = False
     scale_out_2_done: bool = False
+    scale_out_3_done: bool = False
+    scale_out_4_done: bool = False
+    scale_out_5_done: bool = False
+    scale_out_6_done: bool = False
+    scale_out_7_done: bool = False
+    scale_out_8_done: bool = False
+    scale_out_9_done: bool = False
+    scale_out_10_done: bool = False
 
     # High-water mark for trailing stop calculation
     high_water_mark: float = 0.0
     low_water_mark: float = float("inf")
+
+    # SL change failure tracking — prevent infinite retry loops
+    sl_change_fail_count: int = 0
 
 
 @dataclass
@@ -228,16 +243,19 @@ class OrderManager:
         """
         Check if a position should have its SL moved to breakeven.
 
-        Breakeven is triggered when floating profit reaches the dollar
-        threshold (breakeven_trigger_dollars, default $5). This ensures
-        every winning trade locks in profit before trailing starts.
+        Breakeven is triggered when floating profit reaches a multiple
+        of the initial risk (breakeven_risk_mult, default 1.0x).
+        Initial risk = SL distance * pip_value * volume.
+
+        This scales automatically with position size — $5 triggers for a
+        micro lot become $500 triggers for standard lots.
 
         Args:
             symbol: Trading symbol
             position: ManagedPosition to evaluate
             current_price: Current market price
-            atr_value: Current ATR value (used for spread buffer)
-            lot_size: Position volume in lots (for dollar profit calc)
+            atr_value: Current ATR value (used for spread buffer and risk calc)
+            lot_size: Position volume in lots (for risk calc)
 
         Returns:
             OrderResult if breakeven should be triggered, None otherwise.
@@ -246,19 +264,28 @@ class OrderManager:
             return None
 
         risk_cfg = _load_symbol_risk_config(symbol)
-        trigger_dollars = risk_cfg.get("breakeven_trigger_dollars", 5.0)
+        breakeven_risk_mult = risk_cfg.get("breakeven_risk_mult", 1.0)
 
         is_buy = position.side.upper() == "BUY"
+
+        # Calculate initial risk for this position
+        sl_distance_price = abs(position.open_price - position.current_sl) if position.current_sl > 0 else atr_value * risk_cfg.get("sl_atr_mult", 2.0)
+        initial_risk = OrderManager._calc_dollar_profit(
+            symbol, position.volume, position.open_price,
+            position.open_price + (sl_distance_price if is_buy else -sl_distance_price),
+            is_buy
+        )
+        # Fallback: use ATR-based risk if SL not set
+        if initial_risk <= 0:
+            initial_risk = atr_value * risk_cfg.get("sl_atr_mult", 2.0) * position.volume * OrderManager._pip_value_per_lot(symbol)
+
+        # Breakeven trigger = risk_mult * initial_risk
+        trigger_dollars = breakeven_risk_mult * max(initial_risk, 0.01)
 
         # Calculate dollar profit using tick value
         pip_value = OrderManager._pip_value_per_lot(symbol)
         if pip_value <= 0:
             return None
-
-        if is_buy:
-            price_distance = current_price - position.open_price
-        else:
-            price_distance = position.open_price - current_price
 
         # Dollar profit = price_distance / pip_size * pip_value_per_lot * volume
         # Simpler: use tick_size and tick_value from symbol info
@@ -273,11 +300,19 @@ class OrderManager:
 
         if is_buy:
             new_sl = round(position.open_price + spread_buffer, 5)
+            # Validate: SL must be below current price for BUY positions
+            # If breakeven SL is above bid, the position hasn't moved far enough yet
+            if new_sl >= current_price:
+                return None
             # Only move SL up (never down for BUY)
             if position.current_sl > 0 and new_sl <= position.current_sl:
                 return None
         else:  # SELL
             new_sl = round(position.open_price - spread_buffer, 5)
+            # Validate: SL must be above current price for SELL positions
+            # If breakeven SL is below ask, the position hasn't moved far enough yet
+            if new_sl <= current_price:
+                return None
             # Only move SL down (never up for SELL)
             if position.current_sl > 0 and new_sl >= position.current_sl:
                 return None
@@ -290,7 +325,7 @@ class OrderManager:
             new_sl=new_sl,
             old_tp=position.current_tp,
             new_tp=position.current_tp,
-            reason=f"breakeven triggered (dollar_profit=${dollar_profit:.2f} >= ${trigger_dollars:.2f})",
+            reason=f"breakeven triggered (dollar_profit=${dollar_profit:.2f} >= {breakeven_risk_mult}x risk=${trigger_dollars:.2f})",
         )
 
     # ── Trailing Stop ────────────────────────────────────────────────────
@@ -409,29 +444,43 @@ class OrderManager:
     def check_scale_out(symbol: str, position: ManagedPosition,
                          current_price: float, atr_value: float) -> Optional[OrderResult]:
         """
-        Multi-level scale-out for exponential compounding.
+        Dynamic multi-level scale-out system.
 
-        Level 1: Close 1/3 of position at $5 profit (secure quick cash)
-        Level 2: Close 1/3 of position at $10 profit (secure more cash)
-        Level 3: Runner — remove TP, let trailing stop ride the trend to max profit
+        Reads scale_out_N_risk_mult from per-symbol config (1-10 levels supported).
+        Each level closes 1/N of the remaining position at its profit target.
+        After all scale-out levels, enters runner mode (TP removed, trailing manages exit).
 
-        This ensures we book profits early while still letting winners run
-        for exponential growth. The freed margin from partial closes gets
-        reinvested into new positions via Kelly compounding.
-
-        Args:
-            symbol: Trading symbol
-            position: ManagedPosition to evaluate
-            current_price: Current market price
-            atr_value: Current ATR value
-
-        Returns:
-            OrderResult with scale-out details, or None.
+        Default: 3 levels (1.25x, 2.0x, 3.0x risk) for backward compat.
+        Gold config: 10 levels for granular partial profits.
         """
         risk_cfg = _load_symbol_risk_config(symbol)
-        scale1_dollars = risk_cfg.get("scale_out_1_dollars", 5.0)
-        scale2_dollars = risk_cfg.get("scale_out_2_dollars", 10.0)
-        min_lots = float(os.environ.get("AGI_MIN_LOTS", "0.01"))
+        min_lots = _MIN_LOTS
+
+        # Build scale-out levels from config (scale_out_1_risk_mult .. scale_out_10_risk_mult)
+        scale_levels = []
+        for i in range(1, 11):
+            key = f"scale_out_{i}_risk_mult"
+            if key in risk_cfg:
+                scale_levels.append((i, float(risk_cfg[key])))
+
+        # Default to 3 levels if none configured
+        if not scale_levels:
+            scale_levels = [
+                (1, float(risk_cfg.get("scale_out_1_risk_mult", 1.25))),
+                (2, float(risk_cfg.get("scale_out_2_risk_mult", 2.0))),
+                (3, float(risk_cfg.get("scale_out_3_risk_mult", 3.0))),
+            ]
+
+        # Calculate initial risk for this position
+        is_buy = position.side.upper() == "BUY"
+        sl_distance_price = abs(position.open_price - position.current_sl) if position.current_sl > 0 else atr_value * risk_cfg.get("sl_atr_mult", 2.0)
+        initial_risk = OrderManager._calc_dollar_profit(
+            symbol, position.volume, position.open_price,
+            position.open_price + (sl_distance_price if is_buy else -sl_distance_price),
+            is_buy
+        )
+        if initial_risk <= 0:
+            initial_risk = atr_value * risk_cfg.get("sl_atr_mult", 2.0) * position.volume * OrderManager._pip_value_per_lot(symbol)
 
         # Calculate dollar profit
         dollar_profit = OrderManager._calc_dollar_profit(
@@ -439,53 +488,59 @@ class OrderManager:
             position.side.upper() == "BUY"
         )
 
-        # Level 1: Close 1/3 at first profit target ($5)
-        if not position.scale_out_1_done and dollar_profit >= scale1_dollars:
-            close_volume = round(position.volume / 3, 2)
+        # Process each scale-out level
+        n_levels = len(scale_levels)
+        for idx, (level_num, risk_mult) in enumerate(scale_levels):
+            attr_name = f"scale_out_{level_num}_done"
+            if getattr(position, attr_name, False):
+                continue  # Already done
+
+            target_dollars = risk_mult * max(initial_risk, 0.01)
+            if dollar_profit < target_dollars:
+                break  # Not yet at this level
+
+            # Calculate close volume: close 1/(n_levels - idx) of remaining position
+            remaining_levels = n_levels - idx
+            close_volume = round(position.volume / remaining_levels, 2)
             if close_volume < min_lots:
                 close_volume = min_lots
-            if close_volume >= position.volume:
-                # Position too small to split, just mark done
-                position.scale_out_1_done = True
-                position.scale_out_level = 1
-                return None
-            return OrderResult(
-                success=True,
-                action="scale_out_1",
-                ticket=position.ticket,
-                reason=f"scale-out 1/3 at ${dollar_profit:.2f} profit (target ${scale1_dollars})",
-                volume_closed=close_volume,
-            )
 
-        # Level 2: Close 1/3 at second profit target ($10)
-        if position.scale_out_1_done and not position.scale_out_2_done and dollar_profit >= scale2_dollars:
-            close_volume = round(position.volume / 2, 2)  # half of remaining
-            if close_volume < min_lots:
-                close_volume = min_lots
+            # If remaining volume too small to split, go to runner mode
             if close_volume >= position.volume:
-                position.scale_out_2_done = True
-                position.scale_out_level = 2
-                return None
-            return OrderResult(
-                success=True,
-                action="scale_out_2",
-                ticket=position.ticket,
-                reason=f"scale-out 1/3 at ${dollar_profit:.2f} profit (target ${scale2_dollars})",
-                volume_closed=close_volume,
-            )
-
-        # Level 3: Runner mode — remove fixed TP, let trailing run
-        if position.scale_out_1_done and position.scale_out_2_done:
-            if position.scale_out_level < 3:
-                position.scale_out_level = 3
-                # Signal to remove TP so trailing can ride the trend
+                setattr(position, attr_name, True)
+                position.scale_out_level = n_levels + 1
                 return OrderResult(
                     success=True,
                     action="runner_mode",
                     ticket=position.ticket,
                     old_tp=position.current_tp,
-                    new_tp=0.0,  # Remove TP — let trailing manage exit
-                    reason=f"runner mode: TP removed, trailing will ride trend (profit=${dollar_profit:.2f})",
+                    new_tp=0.0,
+                    reason=f"runner mode: position too small to split at level {level_num} (profit=${dollar_profit:.2f})",
+                )
+
+            setattr(position, attr_name, True)
+            position.scale_out_level = level_num
+            return OrderResult(
+                success=True,
+                action=f"scale_out_{level_num}",
+                ticket=position.ticket,
+                reason=f"scale-out level {level_num}/{n_levels}: close {close_volume:.2f} lots at ${dollar_profit:.2f} profit ({risk_mult}x risk=${target_dollars:.2f})",
+                volume_closed=close_volume,
+            )
+
+        # After all scale-out levels done: runner mode
+        all_done = all(getattr(position, f"scale_out_{ln}_done", False) for ln, _ in scale_levels)
+        if all_done and scale_levels:
+            runner_level = len(scale_levels) + 1
+            if position.scale_out_level < runner_level:
+                position.scale_out_level = runner_level
+                return OrderResult(
+                    success=True,
+                    action="runner_mode",
+                    ticket=position.ticket,
+                    old_tp=position.current_tp,
+                    new_tp=0.0,
+                    reason=f"runner mode: all {n_levels} scale-outs done, trailing will ride trend (profit=${dollar_profit:.2f})",
                 )
 
         return None
@@ -633,7 +688,16 @@ class OrderManager:
             pos.partial_close_done = tracked.partial_close_done
             pos.scale_out_1_done = tracked.scale_out_1_done
             pos.scale_out_2_done = tracked.scale_out_2_done
+            pos.scale_out_3_done = getattr(tracked, 'scale_out_3_done', False)
+            pos.scale_out_4_done = getattr(tracked, 'scale_out_4_done', False)
+            pos.scale_out_5_done = getattr(tracked, 'scale_out_5_done', False)
+            pos.scale_out_6_done = getattr(tracked, 'scale_out_6_done', False)
+            pos.scale_out_7_done = getattr(tracked, 'scale_out_7_done', False)
+            pos.scale_out_8_done = getattr(tracked, 'scale_out_8_done', False)
+            pos.scale_out_9_done = getattr(tracked, 'scale_out_9_done', False)
+            pos.scale_out_10_done = getattr(tracked, 'scale_out_10_done', False)
             pos.scale_out_level = tracked.scale_out_level
+            pos.sl_change_fail_count = getattr(tracked, 'sl_change_fail_count', 0)
 
         # Update water marks
         if is_buy:
@@ -643,8 +707,97 @@ class OrderManager:
 
         self._positions[pos.ticket] = pos
 
+        # ── Step 0: Negative timeout — close positions losing for too long ──
+        # If a position has been in negative PnL for longer than the configured timeout,
+        # AND the loss exceeds a minimum threshold, close it to free up capital.
+        # Small negative PnL is normal intra-day fluctuation — don't close micro positions
+        # just because they're temporarily red.
+        neg_timeout_minutes = float(os.environ.get("AGI_NEG_TIMEOUT_MIN", "120"))
+        neg_min_loss_pct = float(os.environ.get("AGI_NEG_TIMEOUT_LOSS_PCT", "2.0"))  # min % of equity loss to trigger
+        if neg_timeout_minutes > 0:
+            # Calculate PnL direction from MT5 position
+            pos_pnl = float(mt5_position.profit) if hasattr(mt5_position, 'profit') else 0.0
+            open_time_ts = float(mt5_position.time) if hasattr(mt5_position, 'time') else 0.0
+            hold_seconds = time.time() - open_time_ts if open_time_ts > 0 else 0.0
+            hold_minutes = hold_seconds / 60.0
+
+            # Only close if PnL is significantly negative (not just a few cents)
+            # For small accounts, -$0.05 on a 0.01 lot position is noise
+            # Use MT5 equity for threshold calculation
+            try:
+                import MetaTrader5 as _mt5_local
+                if _mt5_local.initialize():
+                    _acc = _mt5_local.account_info()
+                    _eq = float(_acc.equity) if _acc else 100.0
+                    _mt5_local.shutdown()
+                else:
+                    _eq = 100.0
+            except Exception:
+                _eq = 100.0
+            min_loss_dollars = max(1.0, _eq * neg_min_loss_pct / 100.0)
+            if pos_pnl < 0 and abs(pos_pnl) < min_loss_dollars:
+                pass  # Loss too small to trigger timeout
+            elif pos_pnl < 0 and hold_minutes > neg_timeout_minutes:
+                logger.info(
+                    f"NEG-TIMEOUT: {symbol} #{pos.ticket} PnL=${pos_pnl:.2f} "
+                    f"held {hold_minutes:.0f}min > {neg_timeout_minutes:.0f}min — closing"
+                )
+                close_result = self._apply_partial_close(mt5_position, pos.volume)
+                if close_result:
+                    return OrderResult(
+                        action="neg_timeout_close",
+                        ticket=getattr(mt5_position, 'ticket', 0) or getattr(pos, 'ticket', 0),
+                        new_sl=0.0,
+                        success=True,
+                        reason=f"neg_timeout: {symbol} PnL=${pos_pnl:.2f} held {hold_minutes:.0f}min",
+                        volume_closed=pos.volume,
+                    )
+
+        # ── Step 0.5: Quick TP — close a portion at small profit for quick wins ──
+        # Many small wins compound like one big win. Close 1/3 of position at 0.5x risk.
+        if not pos.partial_close_done:
+            risk_cfg = _load_symbol_risk_config(symbol)
+            quick_tp_mult = risk_cfg.get("quick_tp_risk_mult", 0.5)
+            quick_tp_pct = risk_cfg.get("quick_tp_close_pct", 0.33)
+
+            sl_distance_price = abs(pos.open_price - pos.current_sl) if pos.current_sl > 0 else atr * risk_cfg.get("sl_atr_mult", 2.0)
+            initial_risk = OrderManager._calc_dollar_profit(
+                symbol, pos.volume, pos.open_price,
+                pos.open_price + (sl_distance_price if is_buy else -sl_distance_price),
+                is_buy
+            )
+            if initial_risk <= 0:
+                initial_risk = atr * risk_cfg.get("sl_atr_mult", 2.0) * pos.volume * OrderManager._pip_value_per_lot(symbol)
+
+            quick_tp_dollars = quick_tp_mult * max(initial_risk, 0.01)
+            dollar_profit = OrderManager._calc_dollar_profit(
+                symbol, pos.volume, pos.open_price, current_price, is_buy
+            )
+
+            if dollar_profit >= quick_tp_dollars and quick_tp_dollars > 0:
+                close_volume = round(pos.volume * quick_tp_pct, 2)
+                min_lots = _MIN_LOTS
+                if close_volume < min_lots:
+                    close_volume = min_lots
+                if close_volume >= pos.volume:
+                    # Position too small to split, just mark done
+                    pos.partial_close_done = True
+                    self._positions[pos.ticket] = pos
+                else:
+                    close_result = self._apply_partial_close(mt5_position, close_volume)
+                    if close_result:
+                        pos.partial_close_done = True
+                        self._positions[pos.ticket] = pos
+                        return OrderResult(
+                            success=True,
+                            action="quick_tp",
+                            ticket=pos.ticket,
+                            reason=f"quick TP: closed {close_volume:.2f} lots at ${dollar_profit:.2f} ({quick_tp_mult}x risk=${quick_tp_dollars:.2f})",
+                            volume_closed=close_volume,
+                        )
+
         # Step 1: Check breakeven (only if not already triggered)
-        if not pos.breakeven_triggered:
+        if not pos.breakeven_triggered and pos.sl_change_fail_count < 3:
             be_result = self.check_breakeven(symbol, pos, current_price, atr)
             if be_result:
                 apply_result = self._apply_sl_change(mt5_position, be_result.new_sl, pos.current_tp)
@@ -653,16 +806,34 @@ class OrderManager:
                     self._positions[pos.ticket] = pos
                     be_result.success = True
                     return be_result
+                else:
+                    pos.sl_change_fail_count += 1
+                    if pos.sl_change_fail_count >= 3:
+                        logger.warning(
+                            f"OrderManager: {symbol} #{pos.ticket} SL change failed 3x — "
+                            f"marking breakeven as done to stop retry loop"
+                        )
+                        pos.breakeven_triggered = True  # Stop retrying
+                    self._positions[pos.ticket] = pos
 
         # Step 2: Check trailing stop (only after breakeven)
-        trail_result = self.check_trailing_stop(symbol, pos, current_price, atr)
-        if trail_result:
-            apply_result = self._apply_sl_change(mt5_position, trail_result.new_sl, pos.current_tp)
-            if apply_result:
-                pos.trailing_active = True
-                self._positions[pos.ticket] = pos
-                trail_result.success = True
-                return trail_result
+        if pos.breakeven_triggered and not pos.trailing_active and pos.sl_change_fail_count < 6:
+            trail_result = self.check_trailing_stop(symbol, pos, current_price, atr)
+            if trail_result:
+                apply_result = self._apply_sl_change(mt5_position, trail_result.new_sl, pos.current_tp)
+                if apply_result:
+                    pos.trailing_active = True
+                    self._positions[pos.ticket] = pos
+                    trail_result.success = True
+                    return trail_result
+                else:
+                    pos.sl_change_fail_count += 1
+                    if pos.sl_change_fail_count >= 6:
+                        logger.warning(
+                            f"OrderManager: {symbol} #{pos.ticket} SL change failed 6x — "
+                            f"stopping trailing SL retries"
+                        )
+                    self._positions[pos.ticket] = pos
 
         # Step 3: Multi-level scale-out for exponential compounding
         scale_result = self.check_scale_out(symbol, pos, current_price, atr)
@@ -671,7 +842,7 @@ class OrderManager:
                 # Remove TP so trailing can ride the trend to infinity
                 apply_result = self._apply_sl_change(mt5_position, pos.current_sl, 0.0)
                 if apply_result:
-                    pos.scale_out_level = 3
+                    pos.scale_out_level = 4
                     pos.current_tp = 0.0
                     self._positions[pos.ticket] = pos
                     logger.info(f"RUNNER MODE: {symbol} #{pos.ticket} TP removed, trailing will ride trend")
@@ -679,12 +850,13 @@ class OrderManager:
             elif scale_result.volume_closed and scale_result.volume_closed > 0:
                 apply_result = self._apply_partial_close(mt5_position, scale_result.volume_closed)
                 if apply_result:
-                    if scale_result.action == "scale_out_1":
-                        pos.scale_out_1_done = True
-                        pos.scale_out_level = 1
-                    elif scale_result.action == "scale_out_2":
-                        pos.scale_out_2_done = True
-                        pos.scale_out_level = 2
+                    # Handle any scale_out_N action dynamically
+                    import re
+                    match = re.match(r"scale_out_(\d+)", scale_result.action)
+                    if match:
+                        level = int(match.group(1))
+                        setattr(pos, f"scale_out_{level}_done", True)
+                        pos.scale_out_level = level
                     self._positions[pos.ticket] = pos
                     scale_result.success = True
                     return scale_result
@@ -692,7 +864,39 @@ class OrderManager:
         return None
 
     def _apply_sl_change(self, mt5_position, new_sl: float, current_tp: float) -> bool:
-        """Apply SL/TP modification to an MT5 position."""
+        """Apply SL/TP modification to an MT5 position.
+
+        Validates SL is on the correct side of current price and respects
+        spread before sending to MT5. Returns True on success, False on failure.
+        """
+        is_buy = mt5_position.type == 0
+        tick = _mt5.symbol_info_tick(mt5_position.symbol) if _mt5 else None
+        if tick is None:
+            logger.warning(f"OrderManager: no tick data for {mt5_position.symbol}, skipping SL change")
+            return False
+
+        # Validate: SL must be on the correct side of the current price
+        if is_buy:
+            if new_sl >= tick.bid:
+                logger.debug(
+                    f"OrderManager: SL change skipped — {mt5_position.symbol} BUY SL {new_sl:.5f} "
+                    f">= bid {tick.bid:.5f}"
+                )
+                return False
+        else:
+            if new_sl <= tick.ask:
+                logger.debug(
+                    f"OrderManager: SL change skipped — {mt5_position.symbol} SELL SL {new_sl:.5f} "
+                    f"<= ask {tick.ask:.5f}"
+                )
+                return False
+
+        # Validate: SL must differ from current SL (avoid no-op requests)
+        current_sl = mt5_position.sl
+        spread_threshold = getattr(mt5_position, 'current_spread', 0) * 0.01 if hasattr(mt5_position, 'current_spread') else 1e-8
+        if current_sl > 0 and abs(new_sl - current_sl) < max(spread_threshold, 1e-8):
+            return True  # SL unchanged, treat as success
+
         request = {
             "action": _mt5.TRADE_ACTION_SLTP,
             "symbol": mt5_position.symbol,
@@ -713,7 +917,7 @@ class OrderManager:
         else:
             logger.warning(
                 f"OrderManager SL change failed: {mt5_position.symbol} #{mt5_position.ticket} "
-                f"retcode={result.retcode}"
+                f"retcode={result.retcode} new_sl={new_sl:.5f} bid={tick.bid:.5f} ask={tick.ask:.5f}"
             )
             return False
 

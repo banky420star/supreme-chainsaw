@@ -245,6 +245,8 @@ function mapStatusToState(status, trades = [], tradeReview = null, learning = nu
         "promote_canary",
         "rollback_champion",
         "restart_server",
+        "unblock",
+        "arm_live",
       ],
       blockedReasons: [],
       notifications: "telegram+ui",

@@ -2,7 +2,7 @@ trading:
   symbols: ["EURUSDm", "GBPUSDm", "XAUUSDm", "BTCUSDm"]
   timeframe: "M5"
   risk_percent: 1.0
-  max_drawdown: 10.0
+  max_drawdown: 50.0
   confidence_threshold: 0.85
   magic_number: 505
 
@@ -11,18 +11,66 @@ telegram:
   chat_id: "${TELEGRAM_CHAT_ID}"
 
 risk:
-  max_daily_loss: 500
-  max_hourly_loss: 150
+  # ── Percentage-based limits (scale with equity from $50 to $250K+) ──
+  max_daily_loss_pct: 3.0        # 3% of equity per day
+  max_hourly_loss_pct: 1.0       # 1% of equity per hour
+  risk_per_trade_pct: 1.0        # 1% of equity risked per trade
+  margin_min_pct: 2.0            # 2% of equity minimum free margin
+  # ── Legacy dollar limits (ignored if pct limits are set) ──
+  # max_daily_loss: 500           # deprecated: use max_daily_loss_pct
+  # max_hourly_loss: 150         # deprecated: use max_hourly_loss_pct
   max_daily_trades: 200
   max_lots: 2.0
-  max_drawdown_pct: 8.0
+  max_drawdown_pct: 50.0
   max_symbol_exposure: 0.50
   max_total_exposure: 2.0
-  max_open_positions: 8
-  max_positions_per_symbol: 2
+  max_open_positions: 20
+  max_positions_per_symbol: 5
   max_spread_bps: 50
   max_slippage_points: 10
+  max_sl_equity_pct: 10.0
+  max_portfolio_sl_pct: 30.0
+  max_directional_pct: 70.0
+  supervisor:
+    enabled: true
+    max_drawdown_pct: 50.0
+    max_daily_loss: 500
+    max_symbol_exposure: 0.50
+    max_total_exposure: 2.0
+    max_open_positions: 20
+    max_positions_per_symbol: 5
+    min_trade_interval_sec: 20
+    max_spread_bps: 3000
+
+event_guard:
+  enabled: true
+  pre_event_min: 60
+  event_live_min: 5
+  post_event_min: 30
+  flat_before: true
+  half_size_during_post: true
+  max_spread_mult_post: 2.0
+  enforce_slippage: true
+  half_size_mult: 0.5
+  high_impact_only: true
+
+news_sentiment:
+  enabled: true
+  finnhub_api_key: "${FINNHUB_API_KEY}"
+  cache_ttl_seconds: 300
+  sentiment_weight: 0.3
+  extreme_fear_threshold: 20
+  extreme_greed_threshold: 80
+  fear_reduction: 0.5
+  greed_reduction: 0.7
 
 drl:
   total_timesteps: 100000
   model_path: "models/ppo_trading.zip"
+
+portfolio:
+  max_portfolio_heat: 0.06    # 6% max total risk across all symbols
+  min_symbol_heat: 0.005     # 0.5% minimum allocation per symbol
+  max_symbol_heat: 0.03      # 3% maximum allocation per symbol
+  correlation_penalty: 0.5    # Reduce allocation for correlated assets
+  history_window: 50         # Number of trades for performance scoring

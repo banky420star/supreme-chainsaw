@@ -128,6 +128,9 @@ def gather_closed_trades(days_back: int = 7) -> list[dict]:
                 "model_version": model_version,
             })
         return trades
+    except Exception as e:
+        logger.error(f"Error gathering closed trades: {e}")
+        return []
 
 
 def load_decision_log(hours_back: int = 168) -> list[dict]:

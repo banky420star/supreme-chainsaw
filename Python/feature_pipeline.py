@@ -3,6 +3,7 @@ import pandas as pd
 
 
 ENGINEERED_V2 = "engineered_v2"
+ENGINEERED_V3 = "engineered_v3"  # v2 + 4 sentiment features = 25 features
 ULTIMATE_150 = "ultimate_150"
 
 ENGINEERED_LSTM_COLUMNS = [
@@ -56,25 +57,39 @@ def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def build_lstm_feature_frame(df: pd.DataFrame, feature_version: str = ENGINEERED_V2) -> tuple[pd.DataFrame, list[str]]:
+def build_lstm_feature_frame(df: pd.DataFrame, feature_version: str = ENGINEERED_V2,
+                              sentiment_engine=None, symbol: str = "") -> tuple[pd.DataFrame, list[str]]:
     version = str(feature_version or ENGINEERED_V2).strip().lower()
     if version == ULTIMATE_150:
         features = _build_ultimate_feature_frame(df)
         return features, list(features.columns)
+    if version == ENGINEERED_V3:
+        features = _build_engineered_lstm_frame(df)
+        features = _add_sentiment_features(features, symbol, sentiment_engine)
+        cols = list(features.columns)
+        return features, cols
     features = _build_engineered_lstm_frame(df)
     return features, list(ENGINEERED_LSTM_COLUMNS)
 
 
-def build_env_feature_matrix(df: pd.DataFrame, feature_version: str = ENGINEERED_V2) -> np.ndarray:
+def build_env_feature_matrix(df: pd.DataFrame, feature_version: str = ENGINEERED_V2,
+                              sentiment_engine=None, symbol: str = "") -> np.ndarray:
     version = str(feature_version or ENGINEERED_V2).strip().lower()
     if version == ULTIMATE_150:
         features, _ = build_lstm_feature_frame(df, feature_version=ULTIMATE_150)
         return features.to_numpy(dtype=np.float32)
+    if version == ENGINEERED_V3:
+        matrix = _build_engineered_env_matrix(df)
+        sentiment_features = _build_sentiment_vector(matrix.shape[0], symbol, sentiment_engine)
+        matrix = np.column_stack([matrix, sentiment_features])
+        return np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
     return _build_engineered_env_matrix(df)
 
 
 def feature_count_for_version(feature_version: str) -> int:
     version = str(feature_version or ENGINEERED_V2).strip().lower()
+    if version == ENGINEERED_V3:
+        return 25  # 21 v2 features + 4 sentiment features
     if version == ULTIMATE_150:
         sample = pd.DataFrame(
             {
@@ -225,6 +240,67 @@ def _build_engineered_env_matrix(df: pd.DataFrame) -> np.ndarray:
         ]
     )
     return np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+
+# ── Sentiment feature augmentation (engineered_v3) ─────────────────────
+
+def _build_sentiment_vector(n_rows: int, symbol: str, sentiment_engine) -> np.ndarray:
+    """Build 4 sentiment features as an (n_rows, 4) matrix.
+
+    Features:
+      0: news_sentiment      [-1, 1] continuous
+      1: event_impact_score  [0, 1] magnitude of upcoming event
+      2: fear_greed_norm     [0, 1] normalized FGI
+      3: vol_forecast        [0, 1] predicted near-term volatility regime
+    """
+    sentiment = 0.0
+    impact_score = 0.0
+    fgi = 50
+
+    if sentiment_engine is not None:
+        try:
+            sentiment = sentiment_engine.get_symbol_sentiment(symbol)
+            impact = sentiment_engine.get_economic_impact(symbol)
+            impact_score = impact.get("impact_score", 0.0)
+            fgi = sentiment_engine.get_fear_greed_index()
+        except Exception:
+            pass
+
+    # Broadcast same values across all timesteps (sentiment is per-decision, not per-bar)
+    fgi_norm = fgi / 100.0
+    # vol_forecast: blend FGI extremes with impact — high impact or extreme FGI = higher vol
+    vol_forecast = min(1.0, 0.3 + 0.3 * abs(sentiment) + 0.2 * impact_score + 0.2 * abs(fgi_norm - 0.5))
+
+    features = np.column_stack([
+        np.full(n_rows, sentiment, dtype=np.float32),
+        np.full(n_rows, impact_score, dtype=np.float32),
+        np.full(n_rows, fgi_norm, dtype=np.float32),
+        np.full(n_rows, vol_forecast, dtype=np.float32),
+    ])
+    return features
+
+
+def _add_sentiment_features(df: pd.DataFrame, symbol: str, sentiment_engine) -> pd.DataFrame:
+    """Add sentiment-derived columns to a DataFrame (for LSTM frame)."""
+    sentiment = 0.0
+    impact_score = 0.0
+    fgi = 50
+
+    if sentiment_engine is not None:
+        try:
+            sentiment = sentiment_engine.get_symbol_sentiment(symbol)
+            impact = sentiment_engine.get_economic_impact(symbol)
+            impact_score = impact.get("impact_score", 0.0)
+            fgi = sentiment_engine.get_fear_greed_index()
+        except Exception:
+            pass
+
+    df = df.copy()
+    df["news_sentiment"] = sentiment
+    df["event_impact_score"] = impact_score
+    df["fear_greed_norm"] = fgi / 100.0
+    df["vol_forecast"] = min(1.0, 0.3 + 0.3 * abs(sentiment) + 0.2 * impact_score + 0.2 * abs(fgi / 100.0 - 0.5))
+    return df
 
 
 def _build_ultimate_feature_frame(df: pd.DataFrame) -> pd.DataFrame:

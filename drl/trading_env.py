@@ -7,7 +7,7 @@ import numpy as np
 import polars as pl
 import pandas as pd
 from gymnasium import spaces
-from Python.feature_pipeline import ENGINEERED_V2, build_env_feature_matrix, feature_count_for_version
+from Python.feature_pipeline import ENGINEERED_V2, ENGINEERED_V3, build_env_feature_matrix, feature_count_for_version
 
 ENGINEERED_FEATURE_COUNT = 21
 DEFAULT_PORTFOLIO_FEATURE_COUNT = 3
@@ -30,6 +30,8 @@ class TradingEnv(gym.Env):
         trade_memory: dict | None = None,
         portfolio_feature_count: int | None = None,
         feature_version: str = ENGINEERED_V2,
+        sentiment_engine=None,
+        symbol: str = "",
     ):
         super().__init__()
         self.initial_balance = float(initial_balance)
@@ -40,6 +42,8 @@ class TradingEnv(gym.Env):
         self.max_leverage = float(max_leverage)
         self.feature_version = str(feature_version or ENGINEERED_V2)
         self.action_version = "direction_only_v2"
+        self.sentiment_engine = sentiment_engine
+        self.symbol = symbol
         self.trade_memory = trade_memory or {}
 
         w = reward_weights or {}
@@ -346,7 +350,9 @@ class TradingEnv(gym.Env):
                 "volume": v,
             }
         )
-        self.feature_data = build_env_feature_matrix(base, feature_version=self.feature_version)
+        self.feature_data = build_env_feature_matrix(base, feature_version=self.feature_version,
+                                                        sentiment_engine=self.sentiment_engine,
+                                                        symbol=self.symbol)
         self.n_features = int(self.feature_data.shape[1])
 
         self._update_observation_space()
@@ -372,7 +378,9 @@ class TradingEnv(gym.Env):
                 "volume": v,
             }
         )
-        self.feature_data = build_env_feature_matrix(base, feature_version=self.feature_version)
+        self.feature_data = build_env_feature_matrix(base, feature_version=self.feature_version,
+                                                        sentiment_engine=self.sentiment_engine,
+                                                        symbol=self.symbol)
         self.n_features = int(self.feature_data.shape[1])
         self._update_observation_space()
         self.reset()
