@@ -18,7 +18,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Union
 
 import requests
 import yaml
@@ -187,7 +187,7 @@ class OllamaAdvisor:
         }
         return self._json_council_call("failure_detective", prompt)
 
-    def analyze_backtest(self, report_path: str | Path) -> Dict[str, Any]:
+    def analyze_backtest(self, report_path: Union[str, Path]) -> Dict[str, Any]:
         """Analyze a backtest, walk-forward report, or result CSV/text file."""
         path = Path(report_path)
         content = _read_text_safely(path)
@@ -214,8 +214,8 @@ class OllamaAdvisor:
 
     def suggest_config_patch(
         self,
-        config_yaml: str | Dict[str, Any],
-        evidence: Optional[str | Dict[str, Any]] = None,
+        config_yaml: Union[str, Dict[str, Any]],
+        evidence: Optional[Union[str, Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Suggest a safe config patch. Does not write files or change trading state."""
         if not self.settings.allow_config_patch_suggestions:
@@ -237,7 +237,7 @@ class OllamaAdvisor:
 
     def summarize_daily_session(
         self,
-        logs: str | Iterable[str],
+        logs: Union[str, Iterable[str]],
         trade_summary: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Summarize daily logs for Telegram/dashboard operator review."""
