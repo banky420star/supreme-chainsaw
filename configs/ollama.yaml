@@ -1,0 +1,59 @@
+# Ollama Council configuration for local Windows/VPS inference.
+# This layer advises, reviews, and explains. It must not bypass deterministic risk gates.
+
+ollama:
+  enabled: true
+  host: "${OLLAMA_HOST:http://127.0.0.1:11434}"
+  request_timeout_sec: 45
+  temperature: 0.15
+  top_p: 0.9
+  max_context_chars: 24000
+  fail_closed_for_live: false
+
+  models:
+    code_architect: "qwen3-coder-next"
+    strategy_reviewer: "qwen3"
+    failure_detective: "deepseek-r1:14b"
+    chief_analyst: "llama3.3:70b"
+    embedder: "nomic-embed-text"
+
+  roles:
+    code_architect:
+      purpose: "Patch review, refactoring plans, test suggestions, repo diagnostics."
+      allow_live_trade_action: false
+    strategy_reviewer:
+      purpose: "Backtest interpretation, config review, regime analysis, risk notes."
+      allow_live_trade_action: false
+    failure_detective:
+      purpose: "Post-loss analysis, drawdown investigation, execution anomaly review."
+      allow_live_trade_action: false
+    chief_analyst:
+      purpose: "Daily report, operator summary, dashboard narrative."
+      allow_live_trade_action: false
+    embedder:
+      purpose: "Local memory embeddings for logs, reports, configs, and decisions."
+      allow_live_trade_action: false
+
+  live_guardrails:
+    require_json: true
+    allowed_recommendations:
+      - HOLD
+      - REDUCE_SIZE
+      - PAUSE_SYMBOL
+      - PAUSE_ALL
+      - REVIEW_ONLY
+    forbidden_recommendations:
+      - BUY
+      - SELL
+      - INCREASE_SIZE
+      - REMOVE_STOP_LOSS
+      - DISABLE_RISK_ENGINE
+
+  prompts:
+    system: |
+      You are the local Ollama council for Chain Gambler.
+      You are not the execution engine.
+      You may explain, review, warn, and recommend conservative risk actions.
+      You must never instruct the bot to place BUY or SELL orders directly.
+      If evidence is weak, recommend REVIEW_ONLY or HOLD.
+      Return compact JSON whenever possible.
