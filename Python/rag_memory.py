@@ -14,7 +14,7 @@ import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 try:
     from loguru import logger
@@ -74,7 +74,7 @@ class LocalRagMemory:
 
     def __init__(
         self,
-        store_path: Path | str = DEFAULT_STORE,
+        store_path: Union[Path, str] = DEFAULT_STORE,
         client: Optional[OllamaClient] = None,
         settings: Optional[OllamaSettings] = None,
     ):
@@ -116,7 +116,7 @@ class LocalRagMemory:
                     f.write(record.to_json() + "\n")
         return records
 
-    def index_file(self, path: Path | str) -> List[MemoryRecord]:
+    def index_file(self, path: Union[Path, str]) -> List[MemoryRecord]:
         """Index one text-like file."""
         path = Path(path)
         if not path.exists() or not path.is_file():
@@ -129,9 +129,13 @@ class LocalRagMemory:
             logger.warning(f"Could not read memory file {path}: {exc}")
             return []
         metadata = {"path": str(path), "suffix": path.suffix, "size_bytes": path.stat().st_size}
-        return self.add_text(text=text, source=str(path.relative_to(ROOT) if path.is_relative_to(ROOT) else path), metadata=metadata)
+        try:
+            source = str(path.relative_to(ROOT))
+        except ValueError:
+            source = str(path)
+        return self.add_text(text=text, source=source, metadata=metadata)
 
-    def index_paths(self, paths: Iterable[Path | str]) -> Dict[str, Any]:
+    def index_paths(self, paths: Iterable[Union[Path, str]]) -> Dict[str, Any]:
         """Index files and directories."""
         files = list(iter_text_files(paths))
         total_records = 0
@@ -184,11 +188,11 @@ class LocalRagMemory:
                     logger.debug(f"Skipping bad memory record: {exc}")
         return records
 
-    def _existing_ids(self) -> set[str]:
+    def _existing_ids(self) -> Set[str]:
         return {record.record_id for record in self.load_records()}
 
 
-def iter_text_files(paths: Iterable[Path | str]) -> Iterable[Path]:
+def iter_text_files(paths: Iterable[Union[Path, str]]) -> Iterable[Path]:
     for item in paths:
         path = Path(item)
         if not path.exists():
@@ -202,7 +206,7 @@ def iter_text_files(paths: Iterable[Path | str]) -> Iterable[Path]:
                 yield child
 
 
-def chunk_text(text: str, chunk_chars: int = 1800, overlap: int = 200) -> Iterable[str]:
+def chunk_text(text: str, chunk_chars: int = 1800, overlap: int = 200) -> List[str]:
     clean = "\n".join(line.rstrip() for line in text.splitlines())
     if not clean.strip():
         return []
