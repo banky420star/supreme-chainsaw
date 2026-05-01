@@ -565,6 +565,40 @@ def run_review(days_back: int = 7) -> dict:
     )
     logger.info(f"Tag distribution: {summary.get('tag_distribution', {})}")
 
+    # ── Ollama advisor: auto-analyze losing trades ──
+    try:
+        from Python.ollama_advisor import get_advisor
+        import yaml
+        config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml")
+        with open(config_path, "r") as f:
+            cfg = yaml.safe_load(f) or {}
+        ollama_cfg = cfg.get("ollama", {})
+        if ollama_cfg.get("enabled", True) and ollama_cfg.get("auto_review", {}).get("losing_trades", True):
+            advisor = get_advisor(cfg)
+            if advisor._available:
+                # Analyze top 3 worst losses
+                losses = [t for t in result.get("enriched", []) if t.get("profit", 0) < 0]
+                losses.sort(key=lambda t: t.get("profit", 0))
+                for loss in losses[:3]:
+                    analysis = advisor.analyze_trade({
+                        "symbol": loss.get("symbol", "?"),
+                        "side": loss.get("type", "?"),
+                        "entry_price": loss.get("price_open", 0),
+                        "exit_price": loss.get("price_close", 0),
+                        "pnl": loss.get("profit", 0),
+                        "sl_hit": loss.get("is_sl", False),
+                        "tp_hit": loss.get("is_tp", False),
+                        "duration_minutes": loss.get("duration_minutes", 0),
+                        "atr_at_entry": loss.get("atr_at_entry", "?"),
+                        "volatility_regime": loss.get("volatility_regime", "?"),
+                        "confidence": loss.get("confidence", "?"),
+                        "model_version": loss.get("model_version", "?"),
+                    })
+                    if analysis:
+                        logger.info(f"Ollama analysis for {loss.get('symbol', '?')} loss: {analysis[:200]}...")
+    except Exception as e:
+        logger.debug(f"Ollama advisor review skipped: {e}")
+
     return result
 
 

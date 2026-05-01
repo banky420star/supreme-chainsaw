@@ -313,6 +313,14 @@ class MT5Executor:
         equity = getattr(self.risk, '_current_equity', 0)
         if equity <= 0:
             equity = 50.0
+        # Read fresh equity from MT5 (more accurate than cached value)
+        if _mt5:
+            try:
+                _info = _mt5.account_info()
+                if _info and _info.equity > 0:
+                    equity = float(_info.equity)
+            except Exception:
+                pass
 
         # Get ATR-based SL distance
         atr = self._get_raw_atr(symbol)
@@ -826,10 +834,23 @@ class MT5Executor:
         equity = getattr(self.risk, "_current_equity", None)
         if equity is None or equity <= 0:
             equity = 50.0
+        # Read fresh equity from MT5 (more accurate than cached value)
+        if _mt5:
+            try:
+                _info = _mt5.account_info()
+                if _info and _info.equity > 0:
+                    equity = float(_info.equity)
+                    self.risk._current_equity = equity
+            except Exception:
+                pass
         max_sl_equity_pct = getattr(self.risk, 'max_sl_equity_pct', 10.0)
-        # For small accounts (<$100), raise the cap to 15% to allow trading
-        if equity < 100:
-            max_sl_equity_pct = max(max_sl_equity_pct, 15.0)
+        # Tiered SL caps: tighter for smaller accounts
+        if equity < 25:
+            max_sl_equity_pct = min(max_sl_equity_pct, 8.0)
+        elif equity < 50:
+            max_sl_equity_pct = min(max_sl_equity_pct, 10.0)
+        elif equity < 100:
+            max_sl_equity_pct = min(max_sl_equity_pct, 12.0)
         max_sl_dollars = equity * max_sl_equity_pct / 100.0
 
         # Calculate SL distance for this symbol to estimate min risk
@@ -1034,7 +1055,16 @@ class MT5Executor:
         # Minimum SL: at least spread * 3 to avoid being stopped out by noise
         # For small accounts (<$100), use a tighter floor (spread * 2) to allow trading
         spread = tick.ask - tick.bid
+        # Read fresh equity from MT5 (more accurate than cached value)
         equity = getattr(self.risk, "_current_equity", 0) or 50.0
+        if _mt5:
+            try:
+                _info = _mt5.account_info()
+                if _info and _info.equity > 0:
+                    equity = float(_info.equity)
+                    self.risk._current_equity = equity  # also update cache
+            except Exception:
+                pass
         if equity < 100:
             # Small accounts: use tighter SL to allow trading
             # FX: 0.003*0.33=0.001 (~10 pips), Gold: $50*0.04=$2, BTC: $500*0.04=$20
@@ -1047,8 +1077,14 @@ class MT5Executor:
 
         # For small accounts (<$100): cap SL distance to what equity can afford
         # This prevents gold/BTC ATR-based SLs ($20-500) from exceeding risk cap
+        # Tiered: smaller accounts get tighter caps to prevent catastrophic losses
         if equity < 100 and sl_distance > min_sl:
-            max_sl_equity_pct_local = 15.0  # same as the cap we use below
+            if equity < 25:
+                max_sl_equity_pct_local = 8.0   # Very small: 8% max SL risk
+            elif equity < 50:
+                max_sl_equity_pct_local = 10.0  # Small: 10% max SL risk
+            else:
+                max_sl_equity_pct_local = 12.0   # Medium-small: 12% max SL risk
             max_risk_dollars = equity * max_sl_equity_pct_local / 100.0
             tick_sz = self._get_tick_size(symbol)
             pip_val = self._get_tick_pip_value(symbol) or self._pip_value_per_lot(symbol)
@@ -1074,11 +1110,15 @@ class MT5Executor:
             tp = round(entry_price - tp_distance, 5) if tp_distance > 0 else 0
 
         # ── Final safety: cap SL risk at max_sl_equity_pct% of equity ──
-        # For small accounts (<$100), raise the cap to 15% to allow trading
+        # Tiered SL caps for small accounts to prevent catastrophic losses
         max_sl_equity_pct = getattr(self.risk, 'max_sl_equity_pct', 10.0)
-        if equity < 100:
-            max_sl_equity_pct = max(max_sl_equity_pct, 15.0)
-        equity = getattr(self.risk, '_current_equity', 0) or 50.0
+        if equity < 25:
+            max_sl_equity_pct = min(max_sl_equity_pct, 8.0)   # Very small: 8% cap
+        elif equity < 50:
+            max_sl_equity_pct = min(max_sl_equity_pct, 10.0)  # Small: 10% cap
+        elif equity < 100:
+            max_sl_equity_pct = min(max_sl_equity_pct, 12.0)  # Medium-small: 12% cap
+        # Use fresh equity (already read above from MT5)
         max_sl_dollars = equity * max_sl_equity_pct / 100.0
         if sl > 0 and sl_distance > 0:
             pip_val = self._get_tick_pip_value(symbol) or self._pip_value_per_lot(symbol)

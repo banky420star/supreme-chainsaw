@@ -74,3 +74,20 @@ portfolio:
   max_symbol_heat: 0.03      # 3% maximum allocation per symbol
   correlation_penalty: 0.5    # Reduce allocation for correlated assets
   history_window: 50         # Number of trades for performance scoring
+
+ollama:
+  enabled: true
+  base_url: "http://localhost:11434"
+  timeout: 300
+  cache_ttl: 300
+  models:
+    code_architect: "deepseek-coder-v2:latest"
+    strategy_reviewer: "qwen3:4b"
+    failure_detective: "qwen3:4b"
+    chief_analyst: "qwen3:4b"
+  # Which analyses to auto-run
+  auto_review:
+    losing_trades: true       # Auto-analyze trades that hit SL
+    daily_summary: true       # Generate daily summary at session end
+    risk_review: true         # Review risk state when DD > 5%
+    backtest_review: true     # Review backtest results after training

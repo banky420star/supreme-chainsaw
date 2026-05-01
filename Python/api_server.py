@@ -1290,6 +1290,107 @@ def api_emergency_status():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# GET /api/ollama — Ollama advisor status and queries
+# ═══════════════════════════════════════════════════════════════════════════
+@app.get("/api/ollama")
+def api_ollama_status():
+    """Return Ollama advisor status."""
+    try:
+        from Python.ollama_advisor import get_advisor
+        advisor = get_advisor()
+        return _json(advisor.get_status())
+    except Exception as e:
+        return _json({"error": str(e), "enabled": False, "available": False}, status=500)
+
+
+@app.post("/api/ollama/analyze_trade")
+def api_ollama_analyze_trade():
+    """Analyze a specific trade using Ollama."""
+    try:
+        from Python.ollama_advisor import get_advisor
+        data = request.json or {}
+        advisor = get_advisor()
+        result = advisor.analyze_trade(data)
+        if result:
+            return _json({"analysis": result, "trade": data})
+        else:
+            return _json({"error": "Ollama not available", "analysis": None}, status=503)
+    except Exception as e:
+        return _json({"error": str(e)}, status=500)
+
+
+@app.post("/api/ollama/review_risk")
+def api_ollama_review_risk():
+    """Review current risk state using Ollama."""
+    try:
+        from Python.ollama_advisor import get_advisor
+        advisor = get_advisor()
+        srv = _server_ref
+        risk_data = {}
+        if srv and hasattr(srv, "risk"):
+            r = srv.risk
+            risk_data = {
+                "equity": getattr(r, "_current_equity", 0),
+                "balance": getattr(r, "_mt5_balance", 0),
+                "drawdown_pct": r.current_dd,
+                "daily_pnl": r.realized_pnl_today,
+                "open_positions": r._get_open_positions_count(),
+                "daily_trades": r.daily_trades,
+                "halted": r.halt,
+                "halt_reason": r.get_halt_reason(),
+                "max_daily_loss_pct": r.max_daily_loss_pct,
+                "max_hourly_loss_pct": r.max_hourly_loss_pct,
+                "risk_per_trade_pct": r.risk_per_trade_pct,
+                "max_drawdown_pct": r.max_drawdown_pct,
+                "max_positions_per_symbol": r.max_positions_per_symbol,
+            }
+        result = advisor.review_risk_state(risk_data)
+        if result:
+            return _json({"review": result, "risk_data": risk_data})
+        else:
+            return _json({"error": "Ollama not available"}, status=503)
+    except Exception as e:
+        return _json({"error": str(e)}, status=500)
+
+
+@app.post("/api/ollama/daily_summary")
+def api_ollama_daily_summary():
+    """Generate a daily trading summary using Ollama."""
+    try:
+        from Python.ollama_advisor import get_advisor
+        from Python.trade_review import gather_closed_trades, analyze_trades, load_decision_log
+        advisor = get_advisor()
+        # Gather today's data
+        trades = gather_closed_trades(days_back=1)
+        decisions = load_decision_log(hours_back=24)
+        result = analyze_trades(trades, decisions)
+        summary = result.get("summary", {})
+        session_data = {
+            "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "start_equity": 0,
+            "end_equity": getattr(_server_ref.risk, "_current_equity", 0) if _server_ref else 0,
+            "net_pnl": summary.get("total_pnl", 0),
+            "total_trades": summary.get("total_trades", 0),
+            "wins": summary.get("wins", 0),
+            "losses": summary.get("losses", 0),
+            "win_rate": summary.get("win_rate", 0),
+            "max_drawdown": summary.get("max_drawdown", 0),
+            "symbol_pnl": summary.get("by_symbol", {}),
+            "top_losses": summary.get("top_losses", [])[:3],
+            "top_wins": summary.get("top_wins", [])[:3],
+            "risk_events": [],
+            "decisions_summary": {},
+        }
+        daily_summary = advisor.daily_summary(session_data)
+        if daily_summary:
+            return _json({"summary": daily_summary, "data": session_data})
+        else:
+            return _json({"error": "Ollama not available"}, status=503)
+    except Exception as e:
+        return _json({"error": str(e)}, status=500)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # GET /api/strategies — Analyze trades into strategies & patterns
 # ═══════════════════════════════════════════════════════════════════════════
 @app.get("/api/strategies")
