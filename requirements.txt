@@ -7,6 +7,7 @@ openpyxl
 loguru
 pandas_ta
 pyyaml
+aiohttp
 stable-baselines3[extra]
 gymnasium
 vectorbt
@@ -19,3 +20,6 @@ pydantic-settings
 MetaTrader5; sys_platform == 'win32'
 joblib
 pyarrow
+optuna
+metaapi-cloud-sdk
+dukascopy-python

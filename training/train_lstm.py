@@ -1,413 +1,365 @@
-"""LSTM Training Script — trains on real market data with balanced sampling and Macro F1 early stopping."""
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from training.progress_writer import update_training_progress
-
 import json
+import os
+import sys
+
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
-import pandas as pd
-import joblib
-from sklearn.preprocessing import MinMaxScaler
+import yaml
 from loguru import logger
-from Python.agi_brain import AGIModel, FEATURE_COLUMNS
-from Python.feature_pipeline import build_lstm_feature_frame, ENGINEERED_V2
+from sklearn.preprocessing import MinMaxScaler
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from Python.agi_brain import AGIModel
+from Python.config_utils import DEFAULT_TRADING_SYMBOLS, parse_symbol_list
 from Python.data_feed import fetch_training_data
+from Python.feature_pipeline import ENGINEERED_V2, ULTIMATE_150, build_lstm_feature_frame, normalize_feature_version
+from alerts.telegram_alerts import TelegramAlerter
 
-CLASS_NAMES = ["LOW_VOL", "MED_VOL", "HIGH_VOL"]
-
-# Per-symbol volatility thresholds (FX pairs have tiny moves, commodities have large moves)
-SYMBOL_THRESHOLDS = {
-    "EURUSDm": (0.0003, 0.0008),   # MED > 0.03%, HIGH > 0.08%
-    "GBPUSDm": (0.0004, 0.0010),   # MED > 0.04%, HIGH > 0.10%
-    "XAUUSDm": (0.0015, 0.0040),   # MED > 0.15%, HIGH > 0.40%
-    "BTCUSDm": (0.0050, 0.0150),   # MED > 0.50%, HIGH > 1.50%
-}
-DEFAULT_THRESHOLDS = (0.0005, 0.0015)
-
-# ── Logging ─────────────────────────────────────────────────────────
-LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+LOG_DIR = os.path.join(PROJECT_ROOT, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
-logger.add(os.path.join(LOG_DIR, "lstm_training.log"), rotation="10 MB", level="DEBUG")
+logger.add(os.path.join(LOG_DIR, "lstm_training.log"), rotation="10 MB", level="INFO")
 
 
-def _parse_symbol_currencies(symbol):
-    """Parse a broker symbol into its two currency/commodity codes.
-    Handles: EURUSDm -> [EUR, USD], XAUUSDm -> [XAU, USD], BTCUSDm -> [BTC, USD]
-    Strips trailing lowercase broker suffixes (e.g. 'm').
-    """
-    base = symbol.rstrip("m").rstrip("M")
-    for prefix in ["XAU", "XAG", "XPT"]:
-        if base.startswith(prefix):
-            return [prefix, base[len(prefix):]]
-    if len(base) == 6:
-        return [base[:3], base[3:]]
-    for prefix in ["BTC", "ETH", "SOL", "LTC"]:
-        if base.startswith(prefix):
-            return [prefix, base[len(prefix):]]
-    currencies = []
-    for i in range(0, len(base) - 2, 3):
-        currencies.append(base[i:i+3])
-    return currencies if currencies else [base]
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return int(default)
+    try:
+        return int(str(raw).strip())
+    except Exception:
+        return int(default)
 
 
-def create_sequences(data, close_prices, seq_len=60, med_thresh=0.0005, high_thresh=0.0015):
-    """Create input sequences and labels for LSTM training (Volatility Focused).
+def _env_str(name: str, default: str) -> str:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return str(default)
+    return str(raw).strip()
 
-    Args:
-        data: scaled feature matrix (n_samples, n_features)
-        close_prices: raw close prices for label generation
-        seq_len: sequence length for LSTM
-        med_thresh: threshold for MED_VOL label
-        high_thresh: threshold for HIGH_VOL label
-    """
+
+def _resolve_cfg_value(v):
+    if isinstance(v, str) and v.startswith("ENV:"):
+        return os.environ.get(v.split(":", 1)[1])
+    return v
+
+
+def _build_alerter():
+    cfg_path = os.path.join(PROJECT_ROOT, "config.yaml")
+    cfg = {}
+    if os.path.exists(cfg_path):
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+        except Exception:
+            cfg = {}
+    tel = cfg.get("telegram", {}) if isinstance(cfg, dict) else {}
+    token = os.environ.get("TELEGRAM_TOKEN") or _resolve_cfg_value(tel.get("token"))
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID") or _resolve_cfg_value(tel.get("chat_id"))
+    if not token or not chat_id:
+        return TelegramAlerter(None, None)
+    return TelegramAlerter(token, str(chat_id))
+
+
+def create_sequences(data: np.ndarray, close_col: int, atr_col: int, rsi_col: int, seq_len: int = 60):
     X, y = [], []
     for i in range(seq_len, len(data) - 1):
-        X.append(data[i - seq_len:i])
+        X.append(data[i - seq_len : i])
 
-        future_return = (close_prices[i] - close_prices[i - 1]) / (close_prices[i - 1] + 1e-8)
-        magnitude = abs(future_return)
+        prev_close = data[i - 1, close_col]
+        next_close = data[i, close_col]
+        future_ret = (next_close - prev_close) / (abs(prev_close) + 1e-8)
 
-        if magnitude > high_thresh:
-            y.append(2)  # HIGH_VOL
-        elif magnitude > med_thresh:
-            y.append(1)  # MED_VOL
+        atr_norm = abs(data[i, atr_col] / (abs(next_close) + 1e-8))
+        rsi = data[i, rsi_col]
+
+        up_thr = max(0.0007, atr_norm * 0.35)
+        dn_thr = -up_thr
+
+        if future_ret > up_thr and rsi > 52:
+            y.append(1)
+        elif future_ret < dn_thr and rsi < 48:
+            y.append(2)
         else:
-            y.append(0)  # LOW_VOL
+            y.append(0)
 
     return np.array(X), np.array(y)
 
 
-def _balance_per_symbol(X_sym, y_sym, max_per_class=None):
-    """Undersample LOW_VOL within a single symbol so classes are more balanced.
-    Keeps all MED_VOL and HIGH_VOL samples, randomly samples LOW_VOL down to
-    2x the largest minority class count.
-    """
-    counts = [(y_sym == c).sum() for c in range(3)]
-    minority_max = max(counts[1], counts[2])
-    if minority_max == 0:
-        minority_max = counts[0] // 4
-    low_cap = min(counts[0], minority_max * 2)
-    if max_per_class is not None:
-        low_cap = min(low_cap, max_per_class)
+def _train_one_symbol(
+    symbol: str,
+    epochs: int,
+    seq_len: int,
+    device: str,
+    out_dir: str,
+    period: str = "60d",
+    interval: str = "5m",
+    candles: int = 100_000,
+    feature_version: str = ULTIMATE_150,
+    data_source: str | None = None,
+    alerter=None,
+):
+    if alerter is not None:
+        try:
+            alerter.training(
+                "LSTM",
+                f"Start {symbol} | epochs={epochs} | seq_len={seq_len} | period={period} | tf={interval} | features={feature_version}",
+            )
+        except Exception:
+            pass
 
-    low_idx = np.where(y_sym == 0)[0]
-    keep_low = np.random.choice(low_idx, size=low_cap, replace=False) if len(low_idx) > low_cap else low_idx
+    df = fetch_training_data(
+        symbol,
+        period=period,
+        interval=interval,
+        strict=False,
+        bars=int(candles),
+        min_bars=int(candles),
+        source=data_source,
+    )
+    if df.empty or len(df) < seq_len + 50:
+        logger.warning(f"insufficient data for {symbol}, skipping")
+        if alerter is not None:
+            try:
+                alerter.alert(f"LSTM skipped {symbol}: insufficient raw data")
+            except Exception:
+                pass
+        return None
 
-    med_idx = np.where(y_sym == 1)[0]
-    high_idx = np.where(y_sym == 2)[0]
+    fdf, feature_columns = build_lstm_feature_frame(df, feature_version=feature_version)
+    if len(fdf) < seq_len + 50:
+        logger.warning(f"insufficient engineered rows for {symbol}, skipping")
+        if alerter is not None:
+            try:
+                alerter.alert(f"LSTM skipped {symbol}: insufficient engineered rows")
+            except Exception:
+                pass
+        return None
 
-    all_idx = np.concatenate([keep_low, med_idx, high_idx])
-    np.random.shuffle(all_idx)
-    return X_sym[all_idx], y_sym[all_idx]
+    feat = fdf[feature_columns].values.astype(np.float32)
+    scaler = MinMaxScaler()
+    feat_scaled = scaler.fit_transform(feat)
 
+    close_col = feature_columns.index("close") if "close" in feature_columns else 0
+    atr_col = feature_columns.index("atr_14") if "atr_14" in feature_columns else close_col
+    rsi_col = feature_columns.index("rsi_14") if "rsi_14" in feature_columns else close_col
 
-def train_lstm(symbols=None, epochs=80, seq_len=60):
-    if symbols is None:
-        symbols = ["EURUSDm", "GBPUSDm", "XAUUSDm", "BTCUSDm"]
+    X, y = create_sequences(feat_scaled, close_col, atr_col, rsi_col, seq_len=seq_len)
+    if len(X) == 0:
+        logger.warning(f"no sequences for {symbol}")
+        if alerter is not None:
+            try:
+                alerter.alert(f"LSTM skipped {symbol}: no sequences built")
+            except Exception:
+                pass
+        return None
 
-    if torch.cuda.is_available():
-        device = 'cuda'
-    elif getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available():
-        device = 'mps'
-    else:
-        device = 'cpu'
-    feature_columns = list(FEATURE_COLUMNS)
-    n_features = len(feature_columns)
-    model = AGIModel(input_dim=n_features).to(device)
+    model = AGIModel(input_dim=len(feature_columns)).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    criterion = nn.CrossEntropyLoss()
 
-    logger.success(f"LSTM Training started on {device.upper()} | Symbols: {symbols} | Epochs: {epochs} | Features: {n_features}")
+    X_tensor = torch.tensor(X, dtype=torch.float32).to(device)
+    y_tensor = torch.tensor(y, dtype=torch.long).to(device)
 
-    # ── Fetch per-symbol data with balanced sampling ────────────────
-    all_X, all_y = [], []
-    per_symbol_scalers = {}
-    for sym in symbols:
-        logger.info(f"Fetching training data for {sym}...")
-        df = fetch_training_data(sym, period="60d")
-        if df is None or df.empty or len(df) < seq_len + 100:
-            logger.warning(f"Insufficient data for {sym} (len={0 if df is None else len(df)}), skipping")
-            continue
-
-        feat_df, available_cols = build_lstm_feature_frame(df, feature_version=ENGINEERED_V2)
-        if len(feat_df) < seq_len + 10:
-            logger.warning(f"Not enough feature rows for {sym} after pipeline, skipping")
-            continue
-
-        use_cols = feature_columns if set(feature_columns).issubset(set(available_cols)) else available_cols
-        features = feat_df[use_cols].astype(float).values
-
-        close_prices = df["close"].iloc[-len(feat_df):].values
-
-        # Per-symbol scaler (preserves resolution for different price ranges)
-        sym_scaler = MinMaxScaler()
-        data = sym_scaler.fit_transform(features)
-        per_symbol_scalers[sym] = sym_scaler
-
-        # Per-symbol thresholds
-        med_t, high_t = SYMBOL_THRESHOLDS.get(sym, DEFAULT_THRESHOLDS)
-
-        X, y = create_sequences(data, close_prices, seq_len, med_thresh=med_t, high_thresh=high_t)
-        logger.info(f"  {sym} raw: {len(X)} seq | LOW:{(y==0).sum()} MED:{(y==1).sum()} HIGH:{(y==2).sum()} | thresh: MED>{med_t} HIGH>{high_t}")
-
-        # Balance within symbol: keep all minority, cap LOW_VOL
-        X_bal, y_bal = _balance_per_symbol(X, y)
-        logger.info(f"  {sym} balanced: {len(X_bal)} seq | LOW:{(y_bal==0).sum()} MED:{(y_bal==1).sum()} HIGH:{(y_bal==2).sum()}")
-
-        all_X.append(X_bal)
-        all_y.append(y_bal)
-
-    if not all_X:
-        logger.error("No training data available!")
-        return
-
-    X_train = np.concatenate(all_X)
-    y_train = np.concatenate(all_y)
-    logger.info(f"Total balanced set: {len(X_train)} seq | LOW_VOL:{(y_train==0).sum()} MED_VOL:{(y_train==1).sum()} HIGH_VOL:{(y_train==2).sum()}")
-
-    X_tensor = torch.tensor(X_train, dtype=torch.float32).to(device)
-    y_tensor = torch.tensor(y_train, dtype=torch.long).to(device)
-
-    # ── Compute class weights ──
-    class_counts = np.array([(y_train == i).sum() for i in range(3)], dtype=np.float64)
-    total_samples = len(y_train)
-    raw_weights = total_samples / (3.0 * class_counts + 1e-6)
-    class_weights = np.minimum(raw_weights, 3.0)
-    class_weights = class_weights / class_weights.mean()
-    class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32).to(device)
-    logger.info(f"Class weights: LOW_VOL={class_weights[0]:.3f} MED_VOL={class_weights[1]:.3f} HIGH_VOL={class_weights[2]:.3f}")
-
-    # ── Time-aware train/val split (last 20% as validation) ──
-    split_idx = int(len(X_tensor) * 0.8)
-    X_train_split = X_tensor[:split_idx]
-    y_train_split = y_tensor[:split_idx]
-    X_val_split = X_tensor[split_idx:]
-    y_val_split = y_tensor[split_idx:]
-    logger.info(f"Train/val split: {len(X_train_split)} train, {len(X_val_split)} validation")
-
-    # ── Setup with class-weighted loss and LR scheduler ──
-    criterion = nn.CrossEntropyLoss(weight=class_weights_tensor)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.5, min_lr=1e-6)
-
-    # ── Early stopping on Macro F1 (not val loss) ──
-    best_macro_f1 = 0.0
-    best_val_loss = float('inf')
-    patience_counter = 0
-    patience = 10
-    best_model_state = None
-
-    # ── Training loop ───────────────────────────────────────────────
-    model.train()
     batch_size = 64
-    n_batches = len(X_train_split) // batch_size
+    n_batches = max(1, len(X_tensor) // batch_size)
 
+    model.train()
+    last_loss = 0.0
     for epoch in range(epochs):
-        perm = torch.randperm(len(X_train_split))
-        X_train_shuf = X_train_split[perm]
-        y_train_shuf = y_train_split[perm]
+        perm = torch.randperm(len(X_tensor))
+        X_epoch = X_tensor[perm]
+        y_epoch = y_tensor[perm]
 
-        epoch_loss = 0.0
         correct = 0
         total = 0
+        epoch_loss = 0.0
 
         for b in range(n_batches):
             start = b * batch_size
-            end = start + batch_size
-            X_batch = X_train_shuf[start:end]
-            y_batch = y_train_shuf[start:end]
+            end = min(start + batch_size, len(X_epoch))
+            xb = X_epoch[start:end]
+            yb = y_epoch[start:end]
+            if len(xb) == 0:
+                continue
 
             optimizer.zero_grad()
-            outputs = model(X_batch)
-            loss = criterion(outputs, y_batch)
+            logits = model(xb)
+            loss = criterion(logits, yb)
             loss.backward()
             optimizer.step()
 
-            epoch_loss += loss.item()
-            _, predicted = outputs.max(1)
-            correct += (predicted == y_batch).sum().item()
-            total += y_batch.size(0)
+            epoch_loss += float(loss.item())
+            preds = logits.argmax(dim=1)
+            correct += int((preds == yb).sum().item())
+            total += int(yb.size(0))
 
-        acc = correct / total * 100 if total > 0 else 0
-        avg_loss = epoch_loss / max(n_batches, 1)
+        last_loss = epoch_loss / max(1, n_batches)
+        acc = (correct / max(1, total)) * 100.0
+        logger.info(f"{symbol} | epoch {epoch + 1}/{epochs} | loss {last_loss:.4f} | acc {acc:.2f}%")
+        if alerter is not None and ((epoch + 1) == 1 or (epoch + 1) % 5 == 0 or (epoch + 1) == epochs):
+            try:
+                alerter.training(
+                    "LSTM",
+                    f"{symbol} epoch {epoch + 1}/{epochs} | loss={last_loss:.4f} | acc={acc:.2f}%",
+                )
+            except Exception:
+                pass
 
-        # ── Validation evaluation ──
-        model.eval()
-        with torch.no_grad():
-            val_outputs = model(X_val_split)
-            val_loss = nn.CrossEntropyLoss(weight=class_weights_tensor)(val_outputs, y_val_split).item()
-            _, val_preds = val_outputs.max(1)
-            val_acc = (val_preds == y_val_split).sum().item() / len(y_val_split) * 100
+    os.makedirs(out_dir, exist_ok=True)
+    safe = symbol.replace("/", "_")
+    model_path = os.path.join(out_dir, f"lstm_{safe}.pt")
+    scaler_path = os.path.join(out_dir, f"lstm_scaler_{safe}.pkl")
+    meta_path = os.path.join(out_dir, f"lstm_{safe}.meta.json")
 
-            per_class = []
-            f1_scores = []
-            min_recall = 1.0
-            for c in range(3):
-                mask = (y_val_split == c)
-                pred_c = (val_preds == c)
-                tp = (pred_c & mask).sum().item()
-                fp = (pred_c & ~mask).sum().item()
-                fn = (~pred_c & mask).sum().item()
-                prec = tp / (tp + fp + 1e-8)
-                rec = tp / (tp + fn + 1e-8)
-                f1 = 2 * prec * rec / (prec + rec + 1e-8)
-                f1_scores.append(f1)
-                recall_pct = rec * 100 if mask.sum() > 0 else 0
-                per_class.append(f"{CLASS_NAMES[c]}:R={recall_pct:.0f}%")
-                min_recall = min(min_recall, rec)
-            macro_f1 = sum(f1_scores) / 3
-            per_class_str = " | ".join(per_class)
-
-        logger.info(f"Epoch {epoch+1:3d}/{epochs} | Loss: {avg_loss:.4f} | Acc: {acc:.1f}% | "
-                    f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.1f}% | Macro F1: {macro_f1:.3f} | MinRecall: {min_recall:.3f} | {per_class_str}")
-        update_training_progress("lstm", {
-            "running": True,
-            "symbol": ",".join(symbols),
-            "epoch": epoch + 1,
-            "epochs_total": epochs,
-            "loss": round(avg_loss, 4),
-            "accuracy": round(acc, 1),
-            "val_loss": round(val_loss, 4),
-            "val_accuracy": round(val_acc, 1),
-            "macro_f1": round(macro_f1, 4),
-        })
-
-        scheduler.step(val_loss)
-
-        # ── Early stopping on Macro F1 (primary metric) ──
-        if macro_f1 > best_macro_f1:
-            best_macro_f1 = macro_f1
-            best_val_loss = val_loss
-            patience_counter = 0
-            best_model_state = {k: v.clone() for k, v in model.state_dict().items()}
-            logger.info(f"  -> New best Macro F1: {macro_f1:.4f} (val_loss={val_loss:.4f})")
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                logger.info(f"Early stopping at epoch {epoch+1} (no Macro F1 improvement for {patience} epochs)")
-                break
-
-        model.train()
-
-    # ── Save model + scalers + metadata ─────────────────────────────
-    model_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
-    os.makedirs(model_dir, exist_ok=True)
-
-    # Save per-symbol scalers
-    scaler_dir = os.path.join(model_dir, "lstm_scalers")
-    os.makedirs(scaler_dir, exist_ok=True)
-    for sym, scaler in per_symbol_scalers.items():
-        sym_scaler_path = os.path.join(scaler_dir, f"{sym}.pkl")
-        joblib.dump(scaler, sym_scaler_path)
-        logger.success(f"Scaler saved: {sym_scaler_path}")
-
-    # Backward-compat combined scaler
-    combined_scaler_path = os.path.join(model_dir, "lstm_scaler.pkl")
-    last_scaler = list(per_symbol_scalers.values())[-1]
-    joblib.dump(last_scaler, combined_scaler_path)
-
-    # Restore best model
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
-        logger.info(f"Restored best model (Macro F1={best_macro_f1:.4f}, val_loss={best_val_loss:.4f})")
-
-    model_path = os.path.join(model_dir, "lstm_agi_trained.pt")
     torch.save(model.state_dict(), model_path)
-    logger.success(f"LSTM model saved: {model_path} ({os.path.getsize(model_path)/1024:.1f} KB)")
 
-    meta_path = os.path.join(model_dir, "lstm_agi_trained.meta.json")
-    meta_data = {
-        "feature_columns": feature_columns,
-        "feature_version": ENGINEERED_V2,
-        "n_features": n_features,
-        "symbols": symbols,
-        "epochs": epochs,
-        "seq_len": seq_len,
-        "per_symbol_thresholds": {s: SYMBOL_THRESHOLDS.get(s, DEFAULT_THRESHOLDS) for s in symbols},
-        "best_macro_f1": float(best_macro_f1),
-    }
+    import joblib
+
+    joblib.dump(scaler, scaler_path)
     with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(meta_data, f, indent=2)
-    logger.success(f"Metadata saved: {meta_path}")
+        json.dump(
+            {
+                "symbol": symbol,
+                "feature_version": feature_version,
+                "feature_columns": feature_columns,
+                "seq_len": int(seq_len),
+                "epochs": int(epochs),
+                "samples": int(len(X)),
+            },
+            f,
+            indent=2,
+        )
+    if alerter is not None:
+        try:
+            alerter.training("LSTM", f"Complete {symbol} | loss={last_loss:.4f} | samples={int(len(X))}")
+        except Exception:
+            pass
 
-    # ── Final validation metrics ─────────────────────────────────────
-    model.eval()
-    with torch.no_grad():
-        val_outputs = model(X_val_split)
-        _, val_preds = val_outputs.max(1)
-        final_acc = (val_preds == y_val_split).sum().item() / len(y_val_split) * 100
-
-        per_class = []
-        f1_scores = []
-        for c in range(3):
-            mask = (y_val_split == c)
-            pred_c = (val_preds == c)
-            tp = (pred_c & mask).sum().item()
-            fp = (pred_c & ~mask).sum().item()
-            fn = (~pred_c & mask).sum().item()
-            prec = tp / (tp + fp + 1e-8)
-            rec = tp / (tp + fn + 1e-8)
-            f1 = 2 * prec * rec / (prec + rec + 1e-8)
-            f1_scores.append(f1)
-            per_class.append(f"{CLASS_NAMES[c]} P={prec:.2f} R={rec:.2f} F1={f1:.2f}")
-        macro_f1 = sum(f1_scores) / 3
-
-    logger.success(f"Training complete! Val Acc: {final_acc:.1f}% | Macro F1: {macro_f1:.3f}")
-    for pc in per_class:
-        logger.info(f"  {pc}")
-    update_training_progress("lstm", {
-        "running": False,
-        "symbol": ",".join(symbols),
-        "epoch": epochs,
-        "epochs_total": epochs,
-        "loss": round(avg_loss, 4),
-        "accuracy": round(final_acc, 1),
-        "macro_f1": round(macro_f1, 4),
-        "completed": True,
-    })
-
-    # Build per-class metrics for scorecard
-    per_class_metrics = {}
-    with torch.no_grad():
-        val_outputs_final = model(X_val_split)
-        _, val_preds_final = val_outputs_final.max(1)
-        for c in range(3):
-            mask = (y_val_split == c)
-            pred_c = (val_preds_final == c)
-            tp = (pred_c & mask).sum().item()
-            fp = (pred_c & ~mask).sum().item()
-            fn = (~pred_c & mask).sum().item()
-            prec = tp / (tp + fp + 1e-8)
-            rec = tp / (tp + fn + 1e-8)
-            f1 = 2 * prec * rec / (prec + rec + 1e-8)
-            per_class_metrics[CLASS_NAMES[c]] = {"precision": float(prec), "recall": float(rec), "f1": float(f1)}
-
-    metrics = {
-        "win_rate": float(final_acc),
-        "macro_f1": float(macro_f1),
-        "per_class": per_class_metrics,
-        "epochs": epochs,
-        "loss": float(best_val_loss),
-        "val_accuracy": float(final_acc),
-        "date": __import__('datetime').datetime.now().isoformat()
+    return {
+        "symbol": symbol,
+        "model_path": model_path,
+        "scaler_path": scaler_path,
+        "meta_path": meta_path,
+        "loss": last_loss,
+        "samples": int(len(X)),
     }
 
-    # Save candidate in Model Registry
-    try:
-        from Python.model_registry import ModelRegistry
-        import shutil
-        reg = ModelRegistry()
-        cand_path = reg.save_candidate(model.state_dict(), metrics, model_type="lstm")
-        for sym in per_symbol_scalers:
-            shutil.copy(os.path.join(scaler_dir, f"{sym}.pkl"), os.path.join(cand_path, f"lstm_scaler_{sym}.pkl"))
-        shutil.copy(combined_scaler_path, os.path.join(cand_path, "lstm_scaler.pkl"))
 
-        if reg.evaluate_and_stage_canary(cand_path):
-            logger.success("Candidate surpassed Champion. Scheduled for live Canary testing!")
-        else:
-            logger.info("Candidate did not pass canary gate — will continue training improvements.")
-    except Exception as e:
-        logger.error(f"Failed to register candidate model: {e}")
+def train_lstm(
+    symbols=None,
+    epochs=20,
+    seq_len=60,
+    period="60d",
+    interval="5m",
+    candles=100_000,
+    feature_version: str = ULTIMATE_150,
+    data_source: str | None = None,
+):
+    if symbols is None:
+        symbols = list(DEFAULT_TRADING_SYMBOLS)
+
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
+
+    logger.info(
+        f"LSTM per-symbol training on {device.upper()} | symbols={symbols} | epochs={epochs} | period={period} | tf={interval} | candles={candles:,} | features={feature_version}"
+    )
+    alerter = _build_alerter()
+    try:
+        alerter.training(
+            "LSTM",
+            f"Batch start | symbols={len(symbols)} | device={device.upper()} | epochs={epochs} | period={period} | tf={interval} | features={feature_version}",
+        )
+    except Exception:
+        pass
+
+    model_dir = os.path.join(PROJECT_ROOT, "models")
+    per_symbol_dir = os.path.join(model_dir, "per_symbol")
+
+    results = []
+    for symbol in symbols:
+        res = _train_one_symbol(
+            symbol,
+            epochs=epochs,
+            seq_len=seq_len,
+            device=device,
+            out_dir=per_symbol_dir,
+            period=period,
+            interval=interval,
+            candles=candles,
+            feature_version=feature_version,
+            data_source=data_source,
+            alerter=alerter,
+        )
+        if res:
+            results.append(res)
+
+    if not results:
+        logger.error("no symbol models trained")
+        try:
+            alerter.alert("LSTM batch failed: no symbol models trained")
+        except Exception:
+            pass
+        return
+
+    best = sorted(results, key=lambda x: x["loss"])[0]
+    import shutil
+
+    shutil.copy2(best["model_path"], os.path.join(model_dir, "lstm_agi_trained.pt"))
+    shutil.copy2(best["scaler_path"], os.path.join(model_dir, "lstm_scaler.pkl"))
+    shutil.copy2(best["meta_path"], os.path.join(model_dir, "lstm_agi_trained.meta.json"))
+    logger.success(f"default lstm artifacts now point to best symbol model: {best['symbol']}")
+    try:
+        alerter.model(f"LSTM best model selected: {best['symbol']} | loss={best['loss']:.4f} | samples={best['samples']}")
+    except Exception:
+        pass
+
 
 if __name__ == "__main__":
-    train_lstm(epochs=80)
+    cfg_path = os.path.join(PROJECT_ROOT, "config.yaml")
+    symbols = None
+    epochs = 20
+    period = "60d"
+    interval = "5m"
+    candles = 100_000
+    feature_version = ULTIMATE_150
+    data_source = None
+
+    if os.path.exists(cfg_path):
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        symbols = cfg.get("trading", {}).get("symbols")
+        env_symbols = os.environ.get("AGI_LSTM_SYMBOLS")
+        if env_symbols:
+            symbols = parse_symbol_list(env_symbols)
+        tcfg = cfg.get("training", {}) or {}
+        epochs = _env_int("AGI_LSTM_EPOCHS", int(tcfg.get("lstm_epochs", 20)))
+        period = _env_str("AGI_LSTM_PERIOD", str(tcfg.get("lstm_period", "90d")))
+        interval = _env_str("AGI_LSTM_INTERVAL", str(tcfg.get("lstm_interval", cfg.get("trading", {}).get("timeframe", "M5"))))
+        candles = _env_int("AGI_LSTM_CANDLES", int(tcfg.get("lstm_candles", 100000)))
+        feature_version = normalize_feature_version(
+            os.environ.get("AGI_FEATURE_VERSION") or tcfg.get("feature_version", ULTIMATE_150),
+            default=ULTIMATE_150,
+        )
+        data_source = tcfg.get("data_source")
+    else:
+        feature_version = normalize_feature_version(os.environ.get("AGI_FEATURE_VERSION"), default=ULTIMATE_150)
+        symbols = list(DEFAULT_TRADING_SYMBOLS)
+
+    train_lstm(
+        symbols=symbols,
+        epochs=epochs,
+        period=period,
+        interval=interval,
+        candles=candles,
+        feature_version=feature_version,
+        data_source=data_source,
+    )

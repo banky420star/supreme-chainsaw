@@ -1,4 +1,4 @@
-import os
+﻿import os
 
 import numpy as np
 import pandas as pd
@@ -7,93 +7,39 @@ import torch.nn as nn
 import torch.nn.functional as F
 from loguru import logger
 from sklearn.preprocessing import MinMaxScaler
-from Python.feature_pipeline import ENGINEERED_V2, ENGINEERED_LSTM_COLUMNS, build_lstm_feature_frame
+from Python.feature_pipeline import ENGINEERED_V2, ULTIMATE_150, ENGINEERED_LSTM_COLUMNS, build_lstm_feature_frame
 
-FEATURE_COLUMNS = list(ENGINEERED_LSTM_COLUMNS)
+# Default to ULTIMATE_150 — same feature set used during LSTM training.
+# ENGINEERED_V2 (17 cols) is kept as a legacy fallback only.
+FEATURE_COLUMNS = list(ENGINEERED_LSTM_COLUMNS)  # 17-col legacy size; overridden by bundle metadata
 
-# ---------------------------------------------------------------------------
-# Feature-group mapping for the ultimate_150 feature set.
-# Each rule is (prefix/pattern, group_name).  Evaluated top-down; first match
-# wins.  The order matters: multi_timeframe and cross_features prefixes must
-# be checked before generic single-word prefixes like "rsi_".
-# ---------------------------------------------------------------------------
-FEATURE_GROUP_RULES: list[tuple[str, str]] = [
-    # cross-feature interactions (must come before single-prefix matches)
-    ("cross_", "cross_features"),
-    # multi-timeframe higher-timeframe context
-    ("m15_", "multi_timeframe"),
-    ("h1_", "multi_timeframe"),
-    ("h4_", "multi_timeframe"),
-    ("d1_", "multi_timeframe"),
-    # time cyclical
-    ("hour_sin", "time_cyclical"),
-    ("hour_cos", "time_cyclical"),
-    ("dow_sin", "time_cyclical"),
-    ("dow_cos", "time_cyclical"),
-    ("month_sin", "time_cyclical"),
-    ("month_cos", "time_cyclical"),
-    # price action
-    ("open_rel", "price_action"),
-    ("high_rel", "price_action"),
-    ("low_rel", "price_action"),
-    ("close_ret_1", "price_action"),
-    ("body_ratio", "price_action"),
-    ("upper_wick", "price_action"),
-    ("lower_wick", "price_action"),
-    ("range_ratio", "price_action"),
-    ("gap_ratio", "price_action"),
-    # momentum
-    ("ret_", "momentum"),
-    ("logret_", "momentum"),
-    ("momentum_", "momentum"),
-    # trend
-    ("close_ma_rel_", "trend"),
-    ("ema_rel_", "trend"),
-    ("slope_", "trend"),
-    ("breakout_", "trend"),
-    # volatility
-    ("realized_vol_", "volatility"),
-    ("range_mean_", "volatility"),
-    ("range_std_", "volatility"),
-    ("bb_width_", "volatility"),
-    ("atr_rel_", "volatility"),
-    # mean reversion
-    ("close_z_", "mean_reversion"),
-    ("rsi_", "mean_reversion"),
-    # volume
-    ("log_volume", "volume"),
-    ("volume_rel_", "volume"),
-]
+# Direction labels produced by create_sequences() in train_lstm.py:
+#   0 = HOLD/NEUTRAL  (small move or ambiguous RSI)
+#   1 = BUY           (future_ret > up_thr AND rsi > 52)
+#   2 = SELL          (future_ret < dn_thr AND rsi < 48)
+DIRECTION_LABELS = ["HOLD", "BUY", "SELL"]
 
 
-def _map_feature_to_group(feature_name: str) -> str:
-    """Return the group name for a given feature, or 'other' if unmatched."""
-    for prefix, group in FEATURE_GROUP_RULES:
-        if feature_name.startswith(prefix):
-            return group
-    return "other"
+def _direction_to_risk_scalar(direction: str) -> float:
+    """Higher risk tolerance when the model has a clear directional conviction."""
+    d = str(direction or "").upper()
+    if d in ("BUY", "SELL"):
+        return 0.90
+    return 0.80  # HOLD / uncertain — reduce position sizing slightly
 
 
-def _regime_to_risk_scalar(regime: str) -> float:
-    regime = str(regime or "").upper()
-    if regime == "HIGH_VOLATILITY":
-        return 0.55
-    if regime == "MED_VOLATILITY":
-        return 0.80
-    if regime == "LOW_VOLATILITY":
-        return 0.95
-    return 0.75
+def _direction_to_trend_bias(direction: str) -> float:
+    """Map direction class to a signed [-1, +1] bias used in HybridBrain blend.
 
-
-def _regime_to_trend_bias(regime: str) -> float:
-    regime = str(regime or "").upper()
-    if regime == "HIGH_VOLATILITY":
-        return 0.10
-    if regime == "MED_VOLATILITY":
-        return 0.00
-    if regime == "LOW_VOLATILITY":
-        return -0.05
-    return 0.0
+    The bias is intentionally ±1.0 so that when no PPO champion is present
+    (ppo_weight redistributed to agi_weight) the AGI signal drives real decisions.
+    """
+    d = str(direction or "").upper()
+    if d == "BUY":
+        return 1.0
+    if d == "SELL":
+        return -1.0
+    return 0.0  # HOLD
 
 
 def _as_series(df: pd.DataFrame, col: str) -> pd.Series:
@@ -104,21 +50,22 @@ def _as_series(df: pd.DataFrame, col: str) -> pd.Series:
 
 
 def build_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
-    features, _ = build_lstm_feature_frame(df, feature_version=ENGINEERED_V2)
+    """Build the 150-feature frame used for both training and inference."""
+    features, _ = build_lstm_feature_frame(df, feature_version=ULTIMATE_150)
     return features
 
 
 class AGIModel(nn.Module):
     def __init__(self, input_dim: int = len(FEATURE_COLUMNS)):
         super().__init__()
-        self.lstm = nn.LSTM(input_dim, 128, 3, batch_first=True, dropout=0.3)
-        self.dropout = nn.Dropout(0.3)
+        self.lstm = nn.LSTM(input_dim, 128, 3, batch_first=True, dropout=0.1)
         self.fc = nn.Linear(128, 3)
 
     def forward(self, x):
         x, _ = self.lstm(x)
         x = self.dropout(x[:, -1, :])
         return self.fc(x)
+
 
 
 class SmartAGI:
@@ -176,7 +123,7 @@ class SmartAGI:
 
     def _load_bundle(self, model_path: str, scaler_path: str, label: str):
         feature_columns = list(FEATURE_COLUMNS)
-        feature_version = ENGINEERED_V2
+        feature_version = ULTIMATE_150  # default: same as training
         metadata_path = os.path.splitext(model_path)[0] + ".meta.json"
         if os.path.exists(metadata_path):
             try:
@@ -187,7 +134,7 @@ class SmartAGI:
                 cols = metadata.get("feature_columns")
                 if isinstance(cols, list) and cols:
                     feature_columns = [str(col) for col in cols]
-                feature_version = str(metadata.get("feature_version", ENGINEERED_V2) or ENGINEERED_V2)
+                feature_version = str(metadata.get("feature_version", ULTIMATE_150) or ULTIMATE_150)
             except Exception as exc:
                 logger.warning(f"{label} metadata load failed: {exc}")
 
@@ -228,7 +175,7 @@ class SmartAGI:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         safe = symbol.replace("/", "_")
 
-        symbol_active = self.registry.load_active_model(prefer_canary=True)
+        symbol_active = self.registry.load_active_model(prefer_canary=True, symbol=symbol)
         if symbol_active:
             reg_model = os.path.join(symbol_active, "per_symbol", f"lstm_{safe}.pt")
             reg_scaler = os.path.join(symbol_active, "per_symbol", f"lstm_scaler_{safe}.pkl")
@@ -305,18 +252,20 @@ class SmartAGI:
         symbol = str(df["symbol"].iloc[0]) if "symbol" in df.columns and len(df) else "UNKNOWN"
         bundle = self._bundle_for_symbol(symbol)
 
-        feature_version = str(bundle.get("feature_version", ENGINEERED_V2) or ENGINEERED_V2)
+        feature_version = str(bundle.get("feature_version", ULTIMATE_150) or ULTIMATE_150)
         feat_df, available_columns = build_lstm_feature_frame(df, feature_version=feature_version)
         if len(feat_df) < 60:
-            regime = "LOW_VOLATILITY"
+            # Insufficient history — return neutral/hold with no bias
             return {
-                "signal": regime,
-                "regime": regime,
+                "signal": "HOLD",
+                "regime": "HOLD",
+                "direction": "HOLD",
                 "confidence": 0.0,
-                "risk_scalar": _regime_to_risk_scalar(regime),
-                "trend_bias": _regime_to_trend_bias(regime),
+                "risk_scalar": _direction_to_risk_scalar("HOLD"),
+                "trend_bias": 0.0,
                 "trade_blocked": False,
                 "symbol": symbol,
+                "feature_version": feature_version,
             }
 
         bundle_columns = [str(col) for col in bundle.get("feature_columns", FEATURE_COLUMNS)]
@@ -331,61 +280,35 @@ class SmartAGI:
 
         seq = torch.tensor(data[-60:].reshape(1, 60, features.shape[1]), dtype=torch.float32).to(self.device)
 
-        # ── Gradient-based indicator attribution ──
-        seq_grad = seq.detach().clone().requires_grad_(True)
-        logits = bundle["model"](seq_grad)
-        probs = F.softmax(logits, dim=-1)
-
         with torch.no_grad():
-            probs_np = probs.cpu().numpy().flatten()
-            pred = int(np.argmax(probs_np)) if production else int(np.random.choice(3, p=probs_np))
+            logits = bundle["model"](seq)
+            probs = F.softmax(logits, dim=-1).cpu().numpy().flatten()
+            pred = int(np.argmax(probs)) if production else int(np.random.choice(3, p=probs))
 
-        # Backprop the winning class to get feature importance
-        top_indicators = []
-        top_feature_groups = []
-        try:
-            probs[0, pred].backward()
-            grad = seq_grad.grad  # (1, 60, n_features)
-            if grad is not None:
-                feature_importance = grad.abs().mean(dim=1).squeeze().cpu().numpy()  # (n_features,)
+        # DIRECTION_LABELS = ["HOLD", "BUY", "SELL"]  — must match train_lstm.py create_sequences()
+        # y=0 neutral/hold, y=1 buy (up + rsi>52), y=2 sell (down + rsi<48)
+        direction = DIRECTION_LABELS[pred]
+        confidence = round(float(probs[pred]), 4)
 
-                # -- Per-indicator attribution (top 10) with group label --
-                top_k = min(10, len(use_columns))
-                top_indices = np.argsort(feature_importance)[-top_k:][::-1]
-                top_indicators = [
-                    {
-                        "indicator": use_columns[i],
-                        "importance": round(float(feature_importance[i]), 6),
-                        "group": _map_feature_to_group(use_columns[i]),
-                    }
-                    for i in top_indices
-                ]
+        # Scale bias by confidence so a low-confidence BUY doesn't over-commit
+        raw_bias = _direction_to_trend_bias(direction)
+        scaled_bias = round(raw_bias * confidence, 4)
 
-                # -- Group-level attribution: sum importance per group --
-                group_scores: dict[str, float] = {}
-                for i, col in enumerate(use_columns):
-                    grp = _map_feature_to_group(col)
-                    group_scores[grp] = group_scores.get(grp, 0.0) + float(feature_importance[i])
-                top_feature_groups = sorted(
-                    [{"name": g, "score": round(s, 6)} for g, s in group_scores.items()],
-                    key=lambda x: x["score"],
-                    reverse=True,
-                )
-        except Exception:
-            pass
-
-        regime = ["LOW_VOLATILITY", "MED_VOLATILITY", "HIGH_VOLATILITY"][pred]
-        confidence = round(float(probs_np[pred]), 4)
         return {
-            "signal": regime,
-            "regime": regime,
+            "signal": direction,
+            "regime": direction,         # backward-compat key still used by logging
+            "direction": direction,
             "confidence": confidence,
-            "risk_scalar": _regime_to_risk_scalar(regime),
-            "trend_bias": _regime_to_trend_bias(regime),
+            "risk_scalar": _direction_to_risk_scalar(direction),
+            "trend_bias": scaled_bias,   # ±confidence (0..1) rather than capped ±0.10
             "trade_blocked": False,
             "symbol": symbol,
-            "top_feature_groups": top_feature_groups,
-            "top_indicators": top_indicators,
+            "feature_version": feature_version,
+            "probs": {
+                "HOLD": round(float(probs[0]), 4),
+                "BUY":  round(float(probs[1]), 4),
+                "SELL": round(float(probs[2]), 4),
+            },
         }
 
     def extract_features(self, seq: torch.Tensor) -> torch.Tensor:

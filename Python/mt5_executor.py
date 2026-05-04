@@ -1,33 +1,20 @@
-"""
-MT5 Executor — Trade execution with conditional MT5 import and dry-run mode.
-Automatically falls back to DryRunExecutor on Mac/Linux.
-Supports multi-position trading: up to N concurrent positions per symbol.
-"""
-import sys
 import os
-import json
-import time
-from datetime import datetime, timezone
+
 from loguru import logger
+from Python.mt5_compat import mt5
 
-# ── Audio alert for trade execution (Windows only) ───────────────────
-if sys.platform == "win32":
-    try:
-        import winsound
-        _ALERT_ENABLED = True
-    except ImportError:
-        _ALERT_ENABLED = False
-else:
-    _ALERT_ENABLED = False
 
-# ── Conditional MT5 import ──────────────────────────────────────────
-_mt5 = None
-if sys.platform == "win32":
-    try:
-        import MetaTrader5 as mt5
-        _mt5 = mt5
-    except ImportError:
-        logger.warning("MetaTrader5 not installed on Windows — using dry-run mode")
+MAGIC_BY_SYMBOL = {
+    "BTCUSDm": 51000,
+    "XAUUSDm": 52000,
+}
+
+LANE_MAGIC_OFFSET = {
+    "champion": 0,
+    "canary": 100,
+    "history": 200,
+    "unknown": 900,
+}
 
 
 class MT5Executor:
@@ -628,6 +615,193 @@ class MT5Executor:
 
         return lot_size
 
+    def _symbol_info(self, symbol):
+        return mt5.symbol_info(symbol)
+
+    def _symbol_tick(self, symbol):
+        return mt5.symbol_info_tick(symbol)
+
+    def get_tick(self, symbol):
+        return self._symbol_tick(symbol)
+
+    def get_mid_price(self, symbol):
+        tick = self._symbol_tick(symbol)
+        if tick is None:
+            return None
+        return float((tick.bid + tick.ask) / 2.0)
+
+    def _symbol_magic_base(self, symbol: str) -> int:
+        profile = {}
+        try:
+            profile = self.risk.get_symbol_profile(symbol) or {}
+        except Exception:
+            profile = {}
+        if "magic_base" in profile:
+            try:
+                return int(profile.get("magic_base"))
+            except Exception:
+                pass
+        if "magic" in profile:
+            try:
+                return int(profile.get("magic"))
+            except Exception:
+                pass
+        return int(MAGIC_BY_SYMBOL.get(str(symbol), 59000))
+
+    def _lane_for_order(self, order_meta: dict | None) -> str:
+        lane = str((order_meta or {}).get("lane", "unknown") or "unknown").strip().lower()
+        if lane in LANE_MAGIC_OFFSET:
+            return lane
+        return "unknown"
+
+    def _symbol_tag(self, symbol: str) -> str:
+        symbol_str = str(symbol or "").upper()
+        if symbol_str.startswith("BTC"):
+            return "BTC"
+        if symbol_str.startswith("XAU"):
+            return "XAU"
+        return symbol_str[:4] or "UNK"
+
+    def _magic_for_order(self, symbol: str, order_meta: dict | None, request_kind: str = "open") -> int:
+        base = self._symbol_magic_base(symbol)
+        lane = self._lane_for_order(order_meta)
+        kind_offset = {"open": 0, "close": 10, "manage": 20}.get(str(request_kind), 90)
+        return int(base + int(LANE_MAGIC_OFFSET.get(lane, 900)) + int(kind_offset))
+
+    def _order_comment(self, symbol: str, order_meta: dict | None, request_kind: str = "open") -> str:
+        meta = order_meta or {}
+        sym = self._symbol_tag(symbol)
+        lane = self._lane_for_order(meta)
+        lane_tag = {"champion": "CH", "canary": "CA", "history": "HI", "unknown": "UN"}.get(lane, "UN")
+        family = str(meta.get("model_family", "P") or "P").upper()[:1]
+        version = str(meta.get("model_version", "") or "")
+        version_tag = version[-6:] if version else "000000"
+        ppo_target = float(meta.get("ppo_target", meta.get("exposure", 0.0)) or 0.0)
+        ppo_tag = int(round(ppo_target * 100.0))
+        req_tag = {"open": "O", "close": "C", "manage": "M"}.get(str(request_kind), "U")
+        comment = f"AGI|{sym}|{lane_tag}|{req_tag}|{family}{version_tag}|P{ppo_tag:+03d}"
+        return comment[:31]
+
+    def _result_ticket(self, result):
+        if result is None:
+            return None
+        for attr in ("order", "deal"):
+            value = getattr(result, attr, None)
+            if value not in (None, 0):
+                return int(value)
+        return None
+
+    def _log_order_send(self, symbol: str, request_action: str, request: dict, result, order_meta: dict | None):
+        meta = order_meta or {}
+        payload = {
+            "action": str(request_action),
+            "request_action": str(request_action),
+            "side": str(meta.get("order_type") or request.get("type") or ""),
+            "lots": float(request.get("volume", 0.0) or 0.0),
+            "executed_lots": float(request.get("volume", 0.0) or 0.0),
+            "target": float(meta.get("exposure", 0.0) or 0.0),
+            "ppo": float(meta.get("ppo_target", 0.0) or 0.0),
+            "dreamer": float(meta.get("dreamer_target", 0.0) or 0.0),
+            "agi": float(meta.get("agi_bias", 0.0) or 0.0),
+            "magic": request.get("magic"),
+            "comment": request.get("comment"),
+            "retcode": getattr(result, "retcode", None) if result is not None else None,
+            "ticket": self._result_ticket(result),
+        }
+        logger.info(
+            "ORDER_SEND {} | action={} side={} lots={:.2f} target={:.4f} ppo={:.4f} dreamer={:.4f} agi={:.4f} magic={} comment={} retcode={} ticket={}",
+            symbol,
+            payload["action"],
+            payload["side"],
+            payload["lots"],
+            payload["target"],
+            payload["ppo"],
+            payload["dreamer"],
+            payload["agi"],
+            payload["magic"],
+            payload["comment"],
+            payload["retcode"],
+            payload["ticket"],
+        )
+        return payload
+
+    def _select_filling_mode(self, symbol):
+        info = self._symbol_info(symbol)
+        if info is None:
+            return mt5.ORDER_FILLING_RETURN
+
+        fm = int(getattr(info, "filling_mode", mt5.ORDER_FILLING_RETURN))
+
+        # Some brokers expose bitmask-like values (e.g. 3 => FOK/IOC allowed).
+        if fm == 3:
+            return mt5.ORDER_FILLING_IOC
+
+        if fm in (mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_RETURN):
+            return fm
+
+        # Safe fallback for market execution when RETURN is unsupported.
+        return mt5.ORDER_FILLING_IOC
+
+    def _min_stop_distance(self, symbol):
+        info = self._symbol_info(symbol)
+        if info is None:
+            return 0.0, 5
+
+        point = float(info.point) if info.point else 0.0001
+        stops_level = max(int(getattr(info, "trade_stops_level", 0)), 0)
+        freeze_level = max(int(getattr(info, "trade_freeze_level", 0)), 0)
+        min_points = max(stops_level, freeze_level) + 2
+        return min_points * point, min_points
+
+    def _sanitize_sl_tp(self, symbol, order_type, sl, tp, tick):
+        info = self._symbol_info(symbol)
+        if info is None or tick is None:
+            return sl, tp
+
+        digits = int(info.digits) if info.digits is not None else 5
+        min_dist, _ = self._min_stop_distance(symbol)
+
+        bid = float(tick.bid)
+        ask = float(tick.ask)
+
+        new_sl = float(sl) if sl else None
+        new_tp = float(tp) if tp else None
+
+        if order_type == mt5.ORDER_TYPE_BUY:
+            # Buy SL must stay below bid, TP must stay above ask.
+            max_sl = bid - min_dist
+            min_tp = ask + min_dist
+
+            if new_sl is not None:
+                if new_sl >= max_sl:
+                    new_sl = max_sl
+                new_sl = round(new_sl, digits)
+                if new_sl <= 0:
+                    new_sl = None
+
+            if new_tp is not None:
+                if new_tp <= min_tp:
+                    new_tp = min_tp
+                new_tp = round(new_tp, digits)
+        else:
+            # Sell SL must stay above ask, TP must stay below bid.
+            min_sl = ask + min_dist
+            max_tp = bid - min_dist
+
+            if new_sl is not None:
+                if new_sl <= min_sl:
+                    new_sl = min_sl
+                new_sl = round(new_sl, digits)
+
+            if new_tp is not None:
+                if new_tp >= max_tp:
+                    new_tp = max_tp
+                new_tp = round(new_tp, digits)
+                if new_tp <= 0:
+                    new_tp = None
+
+        return new_sl, new_tp
+
     def get_positions(self, symbol):
         longs = []
         shorts = []
@@ -638,775 +812,293 @@ class MT5Executor:
         positions = _mt5.positions_get(symbol=symbol)
         if positions:
             for p in positions:
-                if p.type == 0:
+                if p.type == mt5.ORDER_TYPE_BUY:
                     longs.append(p)
                 else:
                     shorts.append(p)
         return longs, shorts
 
-    def _magic_for_order(self, symbol, order_meta, request_kind="open"):
-        """Compute a unique magic number per symbol + lane combination.
+    def reconcile_exposure(self, symbol, target_exposure, max_lots, order_meta=None, execution_context=None):
+        if not self.risk.can_trade(symbol):
+            return {"request_action": "blocked", "executed": False}
 
-        Magic number scheme: BASE + symbol_offset * 100 + lane_offset
-          - champion orders: symbol_offset * 100
-          - canary orders:   symbol_offset * 100 + 1
-          - close orders:    + 50 (to distinguish from opens)
-
-        This lets the user filter trades by symbol/lane in MT5 history.
-        """
-        sym_offset = self._SYMBOL_MAGIC_OFFSET.get(symbol, 99)
-        lane = (order_meta or {}).get("lane", "champion")
-        lane_offset = 0 if lane == "champion" else 1
-        magic = self._MAGIC_BASE + sym_offset * 100 + lane_offset
-        if request_kind == "close":
-            magic += 50
-        return magic
-
-    def _order_comment(self, symbol, order_meta, request_kind="open"):
-        """Build an MT5 order comment string (max 31 chars).
-
-        Format: {SYM6}{KIND}{LANE}{VERSION}
-          SYM6: first 6 chars of symbol (e.g. XAUUSD)
-          KIND: OP=open, CL=close
-          LANE: CH=champion, CA=canary
-          VERSION: last 6 chars of model version (timestamp)
-        Example: XAUUSDOPCH120510  (21 chars)
-        """
-        sym_short = symbol[:6].ljust(6)
-        kind_code = "OP" if request_kind == "open" else "CL"
-        lane = (order_meta or {}).get("lane", "champion")
-        lane_code = "CH" if lane == "champion" else "CA"
-        model_version = (order_meta or {}).get("model_version", "")
-        ver_short = model_version.replace("_", "")[-6:] if model_version else "------"
-
-        comment = f"{sym_short}{kind_code}{lane_code}{ver_short}"
-        # MT5 comment field limit is 31 chars
-        return comment[:31]
-
-    def _check_news_blackout(self, symbol, minutes_before=5, minutes_after=5):
-        """Check if a high-impact economic event is within the blackout window.
-
-        Returns True if news blackout is active (trade should be skipped).
-        Uses the MT5 economic calendar API to find upcoming events.
-        """
-        if not self._is_live or _mt5 is None:
-            return False
-
-        try:
-            from datetime import datetime, timezone, timedelta
-            now = datetime.now(timezone.utc)
-            window_start = now - timedelta(minutes=minutes_after)
-            window_end = now + timedelta(minutes=minutes_before)
-
-            # Parse currencies from symbol name (handles broker suffixes like 'm')
-            base = symbol.rstrip("m").rstrip("M")
-            currencies = []
-            # Known commodity prefixes
-            for prefix in ["XAU", "XAG", "XPT"]:
-                if base.startswith(prefix):
-                    currencies = [prefix, base[len(prefix):]]
-                    break
-            else:
-                # Standard FX: 6-char base
-                if len(base) == 6:
-                    currencies = [base[:3], base[3:]]
-                else:
-                    # Crypto or unknown: try 3-char splits
-                    for prefix in ["BTC", "ETH", "SOL", "LTC"]:
-                        if base.startswith(prefix):
-                            currencies = [prefix, base[len(prefix):]]
-                            break
-                    if not currencies:
-                        for i in range(0, len(base) - 2, 3):
-                            currencies.append(base[i:i+3])
-            if not currencies:
-                currencies = None
-
-            if not self._mt5_has_calendar:
-                return False
-            countries = _mt5.calendar_country()
-            if not countries:
-                return False
-
-            for country in countries:
-                # Skip countries whose currency is not in the symbol
-                if currencies is not None:
-                    currency_code = getattr(country, "currency", "") or getattr(country, "code", "")
-                    if currency_code not in currencies:
-                        continue
-
-                try:
-                    events = _mt5.calendar_value_last_by_country(
-                        country.code, window_start, window_end
-                    )
-                except AttributeError:
-                    # Fallback: try calendar_value_last if _by_country variant missing
-                    try:
-                        events = _mt5.calendar_value_last(
-                            country.code, window_start, window_end
-                        )
-                    except (AttributeError, TypeError):
-                        continue
-
-                if not events:
-                    continue
-
-                for ev in events:
-                    importance = getattr(ev, "importance", 0)
-                    if importance >= 2:  # MT5: 0=low, 1=medium, 2=high
-                        event_name = getattr(ev, "name", "unknown")
-                        event_time = getattr(ev, "time", "")
-                        logger.warning(
-                            f"NEWS BLACKOUT ACTIVE: {event_name} ({country.code}) "
-                            f"importance={importance} time={event_time} — skipping {symbol}"
-                        )
-                        return True
-
-            return False
-
-        except Exception as e:
-            logger.debug(f"News blackout check failed for {symbol}: {e}")
-            return False
-
-    def reconcile_exposure(self, symbol, target_exposure, max_lots, max_positions_per_symbol=5,
-                           order_meta=None):
-        """Multi-position executor: adds new positions up to max_positions_per_symbol.
-
-        Each cycle, if the model says BUY and we have fewer than N long positions,
-        open a new position. If SELL, open shorts. If opposite direction
-        positions exist, close them first.
-
-        Reads per-symbol risk config from configs/{symbol}.yaml for max_lots,
-        SL/TP ATR multipliers, and position limits.
-
-        order_meta: dict with 'lane', 'model_version', etc. for magic/comment.
-
-        Only adds ONE position per call to avoid rapid stacking.
-        """
-        if not self.risk.can_trade():
-            return
-
-        # Post-SL cooldown: skip trading a symbol for N minutes after an SL hit
-        cooldown_minutes = int(os.environ.get("AGI_SL_COOLDOWN_MIN", "15"))
-        last_sl = self._last_sl_hit_time.get(symbol, 0)
-        if last_sl > 0 and (time.time() - last_sl) < (cooldown_minutes * 60):
-            remaining = cooldown_minutes * 60 - (time.time() - last_sl)
-            logger.debug(f"{symbol}: post-SL cooldown active ({remaining:.0f}s remaining)")
-            return
-
-        # Skip trade if a high-impact news event is imminent or just released
-        if self._check_news_blackout(symbol):
-            logger.info(f"{symbol}: trade skipped — news blackout active")
-            self._log_execution({
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "symbol": symbol, "side": "BUY" if target_exposure > 0 else "SELL",
-                "lot_size": 0, "allowed": False, "reason": "news_blackout_active",
-            })
-            return
-
-        # ── Pre-flight checks ────────────────────────────────────────────
-        # Load per-symbol risk config FIRST so preflight uses the right caps
-        sym_max_lots = max_lots
-        sym_max_positions = max_positions_per_symbol
-        sym_min_lots = self._min_lots
-
-        try:
-            import yaml
-            config_path = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                "configs", f"{symbol}.yaml"
-            )
-            if os.path.exists(config_path):
-                with open(config_path, "r") as f:
-                    sym_cfg = yaml.safe_load(f)
-                risk_cfg = sym_cfg.get("risk", {})
-                sym_max_lots = risk_cfg.get("max_lots", max_lots)
-                sym_max_positions = risk_cfg.get("max_positions_per_symbol", max_positions_per_symbol)
-                sym_min_lots = float(risk_cfg.get("min_lots", self._min_lots))
-        except Exception:
-            pass
-
-        # ── Per-symbol minimum equity check ─────────────────────────────────
-        # Reject trades on symbols where even the minimum lot size would risk
-        # more than max_sl_equity_pct of equity. E.g. XAUUSDm 0.01 lots risks $18+
-        # on a $22 account — 80%+ of equity, which exceeds the 10% cap.
-        min_lots = sym_min_lots
-        equity = getattr(self.risk, "_current_equity", None)
-        if equity is None or equity <= 0:
-            equity = 50.0
-        # Read fresh equity from MT5 (more accurate than cached value)
-        if _mt5:
-            try:
-                _info = _mt5.account_info()
-                if _info and _info.equity > 0:
-                    equity = float(_info.equity)
-                    self.risk._current_equity = equity
-            except Exception:
-                pass
-        max_sl_equity_pct = getattr(self.risk, 'max_sl_equity_pct', 10.0)
-        # Tiered SL caps: tighter for smaller accounts
-        if equity < 25:
-            max_sl_equity_pct = min(max_sl_equity_pct, 8.0)
-        elif equity < 50:
-            max_sl_equity_pct = min(max_sl_equity_pct, 10.0)
-        elif equity < 100:
-            max_sl_equity_pct = min(max_sl_equity_pct, 12.0)
-        max_sl_dollars = equity * max_sl_equity_pct / 100.0
-
-        # Calculate SL distance for this symbol to estimate min risk
-        sl_mult = self._get_symbol_sl_mult(symbol)
-        raw_atr = self._get_raw_atr(symbol)
-        if raw_atr > 0 and max_sl_dollars > 0:
-            sl_distance = raw_atr * sl_mult
-            # Apply same min SL floor as open_position to avoid passing trades that will be blocked
-            if equity < 100:
-                min_sl_floor = max(0.00005 * 2, self._min_sl_for_symbol(symbol) * 0.04)
-            else:
-                min_sl_floor = max(0.00005 * 3, self._min_sl_for_symbol(symbol))
-            if sl_distance < min_sl_floor:
-                sl_distance = min_sl_floor
-            # For small accounts: cap SL distance to what equity can afford
-            if equity < 100 and sl_distance > min_sl_floor:
-                tick_sz = self._get_tick_size(symbol)
-                pip_val = self._get_tick_pip_value(symbol) or self._pip_value_per_lot(symbol)
-                if tick_sz > 0 and pip_val > 0 and min_lots > 0:
-                    max_sl_dist = max_sl_dollars / (min_lots * pip_val / tick_sz)
-                    if sl_distance > max_sl_dist and max_sl_dist > min_sl_floor:
-                        sl_distance = max_sl_dist
-            pip_value = self._get_tick_pip_value(symbol) or self._pip_value_per_lot(symbol)
-            tick_size = self._get_tick_size(symbol)
-            if pip_value > 0 and tick_size > 0:
-                sl_pips = sl_distance / tick_size
-                min_risk = min_lots * sl_pips * pip_value
-                if min_risk > max_sl_dollars * 1.01:  # 1% buffer for rounding
-                    logger.warning(
-                        f"{symbol}: SKIP — min_lots {min_lots} risks ${min_risk:.2f} > "
-                        f"{max_sl_equity_pct}% equity (${max_sl_dollars:.2f}). "
-                        f"Account too small for this symbol."
-                    )
-                    self._log_execution({
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "symbol": symbol, "side": "BUY" if target_exposure > 0 else "SELL",
-                        "lot_size": 0, "allowed": False,
-                        "reason": f"equity_too_small_for_symbol (min_risk=${min_risk:.2f} > {max_sl_equity_pct}%=${max_sl_dollars:.2f})",
-                    })
-                    return
-
-        # For very small accounts (< $50), limit to 1 position per symbol to prevent overexposure
-        # Above $50, allow up to config max (typically 3)
-        small_account = equity < 50
-        if small_account:
-            sym_max_positions = 1
-
-        # Apply small account caps AFTER loading config so they don't get clobbered
-        if small_account:
-            sym_max_positions = 1
-            sym_max_lots = min(sym_max_lots, self._min_lots)
-
-        direction = "BUY" if target_exposure > 0 else "SELL"
-        allowed, preflight_reason = self._preflight_check(
-            symbol, direction, sym_max_lots
-        )
-        if not allowed:
-            logger.warning(f"{symbol}: preflight check FAILED — {preflight_reason}")
-            self._last_failed_signal_time[symbol] = time.time()
-            self._log_execution({
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "symbol": symbol, "side": direction,
-                "lot_size": 0, "allowed": False, "reason": preflight_reason,
-            })
-            return
-
-        min_lots = self._min_lots
-
-        # ── ATR-Based Risk-Adjusted Sizing (primary) ──
-        # Uses risk_per_trade_pct from risk engine + ATR stop distance
-        # Falls back to Kelly criterion if ATR unavailable
-        lot_size = self.compute_risk_adjusted_lots(symbol, target_exposure)
-
-        if not self._is_live:
-            # Dry-run: just log the intended trade
-            direction = "BUY" if target_exposure > 0 else "SELL" if target_exposure < 0 else "FLAT"
-            logger.info(
-                f"DRY-RUN TRADE: {symbol} | {direction} | "
-                f"exposure={target_exposure:.4f} | lots={min_lots}"
-            )
-            self.risk.record_trade()
-            return
-
-        # ── Live MT5 execution ──
         longs, shorts = self.get_positions(symbol)
-        n_longs = len(longs)
-        n_shorts = len(shorts)
 
-        # Determine direction from PPO exposure
-        if abs(target_exposure) < float(os.environ.get("AGI_ACTION_THRESHOLD", "0.001")):
-            # Signal too weak — skip
-            return
+        long_lots = sum(p.volume for p in longs)
+        short_lots = sum(p.volume for p in shorts)
 
-        is_buy = target_exposure > 0
-        hedging_enabled = os.environ.get("AGI_HEDGING_ENABLED", "true").lower() == "true"
+        target_lots = round(float(target_exposure) * float(max_lots), 2)
+        result_meta = {
+            "request_action": "noop",
+            "executed": False,
+            "target_lots": float(target_lots),
+        }
+        if abs(target_lots) < 0.01:
+            if long_lots > 0:
+                result_meta = self.close_positions(longs, order_meta=order_meta, execution_context=execution_context)
+            if short_lots > 0:
+                result_meta = self.close_positions(shorts, order_meta=order_meta, execution_context=execution_context)
+            return result_meta
 
-        if is_buy:
-            # If we already have long positions, don't add more unless under the limit
-            # and the existing positions are profitable (avoid doubling down on losers)
-            if n_longs >= sym_max_positions:
-                logger.debug(f"{symbol}: max long positions reached ({n_longs}/{sym_max_positions})")
-                return
-
-            # Close opposing short positions ONLY if hedging is disabled
-            if not hedging_enabled and n_shorts > 0:
-                self.close_positions(shorts, order_meta=order_meta)
-                logger.info(f"Closed {n_shorts} short position(s) for {symbol}")
-
-            # Open ONE new long position
-            opened = self.open_position(symbol, _mt5.ORDER_TYPE_BUY, lot_size, order_meta=order_meta)
-            if opened:
-                self.risk.record_trade()
-                logger.info(f"Opened long #{n_longs + 1}/{sym_max_positions} for {symbol} ({lot_size} lots)")
-                self._log_execution({
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "symbol": symbol, "side": "BUY", "lot_size": lot_size,
-                    "allowed": True, "reason": "ok",
-                    "magic": self._magic_for_order(symbol, order_meta or {}, request_kind="open"),
-                    "order_meta": order_meta,
-                })
+        if target_lots > 0:
+            if short_lots > 0:
+                result_meta = self.close_positions(shorts, order_meta=order_meta, execution_context=execution_context)
+                short_lots = 0.0
+            if long_lots > target_lots + 0.01:
+                result_meta = self.close_positions(longs, order_meta=order_meta, execution_context=execution_context)
+                long_lots = 0.0
+            add_lots = round(target_lots - long_lots, 2)
+            if add_lots >= 0.01:
+                result_meta = self.open_position(
+                    symbol,
+                    mt5.ORDER_TYPE_BUY,
+                    add_lots,
+                    order_meta=order_meta,
+                    execution_context=execution_context,
+                )
         else:
-            if n_shorts >= sym_max_positions:
-                logger.debug(f"{symbol}: max short positions reached ({n_shorts}/{sym_max_positions})")
-                return
+            desired_short_lots = abs(target_lots)
+            if long_lots > 0:
+                result_meta = self.close_positions(longs, order_meta=order_meta, execution_context=execution_context)
+                long_lots = 0.0
+            if short_lots > desired_short_lots + 0.01:
+                result_meta = self.close_positions(shorts, order_meta=order_meta, execution_context=execution_context)
+                short_lots = 0.0
+            add_lots = round(desired_short_lots - short_lots, 2)
+            if add_lots >= 0.01:
+                result_meta = self.open_position(
+                    symbol,
+                    mt5.ORDER_TYPE_SELL,
+                    add_lots,
+                    order_meta=order_meta,
+                    execution_context=execution_context,
+                )
 
-            # Close opposing long positions ONLY if hedging is disabled
-            if not hedging_enabled and n_longs > 0:
-                self.close_positions(longs, order_meta=order_meta)
-                logger.info(f"Closed {n_longs} long position(s) for {symbol}")
+        self.risk.record_trade(symbol)
+        return result_meta
 
-            # Open ONE new short position
-            opened = self.open_position(symbol, _mt5.ORDER_TYPE_SELL, lot_size, order_meta=order_meta)
-            if opened:
-                self.risk.record_trade()
-                logger.info(f"Opened short #{n_shorts + 1}/{sym_max_positions} for {symbol} ({lot_size} lots)")
-                self._log_execution({
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "symbol": symbol, "side": "SELL", "lot_size": lot_size,
-                    "allowed": True, "reason": "ok",
-                    "magic": self._magic_for_order(symbol, order_meta or {}, request_kind="open"),
-                    "order_meta": order_meta,
-                })
-
-    def close_positions(self, positions, order_meta=None):
-        if not self._is_live:
-            return
-
+    def close_positions(self, positions, order_meta=None, execution_context=None):
+        last_meta = {"request_action": "close", "executed": False}
         for p in positions:
-            # Use position's own magic/comment as fallback if no meta provided
-            meta = order_meta or self._last_order_meta.get(p.symbol, {})
-            magic = self._magic_for_order(p.symbol, meta, request_kind="close")
-            comment = self._order_comment(p.symbol, meta, request_kind="close")
+            tick = self._symbol_tick(p.symbol)
+            if tick is None:
+                self.risk.record_error()
+                continue
+
+            close_type = mt5.ORDER_TYPE_SELL if p.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+            close_price = tick.bid if close_type == mt5.ORDER_TYPE_SELL else tick.ask
 
             request = {
                 "action": _mt5.TRADE_ACTION_DEAL,
                 "symbol": p.symbol,
                 "volume": p.volume,
-                "type": _mt5.ORDER_TYPE_SELL if p.type == 0 else _mt5.ORDER_TYPE_BUY,
+                "type": close_type,
                 "position": p.ticket,
-                "magic": magic,
-                "comment": comment,
+                "price": close_price,
+                "deviation": 20,
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": self._select_filling_mode(p.symbol),
             }
-            logger.info(f"MT5 CLOSE: {p.symbol} ticket={p.ticket} | magic={magic} comment={comment}")
-            result = _mt5.order_send(request)
-            if result.retcode != _mt5.TRADE_RETCODE_DONE:
-                logger.error(f"Close position failed for {p.symbol} ticket={p.ticket}: retcode={result.retcode}")
-                # Only critical if retcode indicates a real problem, not market-closed or margin
-                critical = result.retcode not in (10018, 10019, 10020, 10021, 10030, 13108)
-                self.risk.record_error(critical=critical)
-            else:
-                # Record SL hit time for cooldown tracking
-                if p.sl > 0 and p.profit < 0:
-                    self._last_sl_hit_time[p.symbol] = time.time()
-                    logger.info(f"SL cooldown started for {p.symbol} (15 min)")
+            request["magic"] = self._magic_for_order(p.symbol, order_meta, request_kind="close")
+            request["comment"] = self._order_comment(p.symbol, order_meta, request_kind="close")
+            result = mt5.order_send(request)
+            last_meta = self._log_order_send(p.symbol, "close", request, result, order_meta)
+            last_meta["executed"] = bool(result is not None and result.retcode == mt5.TRADE_RETCODE_DONE)
+            if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+                self.risk.record_error()
+        return last_meta
 
-    def close_all_positions(self, symbol=None):
-        """Close all open positions, optionally filtered by symbol."""
-        if not self._is_live:
-            return
-        if symbol:
-            positions = _mt5.positions_get(symbol=symbol)
-        else:
-            positions = _mt5.positions_get()
-        if positions:
-            self.close_positions(list(positions))
-
-    def open_position(self, symbol, order_type, volume, order_meta=None):
-        """Open a position. Returns True on success, False on abort/failure, None when not live."""
-        if not self._is_live:
+    def _atr_points(self, symbol, bars=120, period=14):
+        rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, bars)
+        info = self._symbol_info(symbol)
+        if rates is None or len(rates) < period + 2 or info is None:
             return None
 
-        tick = _mt5.symbol_info_tick(symbol)
+        point = float(info.point) if info.point else 0.0001
+        highs = [float(r[2]) for r in rates]
+        lows = [float(r[3]) for r in rates]
+        closes = [float(r[4]) for r in rates]
+
+        trs = []
+        for i in range(1, len(rates)):
+            tr = max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i - 1]),
+                abs(lows[i] - closes[i - 1]),
+            )
+            trs.append(tr)
+
+        if len(trs) < period:
+            return None
+
+        atr = sum(trs[-period:]) / float(period)
+        atr_points = int(max(1, round(atr / max(point, 1e-12))))
+        return atr_points
+
+    def _dynamic_points(self, symbol):
+        profile = self.risk.get_symbol_profile(symbol)
+        base_sl = int(profile.get("sl_points", 250))
+        base_tp = int(profile.get("tp_points", 450))
+
+        atr_points = self._atr_points(symbol)
+        if atr_points is None:
+            return base_sl, base_tp
+
+        dyn_sl = max(base_sl, int(atr_points * 1.4))
+        dyn_tp = max(base_tp, int(atr_points * 2.2))
+        return dyn_sl, dyn_tp
+
+    def _get_sl_tp(self, symbol, order_type, entry_price):
+        info = self._symbol_info(symbol)
+        tick = self._symbol_tick(symbol)
+        if info is None or tick is None:
+            return None, None, 20
+
+        point = float(info.point) if info.point else 0.0001
+        digits = int(info.digits) if info.digits is not None else 5
+        _, min_pts = self._min_stop_distance(symbol)
+        deviation = int(self.risk.get_symbol_profile(symbol).get("entry_deviation", 20))
+
+        dyn_sl, dyn_tp = self._dynamic_points(symbol)
+        sl_points = max(int(dyn_sl), min_pts)
+        tp_points = max(int(dyn_tp), min_pts)
+
+        sl_dist = sl_points * point
+        tp_dist = tp_points * point
+
+        if order_type == mt5.ORDER_TYPE_BUY:
+            sl = round(entry_price - sl_dist, digits)
+            tp = round(entry_price + tp_dist, digits)
+        else:
+            sl = round(entry_price + sl_dist, digits)
+            tp = round(entry_price - tp_dist, digits)
+
+        sl, tp = self._sanitize_sl_tp(symbol, order_type, sl, tp, tick)
+        return sl, tp, deviation
+
+    def open_position(self, symbol, order_type, volume, order_meta=None, execution_context=None):
+        tick = self._symbol_tick(symbol)
         if tick is None:
-            logger.error(f"Cannot get tick for {symbol}")
-            self.risk.record_error(critical=False)  # Non-critical: market data issue
-            return False
+            self.risk.record_error()
+            return {"request_action": "open", "executed": False}
 
-        # Compute ATR-based SL/TP defaults
-        sl_distance, tp_distance = self._compute_atr_sl_tp(symbol)
-
-        # Enforce minimum SL distance to prevent instant SL hits on tight ATR periods
-        # Minimum SL: at least spread * 3 to avoid being stopped out by noise
-        # For small accounts (<$100), use a tighter floor (spread * 2) to allow trading
-        spread = tick.ask - tick.bid
-        # Read fresh equity from MT5 (more accurate than cached value)
-        equity = getattr(self.risk, "_current_equity", 0) or 50.0
-        if _mt5:
-            try:
-                _info = _mt5.account_info()
-                if _info and _info.equity > 0:
-                    equity = float(_info.equity)
-                    self.risk._current_equity = equity  # also update cache
-            except Exception:
-                pass
-        if equity < 100:
-            # Small accounts: use tighter SL to allow trading
-            # FX: 0.003*0.33=0.001 (~10 pips), Gold: $50*0.04=$2, BTC: $500*0.04=$20
-            min_sl = max(spread * 2, self._min_sl_for_symbol(symbol) * 0.04)
-        else:
-            min_sl = max(spread * 3, self._min_sl_for_symbol(symbol))
-        if 0 < sl_distance < min_sl:
-            logger.warning(f"{symbol}: ATR SL={sl_distance:.5f} too tight, widening to min={min_sl:.5f}")
-            sl_distance = min_sl
-
-        # For small accounts (<$100): cap SL distance to what equity can afford
-        # This prevents gold/BTC ATR-based SLs ($20-500) from exceeding risk cap
-        # Tiered: smaller accounts get tighter caps to prevent catastrophic losses
-        if equity < 100 and sl_distance > min_sl:
-            if equity < 25:
-                max_sl_equity_pct_local = 8.0   # Very small: 8% max SL risk
-            elif equity < 50:
-                max_sl_equity_pct_local = 10.0  # Small: 10% max SL risk
-            else:
-                max_sl_equity_pct_local = 12.0   # Medium-small: 12% max SL risk
-            max_risk_dollars = equity * max_sl_equity_pct_local / 100.0
-            tick_sz = self._get_tick_size(symbol)
-            pip_val = self._get_tick_pip_value(symbol) or self._pip_value_per_lot(symbol)
-            if tick_sz > 0 and pip_val > 0 and volume > 0:
-                max_sl_distance = max_risk_dollars / (volume * pip_val / tick_sz)
-                if sl_distance > max_sl_distance and max_sl_distance > min_sl:
-                    logger.info(f"{symbol}: Small-account SL cap: ${sl_distance:.2f} -> ${max_sl_distance:.2f} "
-                                f"(max risk ${max_risk_dollars:.2f} = {max_sl_equity_pct_local}% of ${equity:.2f})")
-                    sl_distance = max_sl_distance
-
-        # Scale TP proportionally if SL was adjusted
-        if tp_distance > 0 and sl_distance > 0:
-            tp_distance = max(tp_distance, sl_distance * 1.5)
-
-        entry_price = tick.ask if order_type == _mt5.ORDER_TYPE_BUY else tick.bid
-
-        # Compute SL/TP price levels
-        if order_type == _mt5.ORDER_TYPE_BUY:
-            sl = round(entry_price - sl_distance, 5) if sl_distance > 0 else 0
-            tp = round(entry_price + tp_distance, 5) if tp_distance > 0 else 0
-        else:
-            sl = round(entry_price + sl_distance, 5) if sl_distance > 0 else 0
-            tp = round(entry_price - tp_distance, 5) if tp_distance > 0 else 0
-
-        # ── Final safety: cap SL risk at max_sl_equity_pct% of equity ──
-        # Tiered SL caps for small accounts to prevent catastrophic losses
-        max_sl_equity_pct = getattr(self.risk, 'max_sl_equity_pct', 10.0)
-        if equity < 25:
-            max_sl_equity_pct = min(max_sl_equity_pct, 8.0)   # Very small: 8% cap
-        elif equity < 50:
-            max_sl_equity_pct = min(max_sl_equity_pct, 10.0)  # Small: 10% cap
-        elif equity < 100:
-            max_sl_equity_pct = min(max_sl_equity_pct, 12.0)  # Medium-small: 12% cap
-        # Use fresh equity (already read above from MT5)
-        max_sl_dollars = equity * max_sl_equity_pct / 100.0
-        if sl > 0 and sl_distance > 0:
-            pip_val = self._get_tick_pip_value(symbol) or self._pip_value_per_lot(symbol)
-            tick_sz = self._get_tick_size(symbol)
-            if pip_val > 0 and tick_sz > 0:
-                sl_pips = sl_distance / tick_sz
-                actual_risk = volume * sl_pips * pip_val
-                if actual_risk > max_sl_dollars * 1.01:  # 1% buffer for rounding
-                    # Calculate safe volume
-                    safe_volume = max_sl_dollars / (sl_pips * pip_val)
-                    min_lots = self._min_lots
-                    if safe_volume < min_lots:
-                        # Even minimum lots exceeds equity risk cap — ABORT this trade
-                        logger.warning(
-                            f"SL equity cap ABORT: {symbol} min_lots {min_lots} risks "
-                            f"${min_lots * sl_pips * pip_val:.2f} > {max_sl_equity_pct}% equity "
-                            f"(${max_sl_dollars:.2f}). Safe vol={safe_volume:.4f}. "
-                            f"Account too small for this symbol."
-                        )
-                        self.risk.record_error(critical=False)
-                        return False
-                    lot_step = self._get_lot_step(symbol)
-                    safe_volume = round(safe_volume / lot_step) * lot_step
-                    # DO NOT floor safe_volume back to min_lots — that defeats the equity cap
-                    # If safe_volume rounded down to 0, abort instead
-                    if safe_volume < lot_step:
-                        logger.warning(
-                            f"SL equity cap: {symbol} safe_volume {safe_volume:.4f} < lot_step {lot_step}, ABORT"
-                        )
-                        return False
-                    logger.warning(
-                        f"SL equity cap: {symbol} risk ${actual_risk:.2f} > {max_sl_equity_pct}% (${max_sl_dollars:.2f}), "
-                        f"reduced volume {volume:.2f} -> {safe_volume:.2f}"
-                    )
-                    volume = safe_volume
-
-        # Magic number and comment for trade identification
-        meta = order_meta or {}
-        magic = self._magic_for_order(symbol, meta, request_kind="open")
-        comment = self._order_comment(symbol, meta, request_kind="open")
-
-        # Store meta for close order matching
-        self._last_order_meta[symbol] = meta
+        price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
+        sl, tp, deviation = self._get_sl_tp(symbol, order_type, price)
 
         request = {
             "action": _mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
-            "volume": volume,
+            "volume": float(volume),
             "type": order_type,
-            "price": entry_price,
-            "magic": magic,
-            "comment": comment,
+            "price": price,
+            "deviation": deviation,
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": self._select_filling_mode(symbol),
         }
-        if sl > 0:
+        request["magic"] = self._magic_for_order(symbol, order_meta, request_kind="open")
+        request["comment"] = self._order_comment(symbol, order_meta, request_kind="open")
+
+        if sl is not None:
             request["sl"] = sl
-        if tp > 0:
+        if tp is not None:
             request["tp"] = tp
 
-        logger.info(f"MT5 ORDER: {symbol} {'BUY' if order_type == _mt5.ORDER_TYPE_BUY else 'SELL'} "
-                     f"{volume:.2f} lots @ {entry_price} | SL={sl} TP={tp} | magic={magic} comment={comment}")
-        result = _mt5.order_send(request)
-        if result.retcode != _mt5.TRADE_RETCODE_DONE:
-            logger.error(f"MT5 order failed: retcode={result.retcode}")
-            # Only critical for unexpected errors. Common non-critical retcodes:
-            # 10018=market_closed, 10019=no_prices, 10030=invalid_volume
-            # 10020=no_quote, 10021=requote, 13108=disabled
-            critical = result.retcode not in (10018, 10019, 10020, 10021, 10030, 13108)
-            self.risk.record_error(critical=critical)
-            return False
-        else:
-            # Play audio alert on successful trade execution
-            self._play_trade_alert()
-            return True
+        result = mt5.order_send(request)
+        meta = self._log_order_send(symbol, "open", request, result, order_meta)
+        meta["executed"] = bool(result is not None and result.retcode == mt5.TRADE_RETCODE_DONE)
+        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+            self.risk.record_error()
+        return meta
 
-    @staticmethod
-    def _min_sl_for_symbol(symbol):
-        """Minimum SL distance (in price units) per symbol type.
-        Prevents stop-outs from noise/spread during low-ATR periods.
-        These are BASE values — small accounts use a fraction via open_position()."""
-        # Gold: base $50, but small accounts use $2 via 0.04x multiplier
-        if "XAU" in symbol.upper():
-            return 50.0
-        # BTC: base $500, but small accounts use $20 via 0.04x multiplier
-        if "BTC" in symbol.upper():
-            return 500.0
-        # ETH: min $30
-        if "ETH" in symbol.upper():
-            return 30.0
-        # FX pairs: min 0.003 (30 pips for 5-digit pricing)
-        return 0.003
-
-    def _compute_atr_sl_tp(self, symbol, atr_period=14, sl_mult=None, tp_mult=None):
-        """Compute ATR-based stop loss and take profit distances.
-
-        Reads per-symbol ATR multipliers from configs/{symbol}.yaml if available,
-        otherwise uses conservative defaults (sl=2.0, tp=3.0).
-        """
-        if sl_mult is None or tp_mult is None:
-            # Try loading per-symbol config
-            try:
-                import yaml
-                config_path = os.path.join(
-                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                    "configs", f"{symbol}.yaml"
-                )
-                if os.path.exists(config_path):
-                    with open(config_path, "r") as f:
-                        sym_cfg = yaml.safe_load(f)
-                    risk_cfg = sym_cfg.get("risk", {})
-                    sl_mult = sl_mult or risk_cfg.get("sl_atr_mult", 2.0)
-                    tp_mult = tp_mult or risk_cfg.get("tp_atr_mult", 3.0)
-                else:
-                    sl_mult = sl_mult or 2.0
-                    tp_mult = tp_mult or 3.0
-            except Exception:
-                sl_mult = sl_mult or 2.0
-                tp_mult = tp_mult or 3.0
-
-        try:
-            rates = _mt5.copy_rates_from_pos(symbol, _mt5.TIMEFRAME_M5, 0, atr_period + 1)
-            if rates is None or len(rates) < atr_period + 1:
-                return 0, 0
-
-            # Calculate ATR14
-            high = rates["high"]
-            low = rates["low"]
-            close = rates["close"]
-            trs = []
-            for i in range(1, len(rates)):
-                tr = max(high[i] - low[i], abs(high[i] - close[i-1]), abs(low[i] - close[i-1]))
-                trs.append(tr)
-            atr = sum(trs[-atr_period:]) / atr_period if len(trs) >= atr_period else 0
-
-            sl_distance = atr * sl_mult
-            tp_distance = atr * tp_mult
-            return sl_distance, tp_distance
-        except Exception as e:
-            logger.warning(f"ATR SL/TP computation failed for {symbol}: {e}")
-            return 0, 0
-
-    def _get_raw_atr(self, symbol, atr_period=14):
-        """Get the raw ATR14 value (not multiplied by SL/TP factors)."""
-        try:
-            rates = _mt5.copy_rates_from_pos(symbol, _mt5.TIMEFRAME_M5, 0, atr_period + 1)
-            if rates is None or len(rates) < atr_period + 1:
-                return 0
-
-            high = rates["high"]
-            low = rates["low"]
-            close = rates["close"]
-            trs = []
-            for i in range(1, len(rates)):
-                tr = max(high[i] - low[i], abs(high[i] - close[i-1]), abs(low[i] - close[i-1]))
-                trs.append(tr)
-            return sum(trs[-atr_period:]) / atr_period if len(trs) >= atr_period else 0
-        except Exception as e:
-            logger.warning(f"Raw ATR computation failed for {symbol}: {e}")
-            return 0
-
-    def manage_trailing_stops(self):
-        """Check all open positions and apply trailing stops.
-
-        For each position, if price has moved in our favor by more than
-        trailing_trigger_atr * ATR, we move the SL to lock in profit.
-        The new SL is placed at current_price - trailing_distance_atr * ATR
-        (for longs) or current_price + trailing_distance_atr * ATR (for shorts).
-
-        Should be called periodically (e.g. every 30-60 seconds).
-        """
-        if not self._is_live or _mt5 is None:
+    def manage_open_positions(self, symbol):
+        positions = mt5.positions_get(symbol=symbol)
+        info = self._symbol_info(symbol)
+        tick = self._symbol_tick(symbol)
+        if not positions or info is None or tick is None:
             return
 
-        try:
-            # MT5 must be initialized in each background thread context
-            if not _mt5.initialize():
-                logger.debug("Trailing stop: MT5 init failed in thread context")
-                return
+        point = float(info.point) if info.point else 0.0001
+        digits = int(info.digits) if info.digits is not None else 5
+        profile = self.risk.get_symbol_profile(symbol)
 
-            try:
-                positions = _mt5.positions_get()
-                if not positions:
-                    return
+        dyn_sl, dyn_tp = self._dynamic_points(symbol)
+        breakeven_trigger = int(profile.get("breakeven_points", max(25, dyn_sl // 3)))
+        trailing_trigger = int(profile.get("trailing_trigger_points", max(40, dyn_sl // 2)))
+        trailing_step = int(profile.get("trailing_step_points", max(10, dyn_sl // 8)))
 
-                logger.debug(f"Trailing stop check: {len(positions)} open positions")
-                for p in positions:
-                    self._trail_single_position(p)
-            finally:
-                _mt5.shutdown()
-        except Exception as e:
-            logger.warning(f"Trailing stop management error: {e}")
-
-    def _trail_single_position(self, position):
-        """Apply trailing stop to a single position if conditions are met."""
-        import yaml
-
-        symbol = position.symbol
-        is_long = position.type == 0  # 0 = BUY/long, 1 = SELL/short
-        current_sl = position.sl
-        current_tp = position.tp
-        open_price = position.price_open
-
-        # Get current tick
-        tick = _mt5.symbol_info_tick(symbol)
-        if tick is None:
-            return
-
-        current_price = tick.bid if is_long else tick.ask
-
-        # Load trailing config
-        try:
-            config_path = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                "configs", f"{symbol}.yaml"
+        for p in positions:
+            current_price = tick.bid if p.type == mt5.ORDER_TYPE_BUY else tick.ask
+            profit_points = (
+                (current_price - p.price_open) / point
+                if p.type == mt5.ORDER_TYPE_BUY
+                else (p.price_open - current_price) / point
             )
-            if os.path.exists(config_path):
-                with open(config_path, "r") as f:
-                    sym_cfg = yaml.safe_load(f)
-                risk_cfg = sym_cfg.get("risk", {})
-                trigger_atr = risk_cfg.get("trailing_trigger_atr", 1.5)
-                distance_atr = risk_cfg.get("trailing_distance_atr", 1.5)
-            else:
-                trigger_atr = 1.5
-                distance_atr = 1.5
-        except Exception:
-            trigger_atr = 1.5
-            distance_atr = 1.5
 
-        # Calculate raw ATR (not SL-adjusted) for trailing stop computation
-        raw_atr = self._get_raw_atr(symbol)
-        if raw_atr <= 0:
-            return
+            new_sl = float(p.sl) if p.sl else None
+            new_tp = float(p.tp) if p.tp else None
 
-        trigger_distance = raw_atr * trigger_atr
-        trail_distance = raw_atr * distance_atr
+            # Add TP if missing
+            if new_tp is None:
+                tp_dist = dyn_tp * point
+                new_tp = (
+                    p.price_open + tp_dist
+                    if p.type == mt5.ORDER_TYPE_BUY
+                    else p.price_open - tp_dist
+                )
 
-        if is_long:
-            # Check if price has moved enough to trigger trailing
-            profit_distance = current_price - open_price
-            if profit_distance < trigger_distance:
-                return
+            # Break-even promotion
+            if profit_points >= breakeven_trigger:
+                be_buffer = 5 * point
+                be_sl = (
+                    p.price_open + be_buffer
+                    if p.type == mt5.ORDER_TYPE_BUY
+                    else p.price_open - be_buffer
+                )
+                if (p.type == mt5.ORDER_TYPE_BUY and (new_sl is None or be_sl > new_sl)) or (
+                    p.type == mt5.ORDER_TYPE_SELL and (new_sl is None or be_sl < new_sl)
+                ):
+                    new_sl = be_sl
 
-            # New SL = current_price - trail_distance
-            new_sl = round(current_price - trail_distance, 5)
+            # Trailing after trigger
+            if profit_points >= trailing_trigger:
+                trail_dist = trailing_step * point
+                trail_sl = (
+                    current_price - trail_dist
+                    if p.type == mt5.ORDER_TYPE_BUY
+                    else current_price + trail_dist
+                )
+                if (p.type == mt5.ORDER_TYPE_BUY and (new_sl is None or trail_sl > new_sl)) or (
+                    p.type == mt5.ORDER_TYPE_SELL and (new_sl is None or trail_sl < new_sl)
+                ):
+                    new_sl = trail_sl
 
-            # Only move SL up, never down
-            if new_sl <= current_sl and current_sl > 0:
-                return
+            new_sl, new_tp = self._sanitize_sl_tp(symbol, p.type, new_sl, new_tp, tick)
 
-            # Don't move SL below entry
-            if new_sl <= open_price:
-                return
+            if new_sl is not None:
+                new_sl = round(new_sl, digits)
+            if new_tp is not None:
+                new_tp = round(new_tp, digits)
 
-            # Modify the position SL/TP using TRADE_ACTION_SLTP
-            request = {
-                "action": _mt5.TRADE_ACTION_SLTP,
+            sl_changed = (new_sl is not None) and (p.sl is None or abs(float(new_sl) - float(p.sl)) > (0.5 * point))
+            tp_changed = (new_tp is not None) and (p.tp is None or abs(float(new_tp) - float(p.tp)) > (0.5 * point))
+
+            if not sl_changed and not tp_changed:
+                continue
+
+            req = {
+                "action": mt5.TRADE_ACTION_SLTP,
                 "symbol": symbol,
-                "position": position.ticket,
-                "sl": new_sl,
-                "tp": current_tp,
+                "position": p.ticket,
             }
-            result = _mt5.order_send(request)
-            if result.retcode == _mt5.TRADE_RETCODE_DONE:
-                logger.info(f"TRAILING STOP {symbol} long #{position.ticket}: SL moved {current_sl} -> {new_sl} (locked in {new_sl - open_price:.5f} profit)")
-            else:
-                logger.warning(f"Trailing stop modify failed for {symbol} long #{position.ticket}: retcode={result.retcode} comment={getattr(result, 'comment', '')}")
+            if new_sl is not None:
+                req["sl"] = new_sl
+            if new_tp is not None:
+                req["tp"] = new_tp
+            req["magic"] = self._magic_for_order(symbol, None, request_kind="manage")
+            req["comment"] = self._order_comment(symbol, None, request_kind="manage")
 
-        else:  # Short position
-            profit_distance = open_price - current_price
-            if profit_distance < trigger_distance:
-                return
+            result = mt5.order_send(req)
+            self._log_order_send(symbol, "manage", req, result, {"symbol": symbol})
+            if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+                self.risk.record_error()
 
-            new_sl = round(current_price + trail_distance, 5)
-
-            if new_sl >= current_sl and current_sl > 0:
-                return
-
-            if new_sl >= open_price:
-                return
-
-            request = {
-                "action": _mt5.TRADE_ACTION_SLTP,
-                "symbol": symbol,
-                "position": position.ticket,
-                "sl": new_sl,
-                "tp": current_tp,
-            }
-            result = _mt5.order_send(request)
-            if result.retcode == _mt5.TRADE_RETCODE_DONE:
-                logger.info(f"TRAILING STOP {symbol} short #{position.ticket}: SL moved {current_sl} -> {new_sl} (locked in {open_price - new_sl:.5f} profit)")
-            else:
-                logger.warning(f"Trailing stop modify failed for {symbol} short #{position.ticket}: retcode={result.retcode} comment={getattr(result, 'comment', '')}")

@@ -35,7 +35,7 @@ class RiskSupervisor:
         self.max_total_exposure = float(supervisor_cfg.get("max_total_exposure", risk_cfg.get("max_total_exposure", 1.2)))
         self.max_open_positions = int(supervisor_cfg.get("max_open_positions", risk_cfg.get("max_open_positions", 6)))
         self.max_positions_per_symbol = int(
-            supervisor_cfg.get("max_positions_per_symbol", risk_cfg.get("max_positions_per_symbol", 5))
+            supervisor_cfg.get("max_positions_per_symbol", risk_cfg.get("max_positions_per_symbol", 3))
         )
         self.min_trade_interval_sec = int(supervisor_cfg.get("min_trade_interval_sec", 45))
         self.max_spread_bps = float(supervisor_cfg.get("max_spread_bps", trading_cfg.get("max_spread_bps", 25.0)))
@@ -87,18 +87,6 @@ class RiskSupervisor:
     def _now(self) -> dt.datetime:
         return dt.datetime.now(dt.timezone.utc)
 
-    def can_trade(self, symbol: str) -> RiskDecision:
-        """Convenience check: returns (allowed, reason) for basic pre-trade gating."""
-        now = self._now()
-        if self.halt_until and now < self.halt_until:
-            return RiskDecision(False, f"halt_until {self.halt_until.isoformat()}")
-        last = self.last_trade_at_by_symbol.get(str(symbol))
-        if last is not None:
-            elapsed = (now - last).total_seconds()
-            if elapsed < self.min_trade_interval_sec:
-                return RiskDecision(False, f"cooldown {elapsed:.0f}s < {self.min_trade_interval_sec}s")
-        return RiskDecision(True, "ok")
-
     def mark_trade(self, symbol: str):
         self.last_trade_at_by_symbol[str(symbol)] = self._now()
         self._save_state()
@@ -107,12 +95,6 @@ class RiskSupervisor:
         self.halt_until = self._now() + dt.timedelta(minutes=max(1, int(minutes)))
         self._save_state()
         return RiskDecision(False, reason)
-
-    def clear_halt(self):
-        """Administratively clear a halt. Used when the halt was triggered
-        by a canary rollback but the champion model is still profitable."""
-        self.halt_until = None
-        self._save_state()
 
     def allow_trade(
         self,
@@ -146,10 +128,10 @@ class RiskSupervisor:
 
         pnl_today = float(snapshot.get("pnl_today", 0.0) or 0.0)
         if pnl_today <= -abs(self.max_daily_loss):
-            return self.enforce_halt(120, f"daily_loss {pnl_today:.2f} <= -{abs(self.max_daily_loss):.2f}")
+            return self.enforce_halt(24 * 60, f"daily_loss {pnl_today:.2f} <= -{abs(self.max_daily_loss):.2f}")
 
         if drawdown_pct >= self.max_drawdown_pct:
-            return self.enforce_halt(60, f"drawdown_pct {drawdown_pct:.2f} >= {self.max_drawdown_pct:.2f}")
+            return self.enforce_halt(24 * 60, f"drawdown_pct {drawdown_pct:.2f} >= {self.max_drawdown_pct:.2f}")
 
         if total_positions >= self.max_open_positions and abs(target_exposure) > 0.0:
             return RiskDecision(False, f"max_open_positions {total_positions} >= {self.max_open_positions}")

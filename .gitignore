@@ -1,13 +1,4 @@
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-dist/
-build/
-
-# Virtual environments
-.venv/
-.venv312/
+﻿__pycache__/
 venv/
 
 # Models & training artifacts
@@ -23,36 +14,11 @@ logs/
 
 # Environment / secrets
 .env
-.env.*
+*.pt
+config.yaml
 
-# Node
-node_modules/
-package-lock.json
-
-# Runtime state
-live_state.json
-live_incidents.json
-
-# OS
-.DS_Store
-Thumbs.db
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# Claude Code
-.claude/
-
-# Temp
+.venv312/
 .tmp/
-
-# Tensorboard
-runs/
-/tmp/logs/
-
-# Data cache
-*.parquet
-*.feather
+!logs/
+logs/*
+!logs/server.log

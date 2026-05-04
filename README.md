@@ -1,167 +1,164 @@
-# cautious-giggle — Autonomous AGI Trading Hedge Fund (2026)
+# Cautious Giggle
 
-**Full autonomous Observe → Learn → Validate → Deploy → Trade loop**
+MT5-first autonomous trading stack with symbol-scoped LSTM context models, PPO policies, optional Dreamer overlays, a champion/canary registry, and a live operator console.
 
-## 🤖 The Self-Evolving Loop
-This system is designed for total autonomy on a Windows VPS + MetaTrader 5, with full **macOS development support** via Yahoo Finance:
-1. **Observe**: Fetches high-fidelity OHLCV data via MT5 (Windows) or Yahoo Finance with FX volume proxy (macOS/Linux).
-2. **Learn**: Nightly training cycles refine **joint LSTM-PPO** models on combined multi-asset datasets.
-3. **Validate**: The `AutonomyLoop` backtests candidates via walk-forward simulation. Winners are staged as **Canary**.
-4. **Deploy**: The `HybridBrain` hot-swaps active models from the `ModelRegistry` in real-time.
-5. **Trade**: Market execution via MT5 with spread-aware deadzones, volatility gating, and Canary risk scaling.
-6. **Monitor**: Real-time PnL polling rolls back canaries if they misbehave.
-7. **Self-Improve**: Optional `GrokTradingAgent` reads gradient flow and walk-forward reports to suggest hyperparameter tweaks via the xAI API.
+## What is in the repo
 
-## Architecture
+- `Python/Server_AGI.py` runs the live trading loop, risk supervision, MT5 execution, audit logging, and Telegram notifications.
+- `training/train_lstm.py` trains per-symbol LSTM context models.
+- `training/train_drl.py` trains PPO candidates against `drl/trading_env.py`.
+- `training/train_dreamer.py` trains per-symbol Dreamer policies for optional live blending.
+- `tools/champion_cycle.py` runs the full retrain/evaluate/stage flow across the configured symbol set.
+- `tools/project_status_ui.py` serves the dashboard and control API on `127.0.0.1:8088`.
+- `Python/model_registry.py` tracks champion/canary state, history, integrity metadata, and promotion policy.
 
-```
-┌──────────────┐    every 5 min    ┌──────────────┐
-│     n8n      │ ───────────────►  │  agi_n8n     │
-│  Orchestrator│                   │  _bridge.py  │
-│  (5678)      │ ◄──── JSON ─────  │              │
-└──────────────┘                   └──────┬───────┘
-                                          │ socket :9090
-                                   ┌──────▼───────┐
-                                   │  Server_AGI  │ ◄───┐
-                                   │   .py        │     │ Monitoring
-                                   └──┬───┬───┬───┘     │
-                                      │   │   │         │
-                          ┌───────────┘   │   └───── AutonomyLoop
-                          ▼               ▼               │
-                   ┌────────────┐  ┌────────────┐  ┌──────▼─────┐
-                   │HybridBrain │  │ risk_engine│  │ModelRegistry│
-                   │ (PPO+LSTM) │  │(KillSwitch)│  │ (Promotion) │
-                   └──────┬─────┘  └────────────┘  └────────────┘
-                          │
-                   ┌──────▼─────┐
-                   │  data_feed │
-                   │ (MT5 / YF) │
-                   └────────────┘
-```
+## Current architecture
 
-## Key Components
+1. MT5 candles are loaded through `Python/data_feed.py`.
+2. Feature generation is centralized in `Python/feature_pipeline.py`.
+3. LSTM training writes symbol-scoped model bundles into `models/per_symbol/`.
+4. PPO training stages candidates into `models/registry/candidates/`.
+5. Optional Dreamer artifacts are written into `models/dreamer/`.
+6. `Python/autonomy_loop.py` and `tools/champion_cycle.py` evaluate and stage canaries.
+7. `Python/Server_AGI.py` blends SmartAGI, PPO, and optional Dreamer outputs under the risk engine and supervisor.
+8. The dashboard and Telegram read the same runtime/log/registry state.
 
-| File | Purpose |
-|------|---------|
-| `Python/Server_AGI.py` | Main Engine — Concurrent Autonomy, Risk Polling, and Socket Server |
-| `Python/hybrid_brain.py` | RL Executor — PPO-first policy with LSTM volatility gating, deadzones, and Canary risk scaling |
-| `Python/autonomy_loop.py` | Orchestrator — Manages the Train → Evaluate → Canary → Promote/Rollback lifecycle |
-| `Python/model_registry.py` | Ledger — Champion/Canary versioning with `save_candidate()` and `evaluate_and_stage_canary()` |
-| `Python/data_feed.py` | High-fidelity data handler with FX volume proxies, Yahoo Finance fallback, and MT5 integration |
-| `Python/agi_brain.py` | LSTM SmartAGI — 3-layer LSTM for volatility regime classification (LOW/MED/HIGH) |
-| `Python/risk_engine.py` | Risk guardrails — Daily loss limits, trade caps, drawdown kill switch |
-| `Python/mt5_executor.py` | Trade execution — Live MT5 on Windows, automatic dry-run logging on macOS |
-| `Python/backtester.py` | Uses TradingEnv to replay PPO on historical data for promotion gating |
-| `training/train_drl.py` | Joint PPO+LSTM training with curriculum learning and gradient diagnostics |
-| `training/train_lstm.py` | Standalone LSTM volatility classifier training |
-| `drl/trading_env.py` | Gymnasium env — Continuous position management with commission + spread modeling |
-| `drl/lstm_feature_extractor.py` | SB3 custom feature extractor for joint LSTM-PPO gradient flow |
-| `drl/ppo_agent.py` | Standalone PPO inference helper |
-| `evaluation/walk_forward_test.py` | Out-of-sample walk-forward evaluation |
-| `analysis/gradient_flow_analyzer.py` | Real-time LSTM gradient diagnostics via TensorBoard |
-| `agents/grok_trading_agent.py` | Grok self-improver — reads telemetry and suggests hyperparameter patches via xAI API |
+## Feature and model defaults
 
-## Quick Start
+- New LSTM and PPO training defaults use `ultimate_150`.
+- Legacy promoted champions keep their recorded feature metadata until replaced.
+- Dreamer can be enabled per symbol through `drl.dreamer`.
+- Registry canary policy supports global defaults and per-symbol overrides.
+- Live exposure is synthesized in `Python/hybrid_brain.py` from SmartAGI, registry-loaded PPO, optional PPO history/ensemble voting, and optional Dreamer policies from `models/dreamer/`.
+- The blend is controlled by `drl.ppo_blend`, `drl.dreamer.blend`, and the configured Dreamer symbol set.
 
-### macOS Development (Dry-Run Mode)
+## Repo layout
 
-```bash
-# 1. Create virtual environment
-python3 -m venv .venv && source .venv/bin/activate
+- `Python/` runtime, registry, risk, MT5, and evaluation code
+- `training/` LSTM, PPO, Dreamer, and trade-memory builders
+- `drl/` trading environment and policy feature extractors
+- `tools/` operator tools, cycle orchestration, drift analysis, and release helpers
+- `alerts/` Telegram alert transport
+- `docs/` architecture, sync flow, metrics, and release evidence
+- `tests/` regression coverage for runtime, registry, env, status API, and training helpers
 
-# 2. Install dependencies
+## Prerequisites
+
+- Windows host with MetaTrader 5 access
+- Python 3.12-compatible environment (`.venv312` is the repo convention)
+- Telegram bot token/chat if you want alert delivery
+
+## Install
+
+```powershell
+python -m venv .venv312
+.venv312\Scripts\activate
 pip install -r requirements.txt
-
-# 3. Run smoke test
-python smoke_test.py
-
-# 4. Train LSTM (volatility classifier)
-python -m training.train_lstm --epochs 50
-
-# 5. Train Joint LSTM-PPO
-python -m training.train_drl
-
-# 6. Start server (dry-run, no MT5)
-python -m Python.Server_AGI
 ```
 
-### Windows VPS Deployment (Live Trading)
+## Configure
 
-1. **Setup Env Vars**:
-   ```powershell
-   $env:AGI_TOKEN="your_secure_token"
-   $env:AGI_AUTONOMY_AUTO_CANARY="true"
-   $env:AGI_PNL_POLL="true"
-   $env:TELEGRAM_BOT_TOKEN="your_telegram_token"
-   $env:TELEGRAM_CHAT_ID="your_chat_id"
-   ```
+Copy `config.yaml.example` to `config.yaml` and set:
 
-2. **Boot the Server**:
-   ```powershell
-   python -m Python.Server_AGI --live
-   ```
+- `mt5.login`, `mt5.password`, `mt5.server`
+- `telegram.token`, `telegram.chat_id`
+- `trading.symbols`
+- `risk.*` and `risk.supervisor.*`
+- `training.feature_version`
+- `drl.feature_version`
+- `drl.dreamer.*`
+- `registry.canary_policy.*`
 
-3. **Start the n8n Orchestrator** (separate terminal):
-   ```powershell
-   npm install -g n8n
-   $env:NODES_EXCLUDE="[]"
-   n8n start
-   ```
+`config.yaml` is gitignored and is expected to be machine-local.
 
-4. **Monitor Autonomy**:
-   Check `logs/ppo_training.log` or the Console for Model Promotion signals.
+Key runtime safety knobs live under `risk`:
 
-### Docker
+- daily loss cap
+- max open positions
+- max total and per-symbol exposure
+- spread/slippage tolerances
+- symbol-specific execution profiles
 
-```bash
-docker build -t cautious-giggle .
-docker run -p 9090:9090 \
-  -e AGI_TOKEN=your_token \
-  -e TELEGRAM_BOT_TOKEN=your_token \
-  -e TELEGRAM_CHAT_ID=your_id \
-  cautious-giggle
+`risk.supervisor` adds the hard pre-trade gate used by the live server:
+
+- cooldown enforcement
+- max drawdown halt
+- spread cap
+- position count cap
+- exposure cap
+- risk-reduction allowed even while halted
+
+## Run
+
+Live server:
+
+```powershell
+python -m Python.Server_AGI --live
 ```
 
-## Model Lifecycle
+Dashboard:
 
-```
-train_drl.py / train_lstm.py
-        │
-        ▼
-   Candidate (models/registry/candidates/<timestamp>/)
-        │
-        ▼ evaluate_and_stage_canary() or AutonomyLoop
-   Canary (25% lot size via CANARY_LOT_MULT)
-        │
-        ▼ ≥10 trades + PnL ≥ 0 → promote | loss/DD exceeded → rollback
-   Champion (full position sizing)
+```powershell
+python tools/project_status_ui.py
 ```
 
-## Risk Management
+Full training cycle:
 
-- **Canary Mode**: New models trade with 25% risk (configurable via `CANARY_LOT_MULT`).
-- **Kill Switch**: Realized PnL polling from MT5 triggers instant halts if daily loss limits are hit.
-- **Max Drawdown**: Configurable per-model and global limits.
-- **Trade Cap**: Hard daily trade limit (default: 20).
-- **Error Halt**: 3 consecutive execution errors trigger automatic trading halt.
+```powershell
+python tools/champion_cycle.py
+```
 
-## Environment Variables
+Individual training:
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `AGI_HOST` | `127.0.0.1` | Socket server bind address |
-| `AGI_PORT` | `9090` | Socket server port |
-| `AGI_TOKEN` | _(empty)_ | Auth token for socket commands |
-| `AGI_AUTONOMY_INTERVAL_SEC` | `3600` | Autonomy loop check interval |
-| `AGI_AUTONOMY_TRAIN` | `false` | Enable nightly retraining |
-| `AGI_AUTONOMY_AUTO_CANARY` | `true` | Auto-stage winning candidates |
-| `CANARY_MIN_TRADES` | `10` | Min trades before canary promotion |
-| `CANARY_MAX_LOSS` | `75` | Max canary loss before rollback ($) |
-| `CANARY_MAX_DD` | `0.12` | Max canary drawdown before rollback |
-| `CANARY_LOT_MULT` | `0.25` | Canary position size multiplier |
-| `TELEGRAM_BOT_TOKEN` | — | Telegram bot token |
-| `TELEGRAM_CHAT_ID` | — | Telegram chat ID |
-| `XAI_API_KEY` | — | xAI API key for Grok agent |
+```powershell
+python training/train_lstm.py
+python training/train_drl.py
+python training/train_dreamer.py
+```
 
----
-**Risk warning:** For simulation/education only. Trade at your own risk.
+## Operator surface
+
+- UI: `http://127.0.0.1:8088`
+- Status API: `http://127.0.0.1:8088/api/status`
+- WebSocket: `ws://127.0.0.1:8088/ws`
+
+The dashboard exposes runtime health, registry state, incident feed, Telegram parity, training status, logs, and operator controls.
+
+The runtime also maintains:
+
+- `logs/event_intel_state.json` for news/calendar regime context
+- `logs/audit_events.jsonl` for runtime/trade/risk audit events
+- `logs/trade_events.jsonl` for trade history
+- `logs/learning/trade_learning_latest.json` for rolling trade-memory metrics
+- Telegram daily profitability summaries sourced from the trade-learning pass
+
+## Validation
+
+Run the full regression suite with the repo venv:
+
+```powershell
+.venv312\Scripts\python.exe -m pytest
+```
+
+Useful spot checks:
+
+```powershell
+.venv312\Scripts\python.exe -m compileall Python training tools drl
+python tools/backtest_vs_live_drift.py
+python tools/release_summary.py
+```
+
+## Evidence and reporting
+
+- `tools/release_summary.py` writes `docs/results/release_summary.md`
+- `tools/build_evidence_pack.py` rebuilds the public evidence bundle in `docs/results/`
+- `tools/profit_sweep.py` records profitability sweep output in `logs/`
+- `python tools/create_migration_backup.py` writes a GitHub-safe VPS migration snapshot into `backups/`
+- `docs/metrics.md` documents the current trading/profitability story
+
+## Notes
+
+- The runtime is designed for one active owner per role; Windows venv redirector child processes are expected.
+- Raw runtime logs and model artifacts are normally not tracked; use `tools/create_migration_backup.py` when you need a point-in-time backup committed for VPS migration.
+- Machine-local secrets from `config.yaml` should stay out of git; the migration backup writes a redacted reference copy instead.
+- The promoted model set, not the code alone, determines whether the live bot actually trades.

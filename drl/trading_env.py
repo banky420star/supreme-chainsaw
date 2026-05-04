@@ -1,4 +1,4 @@
-import datetime
+﻿import datetime
 import json
 import os
 
@@ -7,7 +7,7 @@ import numpy as np
 import polars as pl
 import pandas as pd
 from gymnasium import spaces
-from Python.feature_pipeline import ENGINEERED_V2, ENGINEERED_V3, build_env_feature_matrix, feature_count_for_version
+from Python.feature_pipeline import ENGINEERED_V2, build_env_feature_matrix, feature_count_for_version
 
 ENGINEERED_FEATURE_COUNT = 21
 DEFAULT_PORTFOLIO_FEATURE_COUNT = 3
@@ -22,7 +22,7 @@ class TradingEnv(gym.Env):
         df=None,
         initial_balance: float = 10000.0,
         commission_rate: float = 0.0002,
-        spread_bps: float = 10.0,
+        spread_bps: float = 2.0,
         max_drawdown: float = 0.15,
         window_size: int = 100,
         max_leverage: float = 1.0,
@@ -30,8 +30,8 @@ class TradingEnv(gym.Env):
         trade_memory: dict | None = None,
         portfolio_feature_count: int | None = None,
         feature_version: str = ENGINEERED_V2,
-        sentiment_engine=None,
-        symbol: str = "",
+        action_config: dict | None = None,
+        symbol: str | None = None,
     ):
         super().__init__()
         self.initial_balance = float(initial_balance)
@@ -41,21 +41,31 @@ class TradingEnv(gym.Env):
         self.window_size = int(window_size)
         self.max_leverage = float(max_leverage)
         self.feature_version = str(feature_version or ENGINEERED_V2)
-        self.action_version = "direction_only_v2"
-        self.sentiment_engine = sentiment_engine
-        self.symbol = symbol
+        self.symbol = str(symbol or "")
+        self.action_version = "multi_trade_v1"
         self.trade_memory = trade_memory or {}
 
         w = reward_weights or {}
         self.reward_weights = {
-            "growth": float(w.get("growth", 5.0)),
+            "growth": float(w.get("growth", 8.0)),
             "payoff": float(w.get("payoff", 2.0)),
-            "sharpe_bonus": float(w.get("sharpe_bonus", 1.5)),
-            "drawdown_penalty": float(w.get("drawdown_penalty", 2.0)),
-            "cost_penalty": float(w.get("cost_penalty", 1.0)),
-            "churn_penalty": float(w.get("churn_penalty", 0.3)),
+            "sharpe_bonus": float(w.get("sharpe_bonus", 1.0)),
+            "drawdown_penalty": float(w.get("drawdown_penalty", 3.0)),
+            "cost_penalty": float(w.get("cost_penalty", 5.0)),
+            "churn_penalty": float(w.get("churn_penalty", 0.5)),
             "memory_expectancy_bonus": float(w.get("memory_expectancy_bonus", 0.5)),
-            "loss_streak_penalty": float(w.get("loss_streak_penalty", 0.2)),
+            "loss_streak_penalty": float(w.get("loss_streak_penalty", 0.4)),
+            "directional_followthrough": float(w.get("directional_followthrough", 0.0)),
+            "actionable_target_bonus": float(w.get("actionable_target_bonus", 0.0)),
+            "neutral_collapse_penalty": float(w.get("neutral_collapse_penalty", 0.0)),
+        }
+        ac = action_config or {}
+        self.action_config = {
+            "min_direction_abs": float(ac.get("min_direction_abs", 0.03)),
+            "min_size_abs": float(ac.get("min_size_abs", 0.03)),
+            "min_target_abs": float(ac.get("min_target_abs", 0.03)),
+            "neutral_target_epsilon": float(ac.get("neutral_target_epsilon", ac.get("min_target_abs", 0.03))),
+            "neutral_return_floor": float(ac.get("neutral_return_floor", 0.0006)),
         }
 
         os.makedirs(os.path.join(os.getcwd(), "logs"), exist_ok=True)
@@ -73,10 +83,9 @@ class TradingEnv(gym.Env):
         else:
             self.portfolio_feature_count = self._default_portfolio_feature_count()
 
-        self.n_features = feature_count_for_version(self.feature_version)
+        self.n_features = 0
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32)
-        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
-        self._update_observation_space()
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(6,), dtype=np.float32)
 
         if df is not None:
             self._set_data(df)
@@ -146,10 +155,18 @@ class TradingEnv(gym.Env):
         return default
 
     @staticmethod
-    def decode_action(action, max_leverage: float = 1.0) -> dict:
+    def decode_action(
+        action,
+        max_leverage: float = 1.0,
+        min_direction_abs: float = 0.03,
+        min_size_abs: float = 0.03,
+        min_target_abs: float = 0.03,
+    ) -> dict:
         raw = np.asarray(action, dtype=np.float32).reshape(-1)
         if raw.size <= 1:
             target = float(np.clip(raw[0] if raw.size else 0.0, -1.0, 1.0)) * float(max_leverage)
+            if abs(target) < float(min_target_abs):
+                target = 0.0
             return {
                 "direction": float(np.clip(target / max(float(max_leverage), 1e-12), -1.0, 1.0)),
                 "size": float(min(1.0, abs(target) / max(float(max_leverage), 1e-12))),
@@ -168,7 +185,7 @@ class TradingEnv(gym.Env):
             target = float(np.clip(direction_raw * size, -1.0, 1.0) * float(max_leverage))
             tp_sl_offset_pct = float(0.005 + risk * 0.015)
 
-            if abs(direction_raw) < 0.03 or size < 0.03:
+            if abs(direction_raw) < float(min_direction_abs) or size < float(min_size_abs) or abs(target) < float(min_target_abs):
                 target = 0.0
 
             return {
@@ -197,7 +214,7 @@ class TradingEnv(gym.Env):
         tp_offset_pct = float(0.005 + max(0.0, tp_raw) * 0.015)
         sl_offset_pct = float(0.005 + max(0.0, -sl_raw) * 0.015)
 
-        if abs(direction_raw) < 0.03 or size < 0.03:
+        if abs(direction_raw) < float(min_direction_abs) or size < float(min_size_abs) or abs(target) < float(min_target_abs):
             target = 0.0
 
         return {
@@ -350,9 +367,7 @@ class TradingEnv(gym.Env):
                 "volume": v,
             }
         )
-        self.feature_data = build_env_feature_matrix(base, feature_version=self.feature_version,
-                                                        sentiment_engine=self.sentiment_engine,
-                                                        symbol=self.symbol)
+        self.feature_data = build_env_feature_matrix(base, feature_version=self.feature_version)
         self.n_features = int(self.feature_data.shape[1])
 
         self._update_observation_space()
@@ -378,9 +393,7 @@ class TradingEnv(gym.Env):
                 "volume": v,
             }
         )
-        self.feature_data = build_env_feature_matrix(base, feature_version=self.feature_version,
-                                                        sentiment_engine=self.sentiment_engine,
-                                                        symbol=self.symbol)
+        self.feature_data = build_env_feature_matrix(base, feature_version=self.feature_version)
         self.n_features = int(self.feature_data.shape[1])
         self._update_observation_space()
         self.reset()
@@ -398,7 +411,13 @@ class TradingEnv(gym.Env):
         return self._get_obs(), {}
 
     def step(self, action: np.ndarray):
-        action_meta = self.decode_action(action, max_leverage=self.max_leverage)
+        action_meta = self.decode_action(
+            action,
+            max_leverage=self.max_leverage,
+            min_direction_abs=float(self.action_config.get("min_direction_abs", 0.03)),
+            min_size_abs=float(self.action_config.get("min_size_abs", 0.03)),
+            min_target_abs=float(self.action_config.get("min_target_abs", 0.03)),
+        )
         prev_equity = self.equity
         prev_position = float(self.position)
 
@@ -432,11 +451,20 @@ class TradingEnv(gym.Env):
         vol = float(np.std(self.recent_returns) + 1e-8)
         sharpe = float(np.mean(self.recent_returns) / (vol + 1e-12))
 
-        payoff = step_ret  # Symmetric: reward gains and penalize losses equally
-        dd_penalty = max(0.0, drawdown - 0.04)  # Lower threshold: penalize DD sooner
+        payoff = max(step_ret, 0.0) - 0.5 * abs(min(step_ret, 0.0))
+        dd_penalty = max(0.0, drawdown - 0.06)
         cost_penalty = total_cost / (prev_equity + 1e-12)
         churn_penalty = abs(delta)
         sharpe_bonus = max(0.0, sharpe)
+        target_val = float(action_meta.get("target", 0.0) or 0.0)
+        target_mag = abs(target_val)
+        directional_followthrough = target_val * float(price_ret)
+        neutral_epsilon = float(self.action_config.get("neutral_target_epsilon", self.action_config.get("min_target_abs", 0.03)))
+        neutral_return_floor = float(self.action_config.get("neutral_return_floor", 0.0006))
+        actionable_target_bonus = target_mag if directional_followthrough > 0.0 and target_mag >= neutral_epsilon else 0.0
+        neutral_collapse_penalty = 0.0
+        if target_mag < neutral_epsilon and abs(float(price_ret)) >= neutral_return_floor:
+            neutral_collapse_penalty = float(min(1.0, abs(float(price_ret)) / max(neutral_return_floor, 1e-12)))
         rw = self.reward_weights
         mem_expectancy = float(self.memory_features.get("expectancy_norm", 0.0))
         mem_loss_streak = float(self.memory_features.get("loss_streak_norm", 0.0))
@@ -444,44 +472,17 @@ class TradingEnv(gym.Env):
         growth_term = memory_growth_scale * step_ret
         loss_streak_penalty = rw["loss_streak_penalty"] * mem_loss_streak * churn_penalty
 
-        # Reward for being flat when market is unfavorable (drawdown > 3%)
-        flat_preservation = 0.01 if abs(self.position) < 0.01 and drawdown > 0.03 else 0.0
-
-        # --- Direction-correctness reward: reward taking a position in the right direction ---
-        # If the model has a position and the market moved favorably, give a clear signal
-        direction_correct = 0.0
-        if abs(self.position) > 0.01 and abs(price_ret) > 1e-8:
-            position_sign = np.sign(self.position)
-            market_sign = np.sign(price_ret)
-            direction_correct = 0.5 * position_sign * market_sign  # +0.5 if aligned, -0.5 if opposed
-
-        # --- Trade close bonus: reward winning trades at close time ---
-        trade_close_bonus = 0.0
-        if self._trade_metrics and self._trade_metrics.get("exit_type"):
-            trade_profit = float(self._trade_metrics.get("profit", 0.0))
-            if trade_profit > 0:
-                trade_close_bonus = 2.0  # Strong reward for closing in profit
-            elif trade_profit < 0:
-                trade_close_bonus = -1.5  # Strong penalty for closing in loss
-            # TP exit gets extra reward
-            if self._trade_metrics.get("exit_type") == "tp":
-                trade_close_bonus += 1.0
-
-        # --- Conviction scaling: ensure reward for correct direction > cost of trading ---
-        # Scale payoff by position magnitude so it's not dwarfed by churn penalty
-        conviction_scale = 1.0 + 10.0 * abs(self.position)  # More position → more payoff leverage
-
         reward = (
             rw["growth"] * growth_term
-            + rw["payoff"] * payoff * conviction_scale
+            + rw["payoff"] * payoff
             + rw["sharpe_bonus"] * sharpe_bonus
-            + direction_correct
-            + trade_close_bonus
-            + flat_preservation
+            + rw["directional_followthrough"] * directional_followthrough
+            + rw["actionable_target_bonus"] * actionable_target_bonus
             - rw["drawdown_penalty"] * dd_penalty
             - rw["cost_penalty"] * cost_penalty
-            - rw["churn_penalty"] * churn_penalty * 0.3  # Reduce churn penalty so position changes are viable
+            - rw["churn_penalty"] * churn_penalty
             - loss_streak_penalty
+            - rw["neutral_collapse_penalty"] * neutral_collapse_penalty
         )
         reward = float(np.clip(reward, -5.0, 5.0))
         self._trade_metrics = {}  # Clear after consuming close bonus
@@ -510,17 +511,16 @@ class TradingEnv(gym.Env):
             },
             "reward_components": {
                 "growth": float(growth_term),
-                "payoff": float(payoff * conviction_scale),
+                "payoff": float(payoff),
                 "sharpe_bonus": float(sharpe_bonus),
-                "direction_correct": float(direction_correct),
-                "trade_close_bonus": float(trade_close_bonus),
-                "flat_preservation": float(flat_preservation),
+                "directional_followthrough": float(directional_followthrough),
+                "actionable_target_bonus": float(actionable_target_bonus),
                 "drawdown_penalty": float(dd_penalty),
                 "cost_penalty": float(cost_penalty),
-                "churn_penalty": float(churn_penalty * 0.3),
+                "churn_penalty": float(churn_penalty),
                 "loss_streak_penalty": float(loss_streak_penalty),
+                "neutral_collapse_penalty": float(neutral_collapse_penalty),
                 "memory_expectancy_norm": float(mem_expectancy),
-                "conviction_scale": float(conviction_scale),
                 "weights": rw,
             },
             "trade_state": self._trade_state_snapshot(current_price),
@@ -584,6 +584,12 @@ class TradingEnv(gym.Env):
             "profitability": info.get("profitability"),
         }
         try:
+            _PROFIT_LOG_MAX = 50 * 1024 * 1024  # 50 MB cap
+            if os.path.exists(self.profit_log_path) and os.path.getsize(self.profit_log_path) >= _PROFIT_LOG_MAX:
+                backup = self.profit_log_path + ".1"
+                if os.path.exists(backup):
+                    os.remove(backup)
+                os.rename(self.profit_log_path, backup)
             with open(self.profit_log_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(payload) + "\n")
         except Exception:
@@ -593,9 +599,7 @@ class TradingEnv(gym.Env):
         if self.open_trade and self.open_trade.get("is_open"):
             return
 
-        direction = float(np.sign(action_meta.get("direction", 0.0)))
-        if direction == 0.0:
-            return  # No signal — stay flat
+        direction = float(np.sign(action_meta.get("direction", 0.0)) or 1.0)
         entry_mode = action_meta.get("entry_mode", "market")
         entry_offset = float(action_meta.get("entry_offset_pct", 0.0))
         if entry_mode == "market":
@@ -667,9 +671,7 @@ class TradingEnv(gym.Env):
         return float(current_price * (1.0 - offset_pct))
 
     def _open_trade(self, action_meta: dict, entry_price: float):
-        direction = float(np.sign(action_meta.get("direction", 0.0)))
-        if direction == 0.0:
-            direction = 0.0  # Stay flat — do not default to long
+        direction = float(np.sign(action_meta.get("direction", 0.0)) or 1.0)
         size = float(action_meta.get("size", 0.0))
         tp_pct = float(action_meta.get("tp_offset_pct", 0.0))
         sl_pct = float(action_meta.get("sl_offset_pct", 0.0))

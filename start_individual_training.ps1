@@ -1,6 +1,6 @@
 param(
   [string[]]$Symbols = @(),
-  [int]$Timesteps = 0
+  [int]$Timesteps = 120000
 )
 
 $ErrorActionPreference = "Stop"
@@ -30,15 +30,14 @@ Write-Host "Starting per-symbol DRL training. symbols=$($Symbols -join ',') time
 
 foreach ($sym in $Symbols) {
   Write-Host "Training symbol: $sym"
-  $args = @("training\train_drl.py", "--symbol", $sym)
-  if ($Timesteps -gt 0) {
-    $env:AGI_DRL_TIMESTEPS = "$Timesteps"
-  }
-  & $python @args
+  $env:AGI_DRL_SYMBOL = $sym
+  $env:AGI_DRL_TIMESTEPS = "$Timesteps"
+  & $python "training\train_drl.py"
   if ($LASTEXITCODE -ne 0) {
     throw "Training failed for symbol $sym"
   }
 }
 
+Remove-Item Env:\AGI_DRL_SYMBOL -ErrorAction SilentlyContinue
 Remove-Item Env:\AGI_DRL_TIMESTEPS -ErrorAction SilentlyContinue
 Write-Host "Per-symbol DRL training completed."

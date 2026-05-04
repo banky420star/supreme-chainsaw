@@ -38,7 +38,7 @@ class _Exec(MT5Executor):
         return {"request_action": "close", "executed": True}
 
     def open_position(self, symbol, order_type, volume, order_meta=None, execution_context=None):
-        self.opened.append((symbol, order_type, volume, order_meta))
+        self.opened.append((symbol, order_type, volume))
         return {"request_action": "open", "executed": True}
 
 
@@ -59,7 +59,7 @@ def test_reconcile_exposure_flips_to_target_not_preclose_delta():
     exec_.reconcile_exposure("EURUSDm", 0.10, 1.0)
 
     assert len(exec_.closed) == 1
-    assert exec_.opened == [("EURUSDm", 0, 0.1, None)]
+    assert exec_.opened == [("EURUSDm", 0, 0.1)]
 
 
 def test_translate_trade_action_skips_zero_exposure():

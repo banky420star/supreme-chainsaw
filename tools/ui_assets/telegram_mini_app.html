@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
-<title>Money Printer</title>
+<title>Cautious Giggle Mini App</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
 :root {
@@ -29,584 +29,480 @@
   --cyan-a08: rgba(90, 215, 255, 0.08);
   --green-ramp: #1fcfb2;
   --amber-ramp: #f0ab35;
-  --radius: 18px;
-  --radius-sm: 12px;
-  --radius-xs: 8px;
+  --focus-outline: 2px solid var(--cyan);
+  --focus-offset: 2px;
 }
-* { box-sizing: border-box; margin: 0; padding: 0; }
+* { box-sizing: border-box; }
 html, body {
+  margin: 0;
   min-height: 100%;
   background:
     radial-gradient(120% 80% at 100% 0%, rgba(90, 215, 255, 0.18), transparent 45%),
     radial-gradient(90% 70% at 0% 0%, rgba(98, 164, 255, 0.16), transparent 44%),
     linear-gradient(180deg, #06101b, var(--bg));
   color: var(--text);
-  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
-  -webkit-font-smoothing: antialiased;
+  font-family: "Segoe UI", Arial, sans-serif;
 }
-body { padding: max(12px, env(safe-area-inset-top)) 10px max(16px, env(safe-area-inset-bottom)); }
-
-.shell { width: 100%; max-width: 720px; margin: 0 auto; display: grid; gap: 10px; }
-
-/* ── Tabs ── */
-.tabs {
-  display: flex; gap: 0; border-radius: var(--radius); overflow: hidden;
-  border: 1px solid var(--line); background: var(--panel);
+body {
+  padding: max(18px, env(safe-area-inset-top)) 14px max(20px, env(safe-area-inset-bottom));
 }
-.tab {
-  flex: 1; padding: 10px 6px; border: none; background: transparent;
-  color: var(--muted); font: inherit; font-size: 12px; font-weight: 600;
-  letter-spacing: 0.04em; cursor: pointer; transition: all 0.2s;
-  text-align: center;
+.shell {
+  width: min(100%, 720px);
+  margin: 0 auto;
+  display: grid;
+  gap: 14px;
 }
-.tab.active { color: var(--cyan); background: var(--cyan-a08); }
-.tab:active { background: var(--white-a04); }
-
-/* ── Cards ── */
-.card, .hero { border: 1px solid var(--line); background: var(--panel); border-radius: var(--radius); }
-.hero { padding: 16px; position: relative; overflow: hidden; }
+.hero, .card, .symbol {
+  border: 1px solid var(--line);
+  background: var(--panel);
+  box-shadow: var(--shadow);
+  border-radius: 24px;
+}
+.hero {
+  padding: 18px;
+  position: relative;
+  overflow: hidden;
+}
 .hero::after {
-  content: ""; position: absolute; inset: auto -15% -45% auto;
-  width: 160px; height: 160px; border-radius: 50%;
+  content: "";
+  position: absolute;
+  inset: auto -15% -45% auto;
+  width: 180px;
+  height: 180px;
+  border-radius: 50%;
   background: radial-gradient(circle, var(--cyan-a28), transparent 70%);
 }
-.card { padding: 14px; }
-
-/* ── Typography ── */
-.eyebrow { font-size: 10px; text-transform: uppercase; letter-spacing: 0.18em; color: var(--cyan); }
-.headline { margin-top: 6px; font-size: 26px; line-height: 1.05; font-weight: 700; letter-spacing: -0.04em; }
-.sub { margin-top: 6px; color: var(--muted); line-height: 1.5; font-size: 13px; }
-
-/* ── Metrics Grid ── */
-.metrics { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
-.metric { padding: 10px 8px; border-radius: 8px; background: var(--white-a03); border: 1px solid var(--line); }
-.metric .k { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
-.metric .v { font-size: 15px; font-weight: 700; letter-spacing: -0.02em; line-height: 1.2; }
-.metric .v.good { color: var(--green); }
-.metric .v.bad { color: var(--red); }
-.metric .v.warn { color: var(--amber); }
-.metric .m { font-size: 10px; color: var(--muted); margin-top: 2px; }
-.metric, .mini { padding: 12px; border-radius: var(--radius-sm); border: 1px solid var(--line); background: var(--panel-2); }
-.metric .k, .mini .k { font-size: 9px; text-transform: uppercase; letter-spacing: 0.16em; color: var(--muted); }
-.metric .v { margin-top: 6px; font-size: 20px; font-weight: 700; }
-.mini .v { margin-top: 4px; font-size: 15px; font-weight: 700; }
-.metric .m, .mini .m { margin-top: 4px; color: var(--muted); font-size: 11px; }
-.v.good { color: var(--green); }
-.v.warn { color: var(--amber); }
-.v.bad { color: var(--red); }
-
-/* ── Positions ── */
-.pos-card {
-  padding: 10px; border-radius: var(--radius-sm); border: 1px solid var(--line);
-  background: var(--panel-2); margin-bottom: 6px;
+.eyebrow {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--cyan);
 }
-.pos-header { display: flex; justify-content: space-between; align-items: center; }
-.pos-sym { font-weight: 700; font-size: 15px; }
-.pos-side { font-size: 10px; padding: 3px 8px; border-radius: 99px; font-weight: 700; letter-spacing: 0.06em; }
-.pos-side.buy { background: rgba(57,217,138,0.15); color: var(--green); }
-.pos-side.sell { background: rgba(255,123,143,0.15); color: var(--red); }
-.pos-pnl { font-weight: 700; font-size: 16px; text-align: right; }
-.pos-pnl.pos { color: var(--green); }
-.pos-pnl.neg { color: var(--red); }
-.pos-detail { display: flex; gap: 12px; margin-top: 4px; font-size: 11px; color: var(--muted); font-family: "Consolas", monospace; }
-.pos-protect { display: flex; gap: 10px; margin-top: 4px; font-size: 10px; color: var(--muted); }
-
-/* ── Lanes ── */
-.lane { padding: 10px; border-radius: var(--radius-sm); border: 1px solid var(--line); background: var(--panel-2); margin-bottom: 6px; }
-.lane-top { display: flex; justify-content: space-between; align-items: center; }
-.lane-sym { font-weight: 700; font-size: 15px; }
-.lane-status { font-size: 11px; font-weight: 700; }
-.lane-meta { margin-top: 4px; font-size: 11px; color: var(--muted); }
-
-/* ── Trade History ── */
-.trade-row {
-  display: flex; justify-content: space-between; align-items: center;
-  padding: 8px 10px; border-radius: var(--radius-xs); border: 1px solid var(--line);
-  background: var(--panel-2); margin-bottom: 4px; font-size: 12px;
+.headline {
+  margin-top: 10px;
+  font-size: 28px;
+  line-height: 1.02;
+  font-weight: 700;
+  letter-spacing: -0.04em;
 }
-.trade-sym { font-weight: 700; }
-.trade-pnl { font-weight: 700; }
-.trade-detail { color: var(--muted); font-size: 10px; margin-top: 2px; }
-
-/* ── Sparkline ── */
-.spark-wrap { height: 60px; position: relative; border-radius: var(--radius-xs); overflow: hidden; background: var(--white-a02); }
-.spark-wrap canvas { width: 100%; height: 100%; }
-
-/* ── Progress bar ── */
-.bar { height: 6px; border-radius: 99px; background: var(--white-a07); overflow: hidden; margin-top: 6px; }
-.fill { height: 100%; border-radius: 99px; background: linear-gradient(90deg, var(--cyan), var(--blue)); transition: width 0.5s; }
-.fill.good { background: linear-gradient(90deg, var(--green-ramp), var(--green)); }
-.fill.warn { background: linear-gradient(90deg, var(--amber-ramp), var(--amber)); }
-.fill.bad { background: linear-gradient(90deg, var(--red), var(--red)); }
-
-/* ── Section ── */
-.section-title { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
-.section-title h2 { font-size: 14px; letter-spacing: -0.02em; }
-.tag { padding: 4px 8px; border-radius: 99px; border: 1px solid var(--line); font-size: 10px; color: var(--muted); background: var(--white-a03); }
-
-/* ── Empty ── */
-.empty { color: var(--muted); font-size: 12px; padding: 8px; text-align: center; }
-
-/* ── Footer ── */
-.footer { text-align: center; color: var(--muted); font-size: 11px; padding: 6px; }
-
-/* ── Training ── */
-.train-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--white-a05); }
-.train-row:last-child { border-bottom: none; }
-.train-label { font-size: 12px; font-weight: 600; }
-.train-state { font-size: 10px; padding: 3px 8px; border-radius: 99px; font-weight: 600; }
-.train-state.idle { color: var(--muted); background: var(--white-a03); }
-.train-state.active { color: var(--cyan); background: var(--cyan-a08); }
-.train-state.training { color: var(--amber); background: rgba(243,187,74,0.15); }
-
-/* ── Risk grid ── */
-.risk-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
-.risk-item { padding: 10px; border-radius: var(--radius-sm); border: 1px solid var(--line); background: var(--panel-2); text-align: center; }
-.risk-item .k { font-size: 9px; text-transform: uppercase; letter-spacing: 0.14em; color: var(--muted); }
-.risk-item .v { margin-top: 4px; font-size: 16px; font-weight: 700; }
-
-/* ── Incident ── */
-.incident { padding: 8px 10px; border-radius: var(--radius-xs); border: 1px solid var(--line); background: var(--panel-2); margin-bottom: 4px; font-size: 12px; }
-.incident .t { font-weight: 600; }
-.incident .m { color: var(--muted); font-size: 11px; margin-top: 2px; }
-
-/* ── Responsive ── */
-@media (max-width: 380px) {
-  .metrics, .risk-grid { grid-template-columns: 1fr; }
-  .headline { font-size: 22px; }
+.sub {
+  margin-top: 10px;
+  color: var(--muted);
+  line-height: 1.55;
+  font-size: 14px;
 }
-
-/* ── Focus ── */
-button:focus-visible, a:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
-
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.metric, .mini {
+  padding: 13px;
+  border-radius: 18px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+}
+.metric .k, .mini .k {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  color: var(--muted);
+}
+.metric .v, .mini .v {
+  margin-top: 8px;
+  font-size: 20px;
+  font-weight: 700;
+}
+.mini .v {
+  font-size: 15px;
+}
+.mini .m, .metric .m {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.section-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.section-title h2 {
+  margin: 0;
+  font-size: 16px;
+  letter-spacing: -0.03em;
+}
+.tag {
+  padding: 6px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  font-size: 11px;
+  color: var(--muted);
+  background: var(--white-a03);
+}
+.card {
+  padding: 16px;
+}
+.row {
+  display: grid;
+  gap: 10px;
+}
+.symbol {
+  padding: 14px;
+  background: linear-gradient(180deg, var(--white-a04), var(--white-a02));
+}
+.symbol-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.symbol-name {
+  margin: 2px 0 0;
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: -0.04em;
+}
+.symbol-sub {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.45;
+}
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--white-a04);
+  color: var(--muted);
+  font-size: 11px;
+}
+.dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+.good { color: var(--green); }
+.warn { color: var(--amber); }
+.bad { color: var(--red); }
+.dot.good { background: var(--green); }
+.dot.warn { background: var(--amber); }
+.dot.bad { background: var(--red); }
+.dot.reconnecting { background: var(--amber); animation: reconnectPulse 1.2s ease-in-out infinite; }
+.statline {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 12px;
+}
+.bar {
+  margin-top: 12px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--white-a07);
+  overflow: hidden;
+}
+.fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--cyan), var(--blue));
+}
+.fill.good {
+  background: linear-gradient(90deg, var(--green-ramp), var(--green));
+}
+.fill.warn {
+  background: linear-gradient(90deg, var(--amber-ramp), var(--amber));
+}
+.fill.bad {
+  background: linear-gradient(90deg, var(--red), var(--red));
+}
+.list {
+  display: grid;
+  gap: 10px;
+}
+.list-item {
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: var(--panel-2);
+}
+.list-item .t {
+  font-size: 13px;
+  line-height: 1.45;
+}
+.list-item .m {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+button, .link-btn {
+  border: 0;
+  border-radius: 16px;
+  padding: 13px 14px;
+  font: inherit;
+  color: var(--text);
+  background: linear-gradient(180deg, var(--cyan-a18), var(--cyan-a08));
+  box-shadow: var(--shadow);
+}
+.link-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
+}
+button.secondary {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.09), var(--white-a04));
+}
+.footer {
+  text-align: center;
+  color: var(--muted);
+  font-size: 12px;
+  padding-bottom: 6px;
+}
+@keyframes reconnectPulse { 0%,100% { opacity: .6; transform: scale(1); } 50% { opacity: 1; transform: scale(1.35); } }
+@media (max-width: 480px) {
+  .metrics, .actions, .statline {
+    grid-template-columns: 1fr;
+  }
+  .headline {
+    font-size: 25px;
+  }
+}
+@media (max-width: 360px) {
+  .statline {
+    grid-template-columns: 1fr;
+  }
+  .headline {
+    font-size: 22px;
+  }
+  .metric .v, .mini .v {
+    font-size: 17px;
+  }
+}
+/* ── Focus states ─ keyboard / assistive navigation ── */
+button:focus-visible, a:focus-visible {
+  outline: var(--focus-outline);
+  outline-offset: var(--focus-offset);
+}
 /* ── Reduced motion ── */
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
 }
 </style>
 </head>
 <body>
-<div class="shell" id="app">
-  <!-- Tabs -->
-  <div class="tabs">
-    <button class="tab active" data-tab="dashboard" onclick="switchTab('dashboard')">Dashboard</button>
-    <button class="tab" data-tab="trading" onclick="switchTab('trading')">Trading</button>
-    <button class="tab" data-tab="models" onclick="switchTab('models')">Models</button>
-    <button class="tab" data-tab="risk" onclick="switchTab('risk')">Risk</button>
-  </div>
+<div class="shell">
+  <section class="hero">
+    <div class="eyebrow">Telegram Mini App</div>
+    <div class="headline" id="headline">Connecting to runtime</div>
+    <div class="sub" id="subline">Waiting for live status from the operator surface.</div>
+  </section>
 
-  <!-- Dashboard Tab -->
-  <div id="tab-dashboard">
-    <section class="hero" id="hero-section"></section>
-    <section class="metrics" id="kpi-section"></section>
-    <section class="card" id="equity-section">
-      <div class="section-title"><h2>Equity Curve</h2><div class="tag" id="eq-tag">live</div></div>
-      <div class="spark-wrap"><canvas id="equity-canvas"></canvas></div>
-    </section>
-    <section class="card" id="lanes-section">
-      <div class="section-title"><h2>Symbol Lanes</h2><div class="tag" id="lanes-tag">0</div></div>
-      <div id="lanes-list"></div>
-    </section>
-  </div>
+  <section class="metrics" id="metrics"></section>
 
-  <!-- Trading Tab -->
-  <div id="tab-trading" style="display:none">
-    <section class="card">
-      <div class="section-title"><h2>Open Positions</h2><div class="tag" id="pos-tag">0</div></div>
-      <div id="positions-list"></div>
-    </section>
-    <section class="card">
-      <div class="section-title"><h2>Trade History</h2><div class="tag" id="hist-tag">0</div></div>
-      <div id="history-list"></div>
-    </section>
-    <section class="card">
-      <div class="section-title"><h2>Trade Review</h2><div class="tag" id="review-tag">-</div></div>
-      <div id="review-section"></div>
-    </section>
-  </div>
+  <section class="card">
+    <div class="section-title">
+      <h2>Per Pair Pipeline</h2>
+      <div class="tag" id="pipelineTag">waiting</div>
+    </div>
+    <div class="row" id="symbols"></div>
+  </section>
 
-  <!-- Models Tab -->
-  <div id="tab-models" style="display:none">
-    <section class="card">
-      <div class="section-title"><h2>Training Engine</h2><div class="tag" id="train-tag">idle</div></div>
-      <div id="training-section"></div>
-    </section>
-    <section class="card">
-      <div class="section-title"><h2>Model Registry</h2><div class="tag" id="reg-tag">-</div></div>
-      <div id="registry-section"></div>
-    </section>
-  </div>
+  <section class="card">
+    <div class="section-title">
+      <h2>Recent Activity</h2>
+      <div class="tag" id="activityTag">logs</div>
+    </div>
+    <div class="list" id="incidents"></div>
+  </section>
 
-  <!-- Risk Tab -->
-  <div id="tab-risk" style="display:none">
-    <section class="card" id="risk-section">
-      <div class="section-title"><h2>Safety & Guardrails</h2><div class="tag" id="risk-tag">active</div></div>
-      <div id="risk-grid"></div>
-    </section>
-    <section class="card">
-      <div class="section-title"><h2>Incidents</h2><div class="tag" id="inc-tag">0</div></div>
-      <div id="incidents-list"></div>
-    </section>
-  </div>
+  <section class="card">
+    <div class="section-title">
+      <h2>Actions</h2>
+      <div class="tag" id="appState">booting</div>
+    </div>
+    <div class="actions">
+      <button type="button" id="refreshBtn">Refresh now</button>
+      <a class="link-btn secondary" id="openDashboard" href="/" target="_blank" rel="noopener">Open full dashboard</a>
+    </div>
+  </section>
 
   <div class="footer" id="footer">Awaiting first status payload.</div>
 </div>
-
 <script>
 const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
-if (tg) { tg.ready(); tg.expand(); }
-
-const $ = (id) => document.getElementById(id);
-const esc = (v) => String(v == null ? "" : v).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-const fmt = (v, d=2) => { const n = Number(v); return Number.isFinite(n) ? n.toFixed(d) : "-"; };
-const fmtI = (v) => { const n = Number(v); return Number.isFinite(n) ? String(Math.trunc(n)) : "-"; };
-const money = (v) => { const n = Number(v); const s = n < 0 ? "-$" : "$"; return s + Math.abs(n).toLocaleString("en", {minimumFractionDigits:2, maximumFractionDigits:2}); };
-const pct = (v) => { const n = Number(v); return Number.isFinite(n) ? `${n.toFixed(1)}%` : "-"; };
-const tone = (v) => { const s = String(v||"").toLowerCase(); if (["done","ready","live","running","active","healthy","pass","buy"].includes(s)) return "good"; if (["failed","blocked","halted","error","sell"].includes(s)) return "bad"; return "warn"; };
-
-let currentTab = "dashboard";
-let state = null;
-
-function switchTab(tab) {
-  currentTab = tab;
-  document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.dataset.tab === tab));
-  ["dashboard","trading","models","risk"].forEach(t => {
-    const el = $("tab-" + t);
-    if (el) el.style.display = t === tab ? "" : "none";
-  });
-  if (state) render();
+if (tg) {
+  tg.ready();
+  tg.expand();
+  document.documentElement.style.setProperty("--bg", tg.themeParams.bg_color || "#07111d");
+  document.documentElement.style.setProperty("--text", tg.themeParams.text_color || "#eef5ff");
 }
 
-function renderHero(s) {
-  const acc = s.trading?.account || {};
-  const pnl = Number(acc.floatingPnl || 0);
-  const pnlClass = pnl >= 0 ? "good" : "bad";
-  $("hero-section").innerHTML = `
-    <div class="eyebrow">Money Printer</div>
-    <div class="headline">${money(acc.equity)}</div>
-    <div class="sub">
-      Balance: ${money(acc.balance)} &middot; Float: <span class="v ${pnlClass}">${money(pnl)}</span> &middot; Positions: ${fmtI(acc.openPositions)}
-    </div>`;
+const byId = (id) => document.getElementById(id);
+const fmtNum = (value, digits = 2) => {
+  const n = Number(value);
+  return Number.isFinite(n) ? n.toFixed(digits) : "-";
+};
+const fmtInt = (value) => {
+  const n = Number(value);
+  return Number.isFinite(n) ? String(Math.trunc(n)) : "-";
+};
+const pct = (value) => {
+  const n = Number(value);
+  return Number.isFinite(n) ? `${n.toFixed(1)}%` : "-";
+};
+const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+const esc = (value) => String(value == null ? "" : value)
+  .replaceAll("&", "&amp;")
+  .replaceAll("<", "&lt;")
+  .replaceAll(">", "&gt;");
+const toneForState = (state) => {
+  const s = String(state || "").toLowerCase();
+  if (["done", "ready", "live", "executed", "running", "healthy"].includes(s)) return "good";
+  if (["failed", "blocked", "paused", "warning", "stopped"].includes(s)) return "bad";
+  return "warn";
+};
+const nowLabel = () => new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+const blendedPosture = (row) => {
+  const execution = row.execution || {};
+  const decision = row.decision || {};
+  const finalTarget = Number(decision.final_target || 0);
+  if (execution.executed) return `Executed ${execution.request_action || "trade"}`;
+  if (execution.block_reason) return "Blocked";
+  if (Math.abs(finalTarget) < 1e-9) return "Flat";
+  return finalTarget > 0 ? "Long bias" : "Short bias";
+};
+
+function metricCard(label, value, meta) {
+  return `<div class="metric"><div class="k">${esc(label)}</div><div class="v">${esc(value)}</div><div class="m">${esc(meta)}</div></div>`;
 }
 
-function renderKpi(s) {
-  const acc = s.trading?.account || {};
-  const risk = s.trading?.risk || {};
-  const rv = s.tradeReview || {};
-  const wr = Number(rv.winRate || 0);
-  const pf = Number(rv.profitFactor || 0);
-  $("kpi-section").innerHTML = [
-    metric("Balance", money(acc.balance), `Free: ${money(acc.freeMargin)}`),
-    metric("Float PnL", money(acc.floatingPnl), `Today: ${money(acc.realizedToday)}`, acc.floatingPnl >= 0 ? "good" : "bad"),
-    metric("Win Rate", `${fmt(wr,0)}%`, `${rv.wins||0}W / ${rv.losses||0}L`, wr >= 50 ? "good" : "warn"),
-    metric("Risk", risk.canTrade ? "ACTIVE" : "BLOCKED", `DD: ${pct(risk.drawdownPct)}`, risk.canTrade ? "good" : "bad"),
-    metric("Profit Factor", fmt(pf), `PnL: ${money(rv.totalPnl)}`, pf >= 1 ? "good" : "bad"),
-    metric("SL/TP Rate", `${fmt(rv.slRate,0)}% / ${fmt(rv.tpRate,0)}%`, `${rv.slHits||0} SL / ${rv.tpHits||0} TP`),
+function miniStat(label, value, meta) {
+  return `<div class="mini"><div class="k">${esc(label)}</div><div class="v">${esc(value)}</div><div class="m">${esc(meta)}</div></div>`;
+}
+
+function renderSummary(status) {
+  const training = status.training || {};
+  const account = status.account || {};
+  const gate = status.canary_gate || {};
+  const server = status.server || {};
+  const runtime = status.runtime_owner || {};
+  const rows = (training.symbol_lane_rows || []);
+  const focus = rows[0] || {};
+  const decision = focus.decision || {};
+  const posture = blendedPosture(focus);
+  const current = focus.symbol || ((training.visual || {}).lstm || {}).current_symbol || (training.configured_symbols || [])[0] || "-";
+
+  byId("headline").textContent = server.running ? `${current} · ${posture}` : "Runtime waiting for server";
+  byId("subline").textContent =
+    `AGI regime ${decision.regime || "-"} | ` +
+    `blended target ${fmtNum(decision.final_target || 0, 3)} | ` +
+    `PPO ${fmtNum(decision.ppo_target || 0, 3)} | ` +
+    `Dreamer ${fmtNum(decision.dreamer_target || 0, 3)} | ` +
+    `owner health ${runtime.ok === false ? "warning" : "ok"}`;
+
+  byId("metrics").innerHTML = [
+    metricCard("Runtime", server.running ? "RUNNING" : "STOPPED", `PID ${((server.pids || [])[0]) || "-"} | cycle ${training.cycle_running ? "active" : "idle"}`),
+    metricCard("Training", training.cycle_running ? "ACTIVE" : "IDLE", `${fmtInt(training.pipeline_summary && training.pipeline_summary.training_active_symbols || 0)} active pairs`),
+    metricCard("AGI regime", decision.regime || "-", `confidence ${fmtNum(decision.confidence || 0, 3)} | risk ${fmtNum(decision.risk_scalar || 0, 2)}`),
+    metricCard("Blended posture", posture, `final ${fmtNum(decision.final_target || 0, 3)} | raw ${fmtNum(decision.raw_target || 0, 3)}`),
+    metricCard("Canary Gate", gate.ready ? "READY" : "HOLD", gate.reason || "waiting for evidence"),
+    metricCard("Account", fmtNum(account.equity), `${fmtInt(account.open_positions)} open positions | balance ${fmtNum(account.balance)}`),
   ].join("");
+
+  byId("pipelineTag").textContent = `${fmtInt((training.configured_symbols || []).length)} pairs`;
+  byId("appState").textContent = status.state || "live";
+  byId("footer").textContent = `Updated ${nowLabel()} from ${status.repo_root || "runtime"}`;
 }
 
-function metric(label, value, meta, t) {
-  return `<div class="metric"><div class="k">${esc(label)}</div><div class="v${t?" "+t:""}">${esc(value)}</div><div class="m">${esc(meta)}</div></div>`;
-}
-
-function renderEquity(s) {
-  const perf = s.perf || {};
-  const curve = perf.equity_curve || [];
-  if (curve.length < 2) { $("eq-tag").textContent = "no data"; return; }
-  const canvas = $("equity-canvas");
-  const ctx = canvas.getContext("2d");
-  const w = canvas.parentElement.offsetWidth;
-  const h = 60;
-  canvas.width = w * 2; canvas.height = h * 2; canvas.style.width = w+"px"; canvas.style.height = h+"px";
-  ctx.scale(2, 2);
-  const mn = Math.min(...curve); const mx = Math.max(...curve); const range = mx - mn || 1;
-  ctx.clearRect(0, 0, w, h);
-  const grad = ctx.createLinearGradient(0, 0, 0, h);
-  grad.addColorStop(0, "rgba(90,215,255,0.25)");
-  grad.addColorStop(1, "rgba(90,215,255,0)");
-  ctx.beginPath();
-  curve.forEach((v, i) => { const x = (i/(curve.length-1))*w; const y = h - ((v-mn)/range)*(h-8) - 4; i===0 ? ctx.moveTo(x,y) : ctx.lineTo(x,y); });
-  ctx.strokeStyle = "#5ad7ff"; ctx.lineWidth = 1.5; ctx.stroke();
-  ctx.lineTo(w, h); ctx.lineTo(0, h); ctx.closePath();
-  ctx.fillStyle = grad; ctx.fill();
-  $("eq-tag").textContent = `${curve.length} pts`;
-}
-
-function renderLanes(s) {
-  const lanes = s.trading?.lanes || [];
-  $("lanes-tag").textContent = fmtI(lanes.length);
-  if (!lanes.length) { $("lanes-list").innerHTML = `<div class="empty">No active lanes</div>`; return; }
-  $("lanes-list").innerHTML = lanes.map(l => {
-    const t = tone(l.status || l.side);
-    const sideLabel = (l.side||"flat").toUpperCase();
-    return `<div class="lane">
-      <div class="lane-top">
-        <div><span class="lane-sym">${esc(l.symbol)}</span> <span class="pos-side ${l.side}">${sideLabel}</span></div>
-        <div class="lane-status v ${t}">${esc((l.status||"watching").toUpperCase())}</div>
+function renderSymbols(status) {
+  const rows = (((status.training || {}).symbol_lane_rows) || []).slice(0, 4);
+  byId("symbols").innerHTML = rows.map((row) => {
+    const symbol = row.symbol || "-";
+    const lstm = row.pipeline && row.pipeline.lstm || {};
+    const canary = row.pipeline && row.pipeline.canary || {};
+    const champion = row.pipeline && row.pipeline.champion || {};
+    const trading = row.pipeline && row.pipeline.trading || {};
+    const decision = row.decision || {};
+    const posture = blendedPosture(row);
+    const stateTone = toneForState(trading.state || champion.state || canary.state || lstm.state);
+    const progress = Number(lstm.progress_pct || 0);
+    return `
+      <div class="symbol">
+        <div class="symbol-top">
+          <div>
+            <div class="eyebrow">Pair</div>
+            <div class="symbol-name">${esc(symbol)}</div>
+            <div class="symbol-sub">AGI regime ${esc(decision.regime || "-")} | blended posture ${esc(posture)}</div>
+          </div>
+          <div class="pill"><span class="dot ${stateTone}"></span>${esc((trading.state || lstm.state || "waiting").toUpperCase())}</div>
+        </div>
+        <div class="statline">
+          ${miniStat("AGI regime", decision.regime || "-", `conf ${fmtNum(decision.confidence || 0, 3)}`)}
+          ${miniStat("Blended", posture, `final ${fmtNum(decision.final_target || 0, 3)}`)}
+          ${miniStat("Model mix", `P ${fmtNum(decision.ppo_target || 0, 3)} / D ${fmtNum(decision.dreamer_target || 0, 3)}`, `AGI ${fmtNum(decision.agi_bias || 0, 3)}`)}
+          ${miniStat("Registry", champion.state || "waiting", `canary ${canary.state || "waiting"}`)}
+        </div>
+        <div class="bar"><div class="fill ${toneForState(lstm.state)}" style="width:${clamp(progress, 0, 100)}%"></div></div>
       </div>
-      <div class="lane-meta">Champion: ${esc(l.champion)} &middot; Conf: ${fmt(l.confidence*100,1)}% &middot; Exposure: ${fmt(Math.abs(l.exposure)*100,0)}%</div>
-      ${l.reason ? `<div class="lane-meta">${esc(l.reason)}</div>` : ""}
-    </div>`;
-  }).join("");
+    `;
+  }).join("") || `<div class="list-item"><div class="t">No pair lanes published yet.</div><div class="m">Start the pipeline and refresh.</div></div>`;
 }
 
-function renderPositions(s) {
-  const positions = s.trading?.account?.positions || [];
-  $("pos-tag").textContent = fmtI(positions.length);
-  if (!positions.length) { $("positions-list").innerHTML = `<div class="empty">No open positions</div>`; return; }
-  $("positions-list").innerHTML = positions.map(p => {
-    const pnlClass = p.profit >= 0 ? "pos" : "neg";
-    return `<div class="pos-card">
-      <div class="pos-header">
-        <div><span class="pos-sym">${esc(p.symbol)}</span> <span class="pos-side ${p.type}">${esc((p.type||"").toUpperCase())}</span></div>
-        <div class="pos-pnl ${pnlClass}">${money(p.profit)}</div>
+function renderIncidents(status) {
+  const incidents = (status.incidents || []).slice(0, 6);
+  byId("activityTag").textContent = `${incidents.length} events`;
+  byId("incidents").innerHTML = incidents.map((item) => {
+    const tone = item.severity === "warning" ? "warn" : item.severity === "critical" ? "bad" : "good";
+    return `
+      <div class="list-item">
+        <div class="t"><span class="${tone}">${esc(item.event || "event")}</span> · ${esc(item.summary || "activity")}</div>
+        <div class="m">${esc(item.ts || "")}</div>
       </div>
-      <div class="pos-detail">
-        <span>${p.volume} lots</span>
-        <span>#${p.ticket}</span>
-        <span>@ ${money(p.openPrice)}</span>
-      </div>
-      ${(p.sl > 0 || p.tp > 0) ? `<div class="pos-protect">
-        ${p.sl > 0 ? `<span>SL: ${money(p.sl)}</span>` : ""}
-        ${p.tp > 0 ? `<span style="color:var(--green)">TP: ${money(p.tp)}</span>` : ""}
-      </div>` : ""}
-    </div>`;
-  }).join("");
+    `;
+  }).join("") || `<div class="list-item"><div class="t">No recent incidents yet.</div></div>`;
 }
 
-function renderHistory(s) {
-  const trades = s.trading?.tradeHistory || [];
-  $("hist-tag").textContent = fmtI(trades.length);
-  if (!trades.length) { $("history-list").innerHTML = `<div class="empty">No trade history</div>`; return; }
-  $("history-list").innerHTML = trades.slice(0, 20).map(t => {
-    const pnlClass = t.pnl >= 0 ? "good" : "bad";
-    return `<div class="trade-row">
-      <div>
-        <div class="trade-sym">${esc(t.symbol)} <span style="color:var(--${t.type==="buy"?"green":"red"})">${esc(t.type.toUpperCase())}</span></div>
-        <div class="trade-detail">${esc(t.reason || t.model)} &middot; ${esc(t.timestamp)}</div>
-      </div>
-      <div class="trade-pnl v ${pnlClass}">${money(t.pnl)}</div>
-    </div>`;
-  }).join("");
-}
-
-function renderReview(s) {
-  const rv = s.tradeReview || {};
-  const bySym = rv.bySymbol || {};
-  const tags = rv.tagDistribution || {};
-  $("review-tag").textContent = `${rv.totalTrades||0} trades`;
-  let html = `<div class="metrics" style="margin-bottom:8px">
-    ${metric("Total Trades", fmtI(rv.totalTrades), `${rv.wins||0}W / ${rv.losses||0}L`)}
-    ${metric("Win Rate", `${fmt(rv.winRate,0)}%`, "", (rv.winRate||0)>=50?"good":"warn")}
-    ${metric("Total PnL", money(rv.totalPnl), "", (rv.totalPnl||0)>=0?"good":"bad")}
-    ${metric("Profit Factor", fmt(rv.profitFactor), "", (rv.profitFactor||0)>=1?"good":"bad")}
-  </div>`;
-  if (Object.keys(bySym).length) {
-    html += `<div class="section-title" style="margin-top:8px"><h2>By Symbol</h2></div>`;
-    for (const [sym, data] of Object.entries(bySym)) {
-      html += `<div class="trade-row"><div class="trade-sym">${esc(sym)}</div><div class="trade-detail">W:${data.wins||0} L:${data.losses||0} PnL:${money(data.total_pnl||0)}</div></div>`;
-    }
-  }
-  if (Object.keys(tags).length) {
-    html += `<div class="section-title" style="margin-top:8px"><h2>Tag Distribution</h2></div>`;
-    for (const [tag, count] of Object.entries(tags)) {
-      html += `<div class="trade-row"><div class="trade-sym">${esc(tag)}</div><div style="font-weight:700">${count}</div></div>`;
-    }
-  }
-  $("review-section").innerHTML = html;
-}
-
-function renderTraining(s) {
-  const tr = s.training || {};
-  const reg = s.registry || {};
-  $("train-tag").textContent = tr.activePhase || "idle";
-  let html = "";
-  // LSTM
-  html += `<div class="train-row"><div><div class="train-label">LSTM Context</div><div style="font-size:11px;color:var(--muted);margin-top:2px">Features: ${tr.lstm?.featuresUsed||0} &middot; Loss: ${fmt(tr.lstm?.loss)}</div></div><span class="train-state ${tr.lstm?.state||"idle"}">${esc((tr.lstm?.state||"idle").toUpperCase())}</span></div>`;
-  html += `<div class="bar"><div class="fill ${tone(tr.lstm?.state)}" style="width:${fmt(tr.lstm?.memoryStrength||0,0)}%"></div></div>`;
-  // PPO
-  html += `<div class="train-row"><div><div class="train-label">PPO Execution</div><div style="font-size:11px;color:var(--muted);margin-top:2px">${fmtI(tr.ppo?.currentTimesteps)} / ${fmtI(tr.ppo?.targetTimesteps)} ts</div></div><span class="train-state ${tr.ppo?.state||"idle"}">${esc((tr.ppo?.state||"idle").toUpperCase())}</span></div>`;
-  html += `<div class="bar"><div class="fill ${tone(tr.ppo?.state)}" style="width:${fmt(tr.ppo?.progressPct||0,0)}%"></div></div>`;
-  // Dreamer
-  html += `<div class="train-row"><div><div class="train-label">DreamerV3</div><div style="font-size:11px;color:var(--muted);margin-top:2px">${fmtI(tr.dreamerV3?.steps)} steps &middot; Align: ${fmt(tr.dreamerV3?.alignment)}</div></div><span class="train-state ${tr.dreamerV3?.state||"idle"}">${esc((tr.dreamerV3?.state||"idle").toUpperCase())}</span></div>`;
-  html += `<div class="bar"><div class="fill ${tone(tr.dreamerV3?.state)}" style="width:${fmt((tr.dreamerV3?.alignment||0)*100,0)}%"></div></div>`;
-  $("training-section").innerHTML = html;
-
-  // Registry
-  const ch = reg.champion || {};
-  const ca = reg.canary || {};
-  const gate = reg.gate || {};
-  $("reg-tag").textContent = ch.id ? "active" : "none";
-  $("registry-section").innerHTML = `
-    <div class="metrics">
-      ${metric("Champion", esc(ch.id || "none").split("_").pop(), `Symbol: ${esc(ch.symbol||"-")}`)}
-      ${metric("Canary", esc(ca.id || "none").split("_").pop(), ca.id ? `Verdict: ${esc(ca.verdict)}` : "No canary staged")}
-      ${metric("Canary Gate", gate.ready ? "READY" : "HOLD", esc(gate.reason || "min trades not reached"), gate.ready ? "good" : "warn")}
-      ${metric("Symbols", fmtI(tr.configuredSymbols?.length || 0), esc((tr.configuredSymbols||[]).join(", ")))}
-    </div>`;
-}
-
-function renderRisk(s) {
-  const risk = s.trading?.risk || {};
-  const canTrade = risk.canTrade;
-  $("risk-tag").textContent = canTrade ? "ACTIVE" : "BLOCKED";
-  $("risk-tag").style.color = canTrade ? "var(--green)" : "var(--red)";
-  $("risk-grid").innerHTML = `
-    <div class="risk-grid">
-      ${metric("Drawdown", pct(risk.drawdownPct), "", (risk.drawdownPct||0)>5?"warn":"good")}
-      ${metric("Daily Loss Cap", pct(risk.maxDailyLossPct), "")}
-      ${metric("Kill Switch", risk.killSwitchArmed ? "ARMED" : "SAFE", "", risk.killSwitchArmed?"warn":"good")}
-      ${metric("Size Cap", pct((risk.sizeCap||0)*100), "")}
-      ${metric("Trades Today", fmtI(s.tradeReview?.totalTrades||0), "")}
-      ${metric("Max Positions", fmtI(s.trading?.account?.openPositions||0), "")}
-    </div>`;
-
-  const incidents = s.incidents || [];
-  $("inc-tag").textContent = fmtI(incidents.length);
-  if (!incidents.length) { $("incidents-list").innerHTML = `<div class="empty">No active incidents</div>`; return; }
-  $("incidents-list").innerHTML = incidents.map(inc => {
-    const t = inc.level === "fail" ? "bad" : inc.level === "warn" ? "warn" : "good";
-    return `<div class="incident"><div class="t v ${t}">${esc(inc.title)}</div><div class="m">${esc(inc.message)}</div></div>`;
-  }).join("");
-}
-
-function render() {
-  if (!state) return;
-  renderHero(state);
-  renderKpi(state);
-  renderEquity(state);
-  renderLanes(state);
-  renderPositions(state);
-  renderHistory(state);
-  renderReview(state);
-  renderTraining(state);
-  renderRisk(state);
-  const now = new Date().toLocaleTimeString([], {hour:"2-digit",minute:"2-digit",second:"2-digit"});
-  $("footer").textContent = `Updated ${now} | Money Printer v1.0`;
-}
-
-// ── Data fetch ──
-async function fetchJSON(path, fallback=null) {
-  try { const r = await fetch(`/api${path}`, {cache:"no-store"}); return r.ok ? await r.json() : fallback; }
-  catch { return fallback; }
-}
-
-async function refresh() {
+async function refreshStatus() {
+  byId("refreshBtn").disabled = true;
   try {
-    const [status, trades, tradeReview, perf, lanes] = await Promise.all([
-      fetchJSON("/status"), fetchJSON("/trades?limit=30"), fetchJSON("/trade_review"),
-      fetchJSON("/perf"), fetchJSON("/lanes")
-    ]);
-    state = mapStatus(status, trades, tradeReview, perf, lanes);
-    render();
-    if (tg) { tg.ready(); }
-  } catch (e) {
-    $("footer").textContent = `Error: ${e.message}`;
+    const response = await fetch("/api/status", { cache: "no-store" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const status = await response.json();
+    renderSummary(status);
+    renderSymbols(status);
+    renderIncidents(status);
+    if (tg) {
+      tg.MainButton.setText("Open full dashboard");
+      tg.MainButton.show();
+      tg.MainButton.onClick(() => tg.openLink(location.origin + "/"));
+    }
+  } catch (error) {
+    byId("headline").textContent = "Mini App could not reach runtime";
+    byId("subline").textContent = String(error);
+  } finally {
+    byId("refreshBtn").disabled = false;
   }
 }
 
-function mapStatus(status, trades, tradeReview, perf, lanes) {
-  const visual = status?.training?.visual || {};
-  const ppo = visual.ppo || {};
-  const lstm = visual.lstm || {};
-  const dreamer = visual.dreamer || {};
-  const account = status?.account || {};
-  const risk = status?.risk || {};
-  const laneRows = status?.training?.symbol_lane_rows || [];
-  const rv = tradeReview || {};
-
-  const incidents = (status?.incidents || []).slice(0, 10).map(inc => ({
-    level: normalizeLevel(inc.severity),
-    title: inc.symbol || inc.type || inc.event || "incident",
-    message: inc.message || inc.summary || inc.reason || JSON.stringify(inc.payload || {}),
-  }));
-
-  const mappedLanes = laneRows.length > 0 ? laneRows.map(row => ({
-    symbol: row.symbol, side: String(row.side || row.position_side || "flat").toLowerCase(),
-    champion: row.champion || "unknown", reason: row.reason || row.decision?.regime || "",
-    confidence: Number(row.confidence || row.decision?.confidence || 0),
-    exposure: Number(row.exposure || 0), status: row.status || "watching",
-  })) : (lanes?.lanes || []).map(l => ({
-    symbol: l.symbol, side: String(l.action || "hold").toLowerCase(),
-    champion: l.champion || "unknown", reason: l.reason || "",
-    confidence: Number(l.confidence || 0), exposure: Number(l.exposure || 0), status: l.can_trade ? "live" : "watching",
-  }));
-
-  const tradeHistory = (trades?.trades || trades || []).slice(0, 30).map((t, i) => ({
-    id: String(t.ticket || `T-${i}`), symbol: t.symbol || "UNKNOWN",
-    type: (t.action_type || t.side || "trade").toLowerCase(),
-    pnl: Number(t.profit || 0), volume: Number(t.volume || 0),
-    reason: t.comment || "executed by champion model",
-    timestamp: t.close_time || t.open_time || "recent",
-    model: t.model || "champion",
-  }));
-
-  const configuredSymbols = status?.training?.configured_symbols || ["BTCUSDm","XAUUSDm","EURUSDm","GBPUSDm"];
-
-  return {
-    trading: {
-      mode: (status?.mode || "DRY-RUN").toLowerCase() === "live" ? "active" : "armed",
-      account: {
-        balance: Number(account.balance || 0), equity: Number(account.equity || 0),
-        freeMargin: Number(account.free_margin || 0), floatingPnl: Number(account.profit || 0),
-        realizedToday: Number(account.realized_today || 0), openPositions: Number(account.open_positions || 0),
-        positions: (account.positions || []).map(p => ({
-          ticket: p.ticket, symbol: p.symbol, type: (p.type||"").toLowerCase(),
-          volume: Number(p.volume || 0), openPrice: Number(p.open_price || 0),
-          currentPrice: Number(p.current_price || 0), profit: Number(p.profit || 0),
-          sl: Number(p.sl || 0), tp: Number(p.tp || 0), comment: p.comment || "",
-          magic: p.magic || 0, openTime: p.open_time || "",
-        })),
-      },
-      risk: {
-        canTrade: risk.can_trade !== false && !Boolean(risk.halt),
-        drawdownPct: Number(risk.current_dd || account.drawdown_pct || 0),
-        dailyLossPct: Number(risk.daily_loss_pct || 0),
-        maxDailyLossPct: Number(risk.max_daily_loss || 3),
-        sizeCap: Number(risk.size_cap || 0.64), killSwitchArmed: true,
-      },
-      lanes: mappedLanes, tradeHistory,
-    },
-    tradeReview: {
-      totalTrades: Number(rv.total_trades || 0), wins: Number(rv.wins || 0),
-      losses: Number(rv.losses || 0), winRate: Number(rv.win_rate || 0),
-      totalPnl: Number(rv.total_pnl || 0), avgWin: Number(rv.avg_win || 0),
-      avgLoss: Number(rv.avg_loss || 0), profitFactor: Number(rv.profit_factor || 0),
-      slHits: Number(rv.sl_hits || 0), tpHits: Number(rv.tp_hits || 0),
-      slRate: Number(rv.sl_rate || 0), tpRate: Number(rv.tp_rate || 0),
-      tagDistribution: rv.tag_distribution || {}, bySymbol: rv.by_symbol || {},
-    },
-    training: {
-      activePhase: visual.active_key || visual.active_label || "policy",
-      configuredSymbols,
-      lstm: { state: lstm.state || "idle", memoryStrength: Number(lstm.memory_strength || 0),
-        featuresUsed: 150, loss: Number(lstm.loss || 0), epoch: Number(status?.training?.lstm_epoch || 0) },
-      ppo: { state: ppo.state || "idle", progressPct: Number(ppo.progress_pct || 0),
-        currentTimesteps: Number(ppo.current_timesteps || 0), targetTimesteps: Number(ppo.target_timesteps || 100000),
-        progress: Number(((ppo.progress_pct || 0) / 100).toFixed(2)) },
-      dreamerV3: { state: dreamer.state || "idle", steps: Number(dreamer.steps || 0),
-        alignment: Number(dreamer.alignment || 0) },
-    },
-    registry: {
-      champion: { id: status?.active_models?.champion || "none", symbol: mappedLanes[0]?.symbol || "BTCUSDm" },
-      canary: { id: status?.active_models?.canary || "none", verdict: status?.active_models?.canary ? "canary" : "none" },
-      gate: { ready: Boolean(status?.canary_gate?.ready), reason: status?.canary_gate?.reason || "" },
-    },
-    perf: perf || { equity_curve: [], pnl_curve: [] },
-    incidents,
-  };
-}
-
-function normalizeLevel(raw) {
-  const v = String(raw || "info").toLowerCase();
-  if (v === "warning" || v === "warn") return "warn";
-  if (v === "critical" || v === "error" || v === "fail") return "fail";
-  if (v === "activity" || v === "success" || v === "pass") return "pass";
-  return "info";
-}
-
-refresh();
-setInterval(refresh, 5000);
+byId("refreshBtn").addEventListener("click", refreshStatus);
+refreshStatus();
+setInterval(refreshStatus, 5000);
 </script>
 </body>
 </html>

@@ -1,63 +1,56 @@
+import os
+import sys
+
 import torch
-import torch.nn as nn
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from gymnasium import spaces
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from loguru import logger
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from Python.agi_brain import SmartAGI
 
 
 class LSTMFeatureExtractor(BaseFeaturesExtractor):
     """
-    Lightweight LSTM feature extractor for PPO.
-    Dynamically infers n_features from observation shape and window_size.
-    No dependency on SmartAGI — trained jointly from scratch with PPO.
+    Trainable LSTM feature extractor for joint LSTM + PPO training.
     """
-    def __init__(
-        self,
-        observation_space: spaces.Box,
-        features_dim: int = 256,
-        window_size: int = 100,
-        portfolio_feature_count: int = 3,
-        lstm_hidden: int = 128,
-        lstm_layers: int = 2,
-    ):
-        obs_dim = int(observation_space.shape[0])
-        seq_dim = obs_dim - portfolio_feature_count
-        n_features = seq_dim // window_size
 
-        output_dim = features_dim + portfolio_feature_count
-        super().__init__(observation_space, features_dim=output_dim)
+    def __init__(self, observation_space: spaces.Box, features_dim: int = 256):
+        total_obs = int(observation_space.shape[0])
+        self.seq_window = 100
+        self.portfolio_dim = total_obs % self.seq_window
+        seq_flat = total_obs - self.portfolio_dim
+        if seq_flat <= 0 or seq_flat % self.seq_window != 0:
+            raise ValueError(
+                f"Invalid observation shape for LSTM extractor: total={total_obs}, "
+                f"window={self.seq_window}, portfolio_dim={self.portfolio_dim}"
+            )
 
-        self.window_size = window_size
-        self.n_features = n_features
-        self.portfolio_feature_count = portfolio_feature_count
+        super().__init__(observation_space, features_dim=features_dim + self.portfolio_dim)
 
-        self.lstm = nn.LSTM(
-            input_size=n_features,
-            hidden_size=lstm_hidden,
-            num_layers=lstm_layers,
-            batch_first=True,
-            dropout=0.1 if lstm_layers > 1 else 0.0,
-        )
-        self.projection = nn.Linear(lstm_hidden, features_dim)
+        logger.info("initializing LSTMFeatureExtractor")
+        self.lstm_brain = SmartAGI()
 
-        logger.info(
-            f"LSTMFeatureExtractor: obs_dim={obs_dim}, "
-            f"n_features={n_features}, window={window_size}, "
-            f"portfolio={portfolio_feature_count}, output={output_dim}"
-        )
+        self.projection = torch.nn.Linear(128, features_dim)
+
+        # Keep all extractor params trainable.
+        for param in self.lstm_brain.model.parameters():
+            param.requires_grad = True
+
+        self.seq_feature_dim = seq_flat // self.seq_window
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        device = observations.device
+        self.lstm_brain.model.to(device)
+        self.projection = self.projection.to(device)
+
         batch_size = observations.shape[0]
 
-        seq_features = observations[:, :-self.portfolio_feature_count]
-        portfolio_state = observations[:, -self.portfolio_feature_count:]
+        seq_features = observations[:, :-self.portfolio_dim]
+        portfolio_state = observations[:, -self.portfolio_dim :]
 
-        seq = seq_features.view(batch_size, self.window_size, self.n_features)
+        seq = seq_features.view(batch_size, self.seq_window, self.seq_feature_dim)
+        lstm_embedding = self.lstm_brain.extract_features(seq)
 
-        lstm_out, _ = self.lstm(seq)
-        last_hidden = lstm_out[:, -1, :]
-
-        projected = self.projection(last_hidden)
-        combined = torch.cat([projected, portfolio_state], dim=1)
-
-        return combined
+        projected = self.projection(lstm_embedding)
+        return torch.cat([projected, portfolio_state], dim=1)

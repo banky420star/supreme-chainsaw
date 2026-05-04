@@ -1,288 +1,460 @@
-"""
-Data Feed — High-fidelity market data with MT5 (Windows) and Yahoo Finance (Mac/Linux) fallback.
-
-Provides:
-  - fetch_training_data(symbol, period)  → pd.DataFrame with [open, high, low, close, volume]
-  - get_combined_training_df(symbols, period) → single concatenated pd.DataFrame
-  - get_latest_data(symbol, timeframe, bars)  → np.ndarray or None
-"""
+import math
 import os
-import sys
+from datetime import datetime, timedelta, timezone
+from typing import Iterable
+
 import numpy as np
 import pandas as pd
 from loguru import logger
+from Python.mt5_compat import mt5
 
-# ── MT5 conditional import (only available on Windows) ──────────────
-_mt5 = None
-if sys.platform == "win32":
-    try:
-        import MetaTrader5 as mt5
-        _mt5 = mt5
-    except ImportError:
-        logger.warning("MetaTrader5 package not installed — using Yahoo Finance fallback.")
-
-# ── Yahoo Finance import ────────────────────────────────────────────
 try:
-    import yfinance as yf
-except ImportError:
-    yf = None
-    logger.warning("yfinance not installed — pip install yfinance")
+    import yaml
+except Exception:
+    yaml = None
 
-# ── Symbol mapping: broker names → Yahoo Finance tickers ────────────
-_YF_MAP = {
-    # FX pairs
-    "EURUSD":   "EURUSD=X",
-    "EURUSDm":  "EURUSD=X",
-    "GBPUSD":   "GBPUSD=X",
-    "GBPUSDm":  "GBPUSD=X",
-    "USDJPY":   "USDJPY=X",
-    "USDJPYm":  "USDJPY=X",
-    "AUDUSD":   "AUDUSD=X",
-    "AUDUSDm":  "AUDUSD=X",
-    "USDCAD":   "USDCAD=X",
-    "USDCADm":  "USDCAD=X",
-    "USDCHF":   "USDCHF=X",
-    "USDCHFm":  "USDCHF=X",
-    "NZDUSD":   "NZDUSD=X",
-    "NZDUSDm":  "NZDUSD=X",
-    "GBPJPY":   "GBPJPY=X",
-    "GBPJPYm":  "GBPJPY=X",
-    "EURJPY":   "EURJPY=X",
-    "EURJPYm":  "EURJPY=X",
-    # Commodities / Metals
-    "XAUUSD":   "GC=F",
-    "XAUUSDm":  "GC=F",
-    "XAGUSD":   "SI=F",
-    "XAGUSDm":  "SI=F",
-    # Indices
-    "US30":     "YM=F",
-    "US500":    "ES=F",
-    "NAS100":   "NQ=F",
-    # Crypto
-    "BTCUSD":   "BTC-USD",
-    "ETHUSD":   "ETH-USD",
-}
+DEFAULT_MAX_MT5_BARS = 100_000
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_ROOT = os.path.join(PROJECT_ROOT, "data", "dukascopy")
 
-# ── MT5 timeframe mapping ──────────────────────────────────────────
-_MT5_TIMEFRAMES = {}
-if _mt5:
-    _MT5_TIMEFRAMES = {
-        "M1":  _mt5.TIMEFRAME_M1,
-        "M5":  _mt5.TIMEFRAME_M5,
-        "M15": _mt5.TIMEFRAME_M15,
-        "M30": _mt5.TIMEFRAME_M30,
-        "H1":  _mt5.TIMEFRAME_H1,
-        "H4":  _mt5.TIMEFRAME_H4,
-        "D1":  _mt5.TIMEFRAME_D1,
+
+def _to_mt5_timeframe(interval: str):
+    m = (interval or "5m").lower().strip()
+    mapping = {
+        "1m": mt5.TIMEFRAME_M1,
+        "5m": mt5.TIMEFRAME_M5,
+        "15m": mt5.TIMEFRAME_M15,
+        "30m": mt5.TIMEFRAME_M30,
+        "1h": mt5.TIMEFRAME_H1,
+        "4h": mt5.TIMEFRAME_H4,
+        "1d": mt5.TIMEFRAME_D1,
     }
+    return mapping.get(m, mt5.TIMEFRAME_M5)
 
 
-def _yf_ticker(symbol: str) -> str:
-    """Resolve a broker symbol to a Yahoo Finance ticker."""
-    clean = symbol.strip()
-    if clean in _YF_MAP:
-        return _YF_MAP[clean]
-    # If it already looks like a YF ticker, pass through
-    if "=" in clean or "-" in clean or "." in clean:
-        return clean
-    # Last resort: try appending =X for FX
-    return clean + "=X"
+def _normalize_interval(interval: str | None) -> str:
+    m = str(interval or "5m").lower().strip()
+    if m.startswith("m") and m[1:].isdigit():
+        return f"{m[1:]}m"
+    if m.startswith("h") and m[1:].isdigit():
+        return f"{m[1:]}h"
+    return m
 
 
-def _synthesize_fx_volume(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Yahoo Finance returns 0 volume for FX pairs.
-    Synthesize a volume proxy from price volatility (High-Low range * 1e6).
-    """
-    if "volume" in df.columns and (df["volume"] == 0).all():
-        df["volume"] = ((df["high"] - df["low"]) * 1e6).clip(lower=100).astype(float)
-        logger.debug("Synthesized FX volume proxy from H-L range.")
+def _interval_minutes(interval: str) -> int:
+    m = _normalize_interval(interval)
+    if m.endswith("m"):
+        return max(1, int(m[:-1]))
+    if m.endswith("h"):
+        return max(1, int(m[:-1])) * 60
+    if m.endswith("d"):
+        return max(1, int(m[:-1])) * 24 * 60
+    return 5
+
+
+def _period_days(period: str) -> int:
+    p = (period or "60d").lower().strip()
+    try:
+        if p.endswith("d"):
+            return max(1, int(p[:-1]))
+        if p.endswith("w"):
+            return max(1, int(p[:-1])) * 7
+        if p.endswith("mo"):
+            return max(1, int(p[:-2])) * 30
+        if p.endswith("y"):
+            return max(1, int(p[:-1])) * 365
+    except Exception:
+        pass
+    return 60
+
+
+def _bars_for(period: str, interval: str) -> int:
+    days = _period_days(period)
+    mins = _interval_minutes(interval)
+    bars = int(math.ceil((days * 24 * 60) / max(1, mins)))
+    return max(300, min(600_000, bars + 50))
+
+
+def _resolve_cfg_value(v):
+    if isinstance(v, str) and v.startswith("ENV:"):
+        return os.environ.get(v.split(":", 1)[1], "")
+    return v
+
+
+def _load_mt5_cfg() -> dict:
+    cfg_path = os.path.join(PROJECT_ROOT, "config.yaml")
+    if not os.path.exists(cfg_path) or yaml is None:
+        return {}
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        return cfg.get("mt5", {}) if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
+
+def _load_data_cfg() -> dict:
+    cfg_path = os.path.join(PROJECT_ROOT, "config.yaml")
+    if not os.path.exists(cfg_path) or yaml is None:
+        return {}
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        return cfg.get("data", {}) if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
+
+def _initialize_mt5() -> bool:
+    mt5_cfg = _load_mt5_cfg()
+    login_raw = os.environ.get("MT5_LOGIN") or _resolve_cfg_value(mt5_cfg.get("login", ""))
+    password = os.environ.get("MT5_PASSWORD") or _resolve_cfg_value(mt5_cfg.get("password", ""))
+    server = os.environ.get("MT5_SERVER") or _resolve_cfg_value(mt5_cfg.get("server", ""))
+    try:
+        login = int(str(login_raw).strip()) if str(login_raw).strip() else 0
+    except Exception:
+        login = 0
+    if login and password and server:
+        return bool(mt5.initialize(login=login, password=str(password), server=str(server)))
+    return bool(mt5.initialize())
+
+
+def _ensure_symbol_ready(symbol: str) -> bool:
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        return False
+    if not bool(getattr(info, "visible", False)):
+        return bool(mt5.symbol_select(symbol, True))
+    return True
+
+
+def _fetch_rates_any(symbol: str, tf: int, bars_req: int):
+    now_utc = datetime.now(timezone.utc)
+    start_utc = datetime(2005, 1, 1, tzinfo=timezone.utc)
+    for chunk_max in (100_000, 50_000, 20_000, 10_000, 5_000, 2_000, 1_000):
+        first = mt5.copy_rates_from_pos(symbol, tf, 0, min(chunk_max, bars_req))
+        if first is None or len(first) == 0:
+            continue
+
+        chunks = [first]
+        offset = len(first)
+        while offset < bars_req:
+            need = min(chunk_max, bars_req - offset)
+            part = mt5.copy_rates_from_pos(symbol, tf, offset, need)
+            if part is None or len(part) == 0:
+                break
+            chunks.append(part)
+            got = len(part)
+            offset += got
+            if got < need:
+                break
+
+        try:
+            return np.concatenate(chunks)
+        except Exception:
+            return chunks[0]
+
+    rates = mt5.copy_rates_from(symbol, tf, now_utc, min(5_000, bars_req))
+    if rates is not None and len(rates) > 0:
+        return rates
+
+    rates = mt5.copy_rates_range(symbol, tf, start_utc, now_utc)
+    if rates is not None and len(rates) > 0:
+        return rates
+
+    return rates
+
+
+def get_latest_data(symbol, timeframe, bars):
+    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, bars)
+    if rates is None:
+        raise RuntimeError(f"MT5 data feed failure for {symbol}")
+    return rates
+
+
+def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out.columns = [str(c).lower() for c in out.columns]
+
+    if "tick_volume" in out.columns and "volume" not in out.columns:
+        out = out.rename(columns={"tick_volume": "volume"})
+
+    for col in ["open", "high", "low", "close"]:
+        if col not in out.columns:
+            raise ValueError(f"missing required column: {col}")
+
+    if "volume" not in out.columns:
+        out["volume"] = 0.0
+
+    out = out[["open", "high", "low", "close", "volume"]].copy()
+    out = out.replace([float("inf"), float("-inf")], pd.NA).dropna().ffill().bfill()
+    return out
+
+
+def _assert_recent_bars(df: pd.DataFrame, interval: str, stale_bars: int = 3):
+    if df.empty or not isinstance(df.index, pd.DatetimeIndex):
+        raise RuntimeError("cannot validate freshness: missing datetime index")
+    last_ts = pd.to_datetime(df.index.max(), utc=True)
+    now_ts = datetime.now(timezone.utc)
+    max_age_min = max(1, _interval_minutes(interval)) * max(1, int(stale_bars))
+    age_min = (now_ts - last_ts.to_pydatetime()).total_seconds() / 60.0
+    if age_min > max_age_min:
+        raise RuntimeError(
+            f"stale MT5 data: last={last_ts.isoformat()} age_min={age_min:.1f} > allowed={max_age_min}"
+        )
+
+
+def _resolve_source(source: str | None) -> str:
+    if source:
+        return str(source).strip().lower()
+    data_cfg = _load_data_cfg()
+    return str(data_cfg.get("source", "mt5") or "mt5").strip().lower()
+
+
+def _dukascopy_cache_path(symbol: str, interval: str) -> str:
+    safe_symbol = str(symbol).replace("/", "_")
+    safe_interval = _normalize_interval(interval)
+    os.makedirs(DATA_ROOT, exist_ok=True)
+    return os.path.join(DATA_ROOT, f"{safe_symbol}_{safe_interval}.parquet")
+
+
+def _dukascopy_to_frame(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    frame = raw.copy()
+    frame.columns = [str(c).lower() for c in frame.columns]
+    if "timestamp" in frame.columns and "time" not in frame.columns:
+        frame = frame.rename(columns={"timestamp": "time"})
+    if "date" in frame.columns and "time" not in frame.columns:
+        frame = frame.rename(columns={"date": "time"})
+    if "bidvolume" in frame.columns and "volume" not in frame.columns:
+        frame = frame.rename(columns={"bidvolume": "volume"})
+    if "tick_volume" in frame.columns and "volume" not in frame.columns:
+        frame = frame.rename(columns={"tick_volume": "volume"})
+    if "time" not in frame.columns and isinstance(frame.index, pd.DatetimeIndex):
+        frame = frame.reset_index().rename(columns={frame.index.name or "index": "time"})
+    frame["time"] = pd.to_datetime(frame["time"], utc=True, errors="coerce")
+    frame = frame.dropna(subset=["time"]).sort_values("time").drop_duplicates(subset=["time"], keep="last")
+    frame = frame.set_index("time")
+    frame = _normalize_ohlcv(frame)
+    frame["symbol"] = symbol
+    return frame
+
+
+def _load_dukascopy_cache(symbol: str, interval: str) -> pd.DataFrame:
+    cache_path = _dukascopy_cache_path(symbol, interval)
+    if not os.path.exists(cache_path):
+        return pd.DataFrame()
+    try:
+        cached = pd.read_parquet(cache_path)
+        return _dukascopy_to_frame(cached, symbol)
+    except Exception as exc:
+        logger.warning(f"Failed loading Dukascopy cache for {symbol}: {exc}")
+        return pd.DataFrame()
+
+
+def _save_dukascopy_cache(df: pd.DataFrame, symbol: str, interval: str):
+    cache_path = _dukascopy_cache_path(symbol, interval)
+    try:
+        df.reset_index().to_parquet(cache_path, index=False)
+    except Exception as exc:
+        logger.warning(f"Failed writing Dukascopy cache for {symbol}: {exc}")
+
+
+def _dukascopy_interval(interval: str) -> str:
+    mapping = {
+        "1m": "1min",
+        "5m": "5min",
+        "15m": "15min",
+        "30m": "30min",
+        "1h": "1hour",
+        "4h": "4hour",
+        "1d": "1day",
+    }
+    return mapping.get(_normalize_interval(interval), "5min")
+
+
+def _download_dukascopy(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    try:
+        from dukascopy_python import fetch
+    except Exception as exc:
+        raise RuntimeError(f"dukascopy_python is not installed: {exc}")
+
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=_period_days(period))
+    instrument = str(symbol).replace("/", "").upper().replace("M", "")
+    df = fetch(
+        instrument=instrument,
+        interval=_dukascopy_interval(interval),
+        offer_side="bid",
+        start=start,
+        end=end,
+    )
+    if df is None or len(df) == 0:
+        raise RuntimeError(f"empty Dukascopy payload for {symbol}")
+    return _dukascopy_to_frame(pd.DataFrame(df), symbol)
+
+
+def _fetch_dukascopy_data(
+    symbol: str,
+    period: str,
+    interval: str,
+    bars_req: int,
+    min_required: int,
+    strict: bool,
+    require_fresh: bool,
+) -> pd.DataFrame:
+    df = _load_dukascopy_cache(symbol, interval)
+    if len(df) < min_required:
+        try:
+            logger.info(f"Fetching Dukascopy history for {symbol} | period={period} tf={interval}")
+            downloaded = _download_dukascopy(symbol, period=period, interval=interval)
+            if not downloaded.empty:
+                df = downloaded
+                _save_dukascopy_cache(df, symbol, interval)
+        except Exception as exc:
+            if strict:
+                raise
+            logger.warning(f"Dukascopy fetch failed for {symbol}: {exc}")
+
+    if df.empty:
+        return pd.DataFrame()
+
+    df = df.tail(int(bars_req)).copy()
+    if len(df) < min_required and strict:
+        raise RuntimeError(
+            f"insufficient Dukascopy data for {symbol} | tf={interval} requested={bars_req} got={len(df)} required={min_required}"
+        )
+    if require_fresh:
+        _assert_recent_bars(df, interval=interval, stale_bars=12)
     return df
 
 
-def _fetch_via_mt5(symbol: str, timeframe: str = "M5", bars: int = 5000) -> pd.DataFrame | None:
-    """Try fetching data via MT5 (Windows only).
-
-    Checks if MT5 is already connected before re-initializing.
-    Re-initializing steals the connection from other processes.
-    """
-    if _mt5 is None:
-        return None
+def _fetch_mt5_data(
+    symbol: str,
+    period: str,
+    interval: str,
+    bars_req: int,
+    min_required: int,
+    strict: bool,
+    require_fresh: bool,
+) -> pd.DataFrame:
+    max_bars_raw = os.environ.get("AGI_MT5_MAX_BARS", str(DEFAULT_MAX_MT5_BARS))
     try:
-        # Check if already connected — avoid re-initializing if possible
-        account_info = _mt5.account_info()
-        if account_info is None:
-            # Not connected — try to initialize
-            if not _mt5.initialize():
-                logger.warning("MT5 initialize() failed.")
-                return None
-        
-        tf = _MT5_TIMEFRAMES.get(timeframe, _mt5.TIMEFRAME_M5)
-        rates = _mt5.copy_rates_from_pos(symbol, tf, 0, bars)
-        
-        if rates is None or len(rates) == 0:
-            logger.warning(f"MT5 returned no data for {symbol}")
-            return None
-        
-        df = pd.DataFrame(rates)
-        df["time"] = pd.to_datetime(df["time"], unit="s")
-        df = df.rename(columns={"tick_volume": "volume"})
-        
-        # Ensure standard column names
-        for col in ["open", "high", "low", "close", "volume"]:
-            if col not in df.columns:
-                logger.error(f"MT5 data missing column: {col}")
-                return None
-        
-        df = df[["time", "open", "high", "low", "close", "volume"]].copy()
-        df = df.sort_values("time").reset_index(drop=True)
-        logger.success(f"MT5: {symbol} → {len(df)} bars loaded")
-        return df
-        
-    except Exception as e:
-        logger.warning(f"MT5 fetch error for {symbol}: {e}")
-        return None
+        max_bars = max(100, int(max_bars_raw))
+    except Exception:
+        max_bars = DEFAULT_MAX_MT5_BARS
+    if bars_req > max_bars:
+        logger.warning(
+            f"requested MT5 bars exceed cap for {symbol} | tf={interval} requested={bars_req} capped={max_bars}"
+        )
+        bars_req = max_bars
+    if min_required > bars_req:
+        min_required = bars_req
 
-
-def _fetch_via_yfinance(symbol: str, period: str = "60d", interval: str = "1h") -> pd.DataFrame | None:
-    """Fetch data via Yahoo Finance."""
-    if yf is None:
-        logger.error("yfinance not installed. Cannot fetch data.")
-        return None
-    
-    ticker = _yf_ticker(symbol)
-    
-    try:
-        logger.info(f"YFinance: Fetching {ticker} (period={period}, interval={interval})...")
-        data = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
-        
-        if data is None or data.empty:
-            logger.error(f"YFinance returned no data for {ticker}")
-            return None
-        
-        # yfinance sometimes returns MultiIndex columns — flatten
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = [col[0].lower() if isinstance(col, tuple) else col.lower() for col in data.columns]
-        else:
-            data.columns = [c.lower() for c in data.columns]
-        
-        # Ensure required columns exist
-        required = ["open", "high", "low", "close", "volume"]
-        missing = [c for c in required if c not in data.columns]
-        if missing:
-            # Try alternate names
-            rename_map = {}
-            for col in data.columns:
-                cl = col.lower()
-                if "open" in cl and "open" not in data.columns:
-                    rename_map[col] = "open"
-                elif "high" in cl and "high" not in data.columns:
-                    rename_map[col] = "high"
-                elif "low" in cl and "low" not in data.columns:
-                    rename_map[col] = "low"
-                elif "close" in cl and "close" not in data.columns:
-                    rename_map[col] = "close"
-                elif "vol" in cl and "volume" not in data.columns:
-                    rename_map[col] = "volume"
-            if rename_map:
-                data = data.rename(columns=rename_map)
-        
-        # Verify we have what we need
-        for col in required:
-            if col not in data.columns:
-                logger.error(f"YFinance data missing column '{col}' for {ticker}. Columns: {list(data.columns)}")
-                return None
-        
-        df = data[required].copy()
-        df = df.dropna()
-        
-        # Synthesize volume for FX
-        df = _synthesize_fx_volume(df)
-        
-        df = df.reset_index(drop=True)
-        logger.success(f"YFinance: {ticker} → {len(df)} bars loaded")
-        return df
-        
-    except Exception as e:
-        logger.error(f"YFinance error for {ticker}: {e}")
-        return None
-
-
-def fetch_training_data(symbol: str, period: str = "60d", interval: str = "1h") -> pd.DataFrame:
-    """
-    Fetch historical training data for a symbol.
-    Tries MT5 first (Windows), falls back to Yahoo Finance.
-    
-    Returns pd.DataFrame with columns: [open, high, low, close, volume]
-    """
-    # Try MT5 first on Windows
-    df = _fetch_via_mt5(symbol)
-    if df is not None and not df.empty:
-        # Drop the time column for training compatibility
-        if "time" in df.columns:
-            df = df.drop(columns=["time"])
-        return df
-    
-    # Fallback to Yahoo Finance
-    df = _fetch_via_yfinance(symbol, period=period, interval=interval)
-    if df is not None and not df.empty:
-        return df
-    
-    logger.error(f"All data sources failed for {symbol}")
-    return pd.DataFrame()
-
-
-def get_combined_training_df(symbols: list[str], period: str = "60d", interval: str = "1h") -> pd.DataFrame:
-    """
-    Fetch and concatenate training data for multiple symbols.
-    Each symbol's data is independently normalized via the TradingEnv, 
-    so concatenation is safe for joint training.
-    
-    Returns pd.DataFrame with columns: [open, high, low, close, volume, symbol]
-    """
-    frames = []
-    for sym in symbols:
-        df = fetch_training_data(sym, period=period, interval=interval)
-        if df is not None and not df.empty and len(df) > 100:
-            df = df.copy()
-            df["symbol"] = sym
-            frames.append(df)
-            logger.info(f"  ✓ {sym}: {len(df)} bars added to combined dataset")
-        else:
-            logger.warning(f"  ✗ {sym}: skipped (insufficient data)")
-    
-    if not frames:
-        logger.error("No valid data from any symbol!")
+    if not _initialize_mt5():
+        msg = f"MT5 initialize failed for {symbol}: {mt5.last_error()}"
+        logger.error(msg)
+        if strict:
+            raise RuntimeError(msg)
         return pd.DataFrame()
-    
-    combined = pd.concat(frames, ignore_index=True)
-    logger.success(f"Combined training dataset: {len(combined)} total bars from {len(frames)} symbols")
+
+    if not _ensure_symbol_ready(symbol):
+        msg = f"symbol not available in MT5 market watch: {symbol}"
+        logger.warning(msg)
+        if strict:
+            raise RuntimeError(msg)
+        return pd.DataFrame()
+
+    rates = _fetch_rates_any(symbol, _to_mt5_timeframe(interval), bars_req)
+    got = 0 if rates is None else len(rates)
+    if rates is None or got < 100:
+        msg = (
+            f"insufficient MT5 data for {symbol} | tf={interval} requested={bars_req} got={got} "
+            f"required_min=100 | last_error={mt5.last_error()}"
+        )
+        logger.warning(msg)
+        if strict:
+            raise RuntimeError(msg)
+        return pd.DataFrame()
+    if got < max(100, min_required):
+        logger.warning(
+            f"partial MT5 history for {symbol} | tf={interval} requested={bars_req} got={got} required={max(100, min_required)} | training with available bars"
+        )
+
+    raw = pd.DataFrame(rates)
+    raw["time"] = pd.to_datetime(raw["time"], unit="s", utc=True)
+    raw = raw.set_index("time")
+
+    try:
+        df = _normalize_ohlcv(raw)
+    except Exception as exc:
+        msg = f"normalization failed for {symbol}: {exc}"
+        logger.error(msg)
+        if strict:
+            raise RuntimeError(msg)
+        return pd.DataFrame()
+
+    if require_fresh:
+        _assert_recent_bars(df, interval=interval, stale_bars=3)
+
+    df["symbol"] = symbol
+    return df
+
+
+def fetch_training_data(
+    symbol: str,
+    period: str = "60d",
+    interval: str = "5m",
+    strict: bool = False,
+    require_fresh: bool = False,
+    bars: int | None = None,
+    min_bars: int | None = None,
+    source: str | None = None,
+) -> pd.DataFrame:
+    bars_req = int(bars) if bars is not None else _bars_for(period, interval)
+    min_required = int(min_bars) if min_bars is not None else 100
+    resolved_source = _resolve_source(source)
+
+    if resolved_source == "dukascopy":
+        return _fetch_dukascopy_data(symbol, period, interval, bars_req, min_required, strict, require_fresh)
+
+    if resolved_source == "auto":
+        primary = _fetch_mt5_data(symbol, period, interval, bars_req, min_required, strict=False, require_fresh=require_fresh)
+        if len(primary) >= min_required:
+            return primary
+        fallback = _fetch_dukascopy_data(symbol, period, interval, bars_req, min_required, strict=False, require_fresh=False)
+        if not fallback.empty:
+            return fallback
+        if strict and primary.empty:
+            raise RuntimeError(f"No valid training data found for {symbol} from MT5 or Dukascopy")
+        return primary
+
+    return _fetch_mt5_data(symbol, period, interval, bars_req, min_required, strict, require_fresh)
+
+
+def get_combined_training_df(
+    symbols: Iterable[str],
+    period: str = "60d",
+    interval: str = "5m",
+    bars: int | None = None,
+    min_bars: int | None = None,
+    source: str | None = None,
+) -> pd.DataFrame:
+    frames = []
+    for symbol in symbols:
+        df = fetch_training_data(
+            symbol,
+            period=period,
+            interval=interval,
+            bars=bars,
+            min_bars=min_bars,
+            source=source,
+        )
+        if not df.empty:
+            frames.append(df)
+
+    if not frames:
+        return pd.DataFrame()
+
+    combined = pd.concat(frames, axis=0).sort_index()
+    combined = combined.replace([float("inf"), float("-inf")], pd.NA).dropna().ffill().bfill()
     return combined
-
-
-def get_latest_data(symbol: str, timeframe: str = "M5", bars: int = 200):
-    """
-    Get latest market data for live inference.
-    Returns np.ndarray on MT5, pd.DataFrame on YF, or None on failure.
-    """
-    # Try MT5
-    if _mt5 is not None:
-        try:
-            if _mt5.initialize():
-                tf = _MT5_TIMEFRAMES.get(timeframe, _mt5.TIMEFRAME_M5)
-                rates = _mt5.copy_rates_from_pos(symbol, tf, 0, bars)
-                if rates is not None and len(rates) > 0:
-                    return rates
-        except Exception as e:
-            logger.warning(f"MT5 live data error: {e}")
-    
-    # Fallback for dev: use yfinance with short period
-    df = _fetch_via_yfinance(symbol, period="5d", interval="5m")
-    if df is not None and not df.empty:
-        if len(df) > bars:
-            df = df.tail(bars).reset_index(drop=True)
-        return df
-    
-    if os.environ.get("AGI_IS_LIVE") == "1":
-        raise Exception(f"Live data feed failure for {symbol}")
-    return None

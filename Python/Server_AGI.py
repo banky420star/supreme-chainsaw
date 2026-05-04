@@ -1,694 +1,1035 @@
-"""
-Server AGI — Main engine with socket server, risk polling, and autonomy loop.
-Works on both Windows (MT5 live) and Mac (dry-run dev mode).
-
-Usage:
-  python -m Python.Server_AGI          # dry-run dev mode
-  python -m Python.Server_AGI --live   # live trading (Windows + MT5 only)
-"""
-# Fix numpy compatibility BEFORE any other imports:
-# PPO models saved with numpy 2.x reference numpy._core but numpy 1.x uses numpy.core.
-import sys as _sys
-import numpy as _np
-if not hasattr(_np, '_core'):
-    import numpy.core as _np_core
-    _sys.modules['numpy._core'] = _np_core
-    _sys.modules['numpy._core.numeric'] = _np_core.numeric
-    _sys.modules['numpy._core._multiarray_umath'] = _np_core._multiarray_umath
-
-import os
-import sys
-import time
+﻿import atexit
+import datetime
 import json
-import socket
-import asyncio
-import threading
-from datetime import datetime, date as datetime_date
+import os
+import subprocess
+import time
+
+try:
+    import MetaTrader5 as mt5
+except Exception as exc:
+    _MT5_IMPORT_ERROR = exc
+
+    class _MissingMetaTrader5:
+        def __getattr__(self, name):
+            raise RuntimeError(
+                "MetaTrader5 is required for live runtime operations and is unavailable in this environment."
+            ) from _MT5_IMPORT_ERROR
+
+    mt5 = _MissingMetaTrader5()
+
+import pandas as pd
 from loguru import logger
 
-# ── Conditional MT5 import ──────────────────────────────────────────
-_mt5 = None
-if sys.platform == "win32":
+from Python.config_utils import DEFAULT_TRADING_SYMBOLS, load_project_config, resolve_trading_symbols
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOCK_DIR = os.path.join(BASE_DIR, ".tmp")
+LOCK_PATH = os.path.join(LOCK_DIR, "server_agi.lock")
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+SERVER_LOG = os.path.join(LOG_DIR, "server.log")
+AUDIT_LOG = os.path.join(LOG_DIR, "audit_events.jsonl")
+TRADE_EVENTS_LOG = os.path.join(LOG_DIR, "trade_events.jsonl")
+ACTIVE_MODELS_PATH = os.path.join(BASE_DIR, "models", "registry", "active.json")
+
+os.makedirs(LOG_DIR, exist_ok=True)
+logger.add(SERVER_LOG, rotation="10 MB", level="INFO")
+
+SYMBOL_EXECUTION_PROFILES = {
+    "BTCUSDm": {
+        "ppo_weight": 0.65,
+        "dreamer_weight": 0.25,
+        "agi_weight": 0.10,
+        "min_trade_threshold": 0.18,
+        "max_abs_target": 1.00,
+        "cooldown_sec": 30,
+    },
+    "XAUUSDm": {
+        "ppo_weight": 0.50,
+        "dreamer_weight": 0.20,
+        "agi_weight": 0.30,
+        "min_trade_threshold": 0.12,
+        "max_abs_target": 0.75,
+        "cooldown_sec": 45,
+    },
+}
+
+
+def _utc_now() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _json_default(v):
+    if isinstance(v, (datetime.datetime, datetime.date)):
+        return v.isoformat()
+    return str(v)
+
+
+_JSONL_MAX_BYTES = 10 * 1024 * 1024  # 10 MB per JSONL file before rotation
+
+
+def _rotate_jsonl_if_needed(path: str) -> None:
+    """Rename path -> path.1 (keeping one backup) when the file exceeds _JSONL_MAX_BYTES."""
     try:
-        import MetaTrader5 as mt5
-        _mt5 = mt5
-    except ImportError:
+        if os.path.exists(path) and os.path.getsize(path) >= _JSONL_MAX_BYTES:
+            backup = path + ".1"
+            if os.path.exists(backup):
+                os.remove(backup)
+            os.rename(path, backup)
+    except Exception:
+        pass  # Never let rotation failure block a write
+
+
+def _append_jsonl(path: str, row: dict):
+    _rotate_jsonl_if_needed(path)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=True, default=_json_default) + "\n")
+
+
+def _append_audit(event: str, payload: dict):
+    _append_jsonl(
+        AUDIT_LOG,
+        {
+            "ts": _utc_now().isoformat(timespec="microseconds"),
+            "event": event,
+            "payload": payload,
+        },
+    )
+
+
+def _append_trade_event(event: str, payload: dict):
+    row = {
+        "ts": _utc_now().isoformat(timespec="microseconds"),
+        "event": event,
+        "payload": payload,
+    }
+    _append_jsonl(TRADE_EVENTS_LOG, row)
+    _append_audit(event, payload)
+
+
+def _load_runtime_components():
+    from Python.agi_brain import SmartAGI
+    from Python.event_intel import EventIntel
+    from Python.hybrid_brain import HybridBrain
+    from Python.mt5_executor import MT5Executor
+    from Python.risk_engine import RiskEngine
+    from Python.risk_supervisor import RiskSupervisor
+    from Python.trade_learning import build_trade_learning
+    from alerts.telegram_alerts import TelegramAlerter
+
+    return {
+        "SmartAGI": SmartAGI,
+        "EventIntel": EventIntel,
+        "HybridBrain": HybridBrain,
+        "MT5Executor": MT5Executor,
+        "RiskEngine": RiskEngine,
+        "RiskSupervisor": RiskSupervisor,
+        "build_trade_learning": build_trade_learning,
+        "TelegramAlerter": TelegramAlerter,
+    }
+
+
+
+def _read_active_models():
+    if not os.path.exists(ACTIVE_MODELS_PATH):
+        return {"champion": None, "canary": None}
+    try:
+        with open(ACTIVE_MODELS_PATH, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if not isinstance(d, dict):
+            return {"champion": None, "canary": None}
+        return {"champion": d.get("champion"), "canary": d.get("canary")}
+    except Exception:
+        return {"champion": None, "canary": None}
+
+
+def _training_state():
+    out = {
+        "lstm_running": False,
+        "drl_running": False,
+        "cycle_running": False,
+        "lstm_symbol": None,
+        "lstm_epoch": None,
+        "lstm_epochs_total": None,
+        "lstm_score": None,
+        "drl_symbol": None,
+        "drl_score": None,
+    }
+    try:
+        cmd = (
+            "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+            "Select-Object CommandLine | ConvertTo-Json -Depth 3"
+        )
+        raw = subprocess.check_output(["powershell", "-NoProfile", "-Command", cmd], text=True, timeout=6)
+        rows = json.loads(raw)
+        if isinstance(rows, dict):
+            rows = [rows]
+        lines = [str((r or {}).get("CommandLine") or "").lower().replace("\\", "/") for r in (rows or [])]
+        out["lstm_running"] = any("training/train_lstm.py" in x for x in lines)
+        out["drl_running"] = any("training/train_drl.py" in x for x in lines)
+        out["cycle_running"] = any(("tools/champion_cycle.py" in x or "tools/champion_cycle_loop.py" in x) for x in lines)
+    except Exception:
         pass
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    try:
+        lstm_lines = []
+        lstm_log = os.path.join(LOG_DIR, "lstm_training.log")
+        if os.path.exists(lstm_log):
+            with open(lstm_log, "r", encoding="utf-8", errors="replace") as f:
+                lstm_lines = [x.rstrip("\n") for x in f.readlines()[-40:]]
+        for line in reversed(lstm_lines):
+            if " | epoch " in line and " | loss " in line:
+                parts = line.split("|")
+                if len(parts) >= 4:
+                    left = parts[1].strip()
+                    ep = parts[2].strip().replace("epoch", "").strip()
+                    score = parts[3].strip()
+                    sym = left.split()[-1]
+                    out["lstm_symbol"] = sym
+                    if "/" in ep:
+                        a, b = ep.split("/", 1)
+                        out["lstm_epoch"] = a.strip()
+                        out["lstm_epochs_total"] = b.strip()
+                    if "acc" in score.lower():
+                        out["lstm_score"] = score
+                    break
+    except Exception:
+        pass
 
-from Python.risk_engine import RiskEngine
-from Python.risk_supervisor import RiskSupervisor
-from Python.mt5_executor import MT5Executor
-from Python.hybrid_brain import HybridBrain
-from Python.data_feed import get_latest_data, fetch_training_data
-from Python.api_server import start_api_server, cache_decision
-from Python.order_manager import OrderManager
-from Python.event_guard import EventGuard
-from Python.portfolio_allocator import PortfolioAllocator
-from alerts.telegram_alerts import TelegramAlerter
+    try:
+        ppo_lines = []
+        ppo_log = os.path.join(LOG_DIR, "ppo_training.log")
+        if os.path.exists(ppo_log):
+            with open(ppo_log, "r", encoding="utf-8", errors="replace") as f:
+                ppo_lines = [x.rstrip("\n") for x in f.readlines()[-80:]]
+        for line in reversed(ppo_lines):
+            if "DRL Training | symbols=" in line:
+                idx = line.find("symbols=")
+                if idx >= 0:
+                    chunk = line[idx + len("symbols=") :]
+                    if "[" in chunk and "]" in chunk:
+                        s = chunk[chunk.find("[") + 1 : chunk.find("]")]
+                        first = s.split(",")[0].strip().strip("'\"")
+                        out["drl_symbol"] = first or None
+            if "best_score=" in line:
+                out["drl_score"] = line.split("best_score=", 1)[1].strip()
+                if out["drl_symbol"] is not None:
+                    break
+    except Exception:
+        pass
 
-# ── Logging ─────────────────────────────────────────────────────────
-LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
-os.makedirs(LOG_DIR, exist_ok=True)
-logger.add(os.path.join(LOG_DIR, "server_agi.log"), rotation="10 MB", level="INFO")
+    return out
 
 
-class AGIServer:
-    """Main server engine that coordinates brain, risk, and execution."""
-
-    def __init__(self, live: bool = False):
-        self.live = live
-        self.live_armed = False  # Must be explicitly armed even in live mode
-        if live:
-            os.environ["AGI_IS_LIVE"] = "1"
-            # Auto-arm if explicit arm is not required
-            if os.environ.get("AGI_REQUIRE_EXPLICIT_LIVE_ARM", "true").lower() != "true":
-                self.live_armed = True
-                logger.info("Live mode auto-armed (AGI_REQUIRE_EXPLICIT_LIVE_ARM=false)")
-
-        # Load config first so components can use it
-        import yaml
-        config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml")
-        try:
-            with open(config_path) as f:
-                self.cfg = yaml.safe_load(f)
-            self.symbols = self.cfg.get("trading", {}).get("symbols", ["EURUSD"])
-        except Exception:
-            self.cfg = {}
-            self.symbols = ["EURUSD"]
-
-        # Initialize MT5 if available
-        if _mt5 is not None and live:
-            if not _mt5.initialize():
-                logger.error("MT5 failed to initialize — running in dry-run mode")
-                self.live = False
-            else:
-                logger.success("MT5 connected successfully")
-
-        # Core components
-        self.risk = RiskEngine()
-        self.risk_supervisor = RiskSupervisor(self.cfg)
-        self.executor = MT5Executor(self.risk)
-        self.executor.set_server_ref(self)  # Wire server ref for preflight checks
-        self.brain = HybridBrain(self.risk, self.executor)
-        self.risk_engine = self.risk  # Alias for AutonomyLoop compatibility
-        self.order_manager = OrderManager(self.executor)
-
-        # Socket server config
-        self.host = os.environ.get("AGI_HOST", "127.0.0.1")
-        self.port = int(os.environ.get("AGI_PORT", "9090"))
-        self.token = os.environ.get("AGI_TOKEN", "").strip()
-
-        # Event volatility guard — blocks/flattens during news events
-        self.event_guard = EventGuard(self.cfg, log_dir=LOG_DIR)
-
-        # Portfolio allocator — dynamic risk budget per symbol
-        alloc_cfg = (self.cfg or {}).get("portfolio", {})
-        self.portfolio_allocator = PortfolioAllocator(alloc_cfg, self.symbols)
-
-        # Telegram alerter
-        tel_cfg = (self.cfg or {}).get("telegram", {}) if isinstance(self.cfg, dict) else {}
-        tel_token = os.environ.get("TELEGRAM_TOKEN", "") or str(tel_cfg.get("token", "")).strip()
-        tel_chat = os.environ.get("TELEGRAM_CHAT_ID", "") or str(tel_cfg.get("chat_id", "")).strip()
-        self.telegram = TelegramAlerter(tel_token or None, tel_chat or None)
-        if self.telegram.token:
-            logger.success(f"Telegram bot wired | chat_id={tel_chat}")
-        else:
-            logger.info("Telegram bot not configured — alerts disabled")
-
-        self.start_time = time.time()
-        self._equity_poll_interval = int(os.environ.get("AGI_EQUITY_POLL_SEC", "30"))
-        self._trade_interval = int(os.environ.get("AGI_TRADE_INTERVAL_SEC", "900"))
-        self._heartbeat_interval = int(os.environ.get("AGI_HEARTBEAT_SEC", "1800"))  # 30 min default
-        logger.success(f"AGIServer initialized | live={self.live} | symbols={self.symbols} | trade_interval={self._trade_interval}s")
-
-        # Start equity polling in background
-        self._equity_thread = threading.Thread(target=self._equity_poll_loop, daemon=True)
-        self._equity_thread.start()
-
-        # Start autonomous trading loop in background
-        self._trade_thread = threading.Thread(target=self._auto_trade_loop, daemon=True)
-        self._trade_thread.start()
-
-        # Start trailing stop manager in background
-        self._trail_interval = int(os.environ.get("AGI_TRAIL_INTERVAL_SEC", "45"))
-        self._trail_thread = threading.Thread(target=self._trailing_stop_loop, daemon=True)
-        self._trail_thread.start()
-
-        # Start PPO position review loop in background (every 5 min)
-        self._review_interval = int(os.environ.get("AGI_REVIEW_INTERVAL_SEC", "300"))
-        self._review_thread = threading.Thread(target=self._position_review_loop, daemon=True)
-        self._review_thread.start()
-
-        # Start Telegram heartbeat in background
-        self._hb_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
-        self._hb_thread.start()
-
-    def handle_command(self, request: dict) -> dict:
-        """Process a command from the socket server or n8n bridge."""
-        # Token auth
-        if self.token and request.get("token") != self.token:
-            return {"error": "Invalid token", "action": "ERROR"}
-
-        command = request.get("action", "").lower()
-        symbol = request.get("symbol", self.symbols[0])
-
-        if command == "arm_live":
-            return self._arm_live()
-        elif command == "disarm_live":
-            self.live_armed = False
-            logger.warning("Live mode DISARMED")
-            return {"ok": True, "action": "DISARM_LIVE", "live_armed": False}
-        elif command == "unblock":
-            return self._unblock()
-        elif command == "reset_risk":
-            return self._unblock()
-
-        if command == "predict":
-            return self._handle_predict(symbol)
-        elif command == "trade":
-            return self._handle_trade(symbol)
-        elif command == "health":
-            return self._handle_health()
-        elif command == "risk_status":
-            return self._handle_risk_status()
-        else:
-            return {"error": f"Unknown command: {command}", "action": "ERROR"}
-
-    def _arm_live(self) -> dict:
-        """Arm live trading mode. Requires AGI_LIVE_ENABLED=true env var AND self.live=True."""
-        if not self.live:
-            return {"ok": False, "action": "ARM_LIVE", "error": "Server not started in live mode (--live flag required)"}
-        live_enabled = os.environ.get("AGI_LIVE_ENABLED", "false").lower() == "true"
-        require_explicit = os.environ.get("AGI_REQUIRE_EXPLICIT_LIVE_ARM", "true").lower() == "true"
-        if require_explicit and not live_enabled:
-            return {"ok": False, "action": "ARM_LIVE", "error": "AGI_LIVE_ENABLED env var must be 'true' to arm live trading"}
-        self.live_armed = True
-        logger.success("LIVE TRADING ARMED — orders will now be sent to MT5")
-        try:
-            self.telegram.risk_event("LIVE ARMED", "Live trading has been explicitly armed via API")
-        except Exception:
-            pass
-        return {"ok": True, "action": "ARM_LIVE", "live_armed": True}
-
-    def _unblock(self) -> dict:
-        """Unblock the risk engine — clear halt, reset daily counters, and reset peak equity.
-        This is the hard-wired unblock that always works."""
-        prev_halt = self.risk.halt
-        prev_reason = self.risk.get_halt_reason()
-
-        # Clear halt state
-        self.risk.halt = False
-        self.risk._halt_reason = ""
-        self.risk.error_count = 0
-
-        # Reset daily loss tracking so we don't immediately re-halt
-        self.risk.realized_pnl_today = 0.0
-        self.risk.daily_trades = 0
-        self.risk._hourly_pnl.clear()
-
-        # Reset peak equity to current so drawdown % recalculates fresh
-        try:
-            import MetaTrader5 as mt5
-            if mt5.initialize():
-                info = mt5.account_info()
-                if info and info.equity > 0:
-                    self.risk._peak_equity = info.equity
-                    self.risk._current_equity = info.equity
-                    logger.info(f"Peak equity reset to ${info.equity:.2f}")
-                mt5.shutdown()
-        except Exception:
-            pass
-
-        logger.success(
-            f"UNBLOCK: risk engine cleared (was halted={prev_halt}, reason={prev_reason}). "
-            f"Trading resumed."
+def _runtime_owner_health():
+    out = {"ok": True, "issues": []}
+    try:
+        cmd = (
+            "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+            "Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine | ConvertTo-Json -Depth 4"
         )
+        raw = subprocess.check_output(["powershell", "-NoProfile", "-Command", cmd], text=True, timeout=6)
+        rows = json.loads(raw)
+        if isinstance(rows, dict):
+            rows = [rows]
+    except Exception:
+        return out
+
+    tokens = [
+        ("server", "python.server_agi"),
+        ("ui", "tools/project_status_ui.py"),
+        ("cycle", "tools/champion_cycle.py"),
+        ("train_lstm", "training/train_lstm.py"),
+        ("train_drl", "training/train_drl.py"),
+    ]
+    try:
+        cfg = _load_cfg(live=True)
+        max_parallel_roots = max(1, len(resolve_trading_symbols(cfg, env_keys=("AGI_RUNTIME_SYMBOLS",), fallback=DEFAULT_TRADING_SYMBOLS)))
+    except Exception:
+        max_parallel_roots = max(1, len(DEFAULT_TRADING_SYMBOLS))
+    parallel_roles = {"train_lstm", "train_drl"}
+
+    for role, token in tokens:
+        matches = []
+        for r in rows or []:
+            cmdline = str((r or {}).get("CommandLine") or "").lower().replace("\\", "/")
+            if token in cmdline:
+                matches.append(
+                    {
+                        "pid": int((r or {}).get("ProcessId") or 0),
+                        "ppid": int((r or {}).get("ParentProcessId") or 0),
+                        "exe": str((r or {}).get("ExecutablePath") or ""),
+                    }
+                )
+        if not matches:
+            continue
+
+        pid_set = {m["pid"] for m in matches}
+        roots = [m for m in matches if m["ppid"] not in pid_set]
+        exe_paths = sorted({m["exe"].lower() for m in matches if m["exe"]})
+
+        # Windows venv redirector chain: venv launcher roots the tree and the base
+        # interpreter appears only as a child process for the same role token.
+        allowed_paths = {
+            "users\\administrator\\desktop\\python.exe",
+            ".venv312\\scripts\\python.exe",
+            ".venv\\scripts\\python.exe",
+        }
+        if len(roots) == 1 and exe_paths and all(any(token in p for token in allowed_paths) for p in exe_paths):
+            non_root_children_ok = True
+            for m in matches:
+                if m["pid"] != (roots[0]["pid"] if roots else 0) and m["ppid"] not in pid_set:
+                    non_root_children_ok = False
+                    break
+            if non_root_children_ok:
+                continue
+
+        if len(roots) > 1 and role in parallel_roles and len(roots) <= max_parallel_roots:
+            continue
+
+        if len(roots) > 1:
+            out["ok"] = False
+            out["issues"].append(
+                {
+                    "role": role,
+                    "type": "multiple_root_owners",
+                    "root_pids": [m["pid"] for m in roots],
+                    "exe_paths": exe_paths,
+                }
+            )
+        elif len(exe_paths) > 1:
+            out["ok"] = False
+            out["issues"].append(
+                {
+                    "role": role,
+                    "type": "mixed_executables",
+                    "root_pids": [m["pid"] for m in roots] or [matches[0]["pid"]],
+                    "exe_paths": exe_paths,
+                }
+            )
+    return out
+
+
+def _acquire_single_instance_lock():
+    os.makedirs(LOCK_DIR, exist_ok=True)
+    try:
+        fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode("utf-8"))
+        os.close(fd)
+    except FileExistsError:
+        return False
+
+    def _cleanup_lock():
         try:
-            self.telegram.risk_event("UNBLOCK", f"Risk halt cleared. Was: {prev_reason}. Trading resumed.")
+            if os.path.exists(LOCK_PATH):
+                os.remove(LOCK_PATH)
         except Exception:
             pass
 
-        return {
-            "ok": True,
-            "action": "UNBLOCK",
-            "was_halted": prev_halt,
-            "was_reason": prev_reason,
-            "halt": False,
-            "message": "Risk engine unblocked. Trading resumed.",
-        }
+    atexit.register(_cleanup_lock)
+    return True
 
-    def _handle_predict(self, symbol: str) -> dict:
-        """Get prediction without executing."""
-        try:
-            df = fetch_training_data(symbol, period="5d", interval="5m")
-            if df is None or df.empty or len(df) < 100:
-                return {"error": f"Insufficient data for {symbol}", "action": "ERROR"}
 
-            decision = self.brain.decide(symbol, df)
-            cache_decision(symbol, decision)
-            return decision
-        except Exception as e:
-            return {"error": str(e), "action": "ERROR"}
+def _load_cfg(live: bool = False):
+    return load_project_config(BASE_DIR, live_mode=bool(live))
 
-    def _handle_trade(self, symbol: str) -> dict:
-        """Get prediction and execute."""
-        try:
-            df = fetch_training_data(symbol, period="5d", interval="5m")
-            if df is None or df.empty or len(df) < 100:
-                return {"error": f"Insufficient data for {symbol}", "action": "ERROR"}
 
-            # Get portfolio allocation multiplier for this symbol
-            equity = getattr(self.risk, "_current_equity", 0) or 0
-            lot_multiplier = self.portfolio_allocator.get_lot_multiplier(symbol, equity)
+def _resolve_env_ref(v):
+    if isinstance(v, str) and v.startswith("ENV:"):
+        return os.environ.get(v.split(":", 1)[1])
+    return v
 
-            decision = self.brain.live_trade(
-                symbol, df,
-                risk_supervisor=self.risk_supervisor,
-                max_positions_per_symbol=int(os.environ.get("AGI_MAX_POS_PER_SYMBOL", "5")),
-                lot_multiplier=lot_multiplier,
-            )
-            result = decision if decision else {"action": "HOLD", "reason": "risk_blocked"}
-            cache_decision(symbol, result)
 
-            # Record trade result for portfolio allocator performance tracking
-            pnl = result.get("pnl", 0.0)
-            if pnl != 0.0:
-                self.portfolio_allocator.record_trade_result(symbol, pnl)
+def _load_telegram_cfg(cfg):
+    tcfg = cfg.get("telegram", {}) or {}
+    token = os.environ.get("TELEGRAM_TOKEN") or _resolve_env_ref(tcfg.get("token"))
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID") or _resolve_env_ref(tcfg.get("chat_id"))
 
-            # Send Telegram alert for executed trades
-            action = result.get("action", "HOLD")
-            if action in ("BUY", "SELL"):
-                try:
-                    self.telegram.trade(
-                        symbol=symbol,
-                        action=action,
-                        exposure=result.get("exposure", 0.0),
-                        confidence=result.get("confidence", 0.0),
-                        balance=getattr(self.risk, "_mt5_balance", 0) or 0,
-                        equity=getattr(self.risk, "_current_equity", 0) or 0,
-                        free_margin=getattr(self.risk, "_mt5_free_margin", 0) or 0,
-                        sl=result.get("sl", 0),
-                        tp=result.get("tp", 0),
-                        tag=result.get("tag", ""),
-                    )
-                except Exception as e:
-                    logger.debug(f"Telegram trade alert failed: {e}")
+    if token in ("", "YOUR_BOT_TOKEN_HERE"):
+        token = None
+    if chat_id in ("", "YOUR_CHAT_ID_HERE"):
+        chat_id = None
 
-            return result
-        except Exception as e:
-            return {"error": str(e), "action": "ERROR"}
+    return token, chat_id
 
-    def _handle_health(self) -> dict:
-        uptime = int(time.time() - self.start_time)
-        mt5_ok = _mt5 is not None and _mt5.initialize() if _mt5 else False
-        return {
-            "status": "OK",
-            "action": "HEALTH",
-            "uptime_sec": uptime,
-            "mt5_connected": mt5_ok,
-            "trading_enabled": not self.risk.halt,
-            "daily_trades": self.risk.daily_trades,
-            "realized_pnl": self.risk.realized_pnl_today,
-            "mode": "LIVE" if self.live else "DRY-RUN",
-        }
 
-    def _handle_risk_status(self) -> dict:
-        return {
-            "action": "RISK_STATUS",
-            "halt": self.risk.halt,
-            "daily_trades": self.risk.daily_trades,
-            "max_daily_trades": self.risk.max_daily_trades,
-            "realized_pnl": self.risk.realized_pnl_today,
-            "max_daily_loss": round(self.risk.max_daily_loss, 2),
-            "max_hourly_loss": round(self.risk.max_hourly_loss, 2),
-            "max_daily_loss_pct": self.risk.max_daily_loss_pct,
-            "max_hourly_loss_pct": self.risk.max_hourly_loss_pct,
-            "risk_per_trade_pct": self.risk.risk_per_trade_pct,
-            "current_dd": round(self.risk.current_dd, 2),
-            "equity": round(self.risk._current_equity, 2),
-            "can_trade": self.risk.can_trade(),
-        }
+def _init_mt5(cfg):
+    mt5_cfg = cfg.get("mt5", {})
+    login = int(os.environ.get("MT5_LOGIN", _resolve_env_ref(mt5_cfg.get("login", 0))) or 0)
+    password = os.environ.get("MT5_PASSWORD") or _resolve_env_ref(mt5_cfg.get("password", ""))
+    server = os.environ.get("MT5_SERVER") or _resolve_env_ref(mt5_cfg.get("server", ""))
 
-    def _equity_poll_loop(self):
-        """Background thread: poll MT5 account equity and update the risk engine."""
-        logger.info(f"Equity poll started (every {self._equity_poll_interval}s)")
-        prev_halt = False
-        _last_reset_date = datetime_date.today()
-        while True:
-            try:
-                # Daily reset: reset risk engine counters at midnight
-                today = datetime_date.today()
-                if today != _last_reset_date:
-                    logger.info(f"Daily risk reset: {_last_reset_date} -> {today}")
-                    self.risk.reset_daily()
-                    _last_reset_date = today
+    if login and password and server:
+        return mt5.initialize(login=login, password=password, server=server)
+    return mt5.initialize()
 
-                equity = self._read_equity()
-                if equity is not None and equity > 0:
-                    self.risk.update_equity(equity)
-                    logger.debug(f"Equity update: ${equity:.2f} | peak=${self.risk._peak_equity:.2f} | dd={self.risk.current_dd:.2f}%")
-                    # Alert on risk halt activation
-                    if self.risk.halt and not prev_halt:
-                        try:
-                            self.telegram.risk_event(
-                                "RISK HALT ACTIVATED",
-                                f"drawdown={self.risk.current_dd:.1f}% | daily_loss=${self.risk.realized_pnl_today:.2f} | trades={self.risk.daily_trades}"
-                            )
-                        except Exception:
-                            pass
-                    prev_halt = self.risk.halt
-            except Exception as e:
-                logger.warning(f"Equity poll error: {e}")
-            time.sleep(self._equity_poll_interval)
 
-    def _heartbeat_loop(self):
-        """Background thread: periodic Telegram heartbeat and status snapshot."""
-        logger.info(f"Telegram heartbeat started (every {self._heartbeat_interval}s)")
-        # Wait for server to stabilize before first heartbeat
-        time.sleep(60)
-        while True:
-            try:
-                uptime = time.time() - self.start_time
-                mt5_ok = _mt5 is not None and self.live
-                equity = getattr(self.risk, "_current_equity", 0) or 0
-                balance = getattr(self.risk, "_mt5_balance", 0) or 0
-                profit = getattr(self.risk, "_mt5_profit", 0) or 0
+def _to_mt5_timeframe(tf: str):
+    mapping = {
+        "M1": mt5.TIMEFRAME_M1,
+        "M5": mt5.TIMEFRAME_M5,
+        "M15": mt5.TIMEFRAME_M15,
+        "M30": mt5.TIMEFRAME_M30,
+        "H1": mt5.TIMEFRAME_H1,
+        "H4": mt5.TIMEFRAME_H4,
+    }
+    return mapping.get((tf or "M5").upper(), mt5.TIMEFRAME_M5)
 
-                # Count open positions
-                positions = 0
-                if _mt5 is not None and self.live:
-                    try:
-                        if _mt5.initialize():
-                            pos = _mt5.positions_get()
-                            if pos:
-                                positions = len(pos)
-                            _mt5.shutdown()
-                    except Exception:
-                        pass
 
-                self.telegram.heartbeat(
-                    uptime=uptime,
-                    mt5_connected=mt5_ok,
-                    trading_enabled=not self.risk.halt,
-                    equity=equity,
-                    balance=balance,
-                    positions=positions,
-                    pnl=profit,
-                )
-            except Exception as e:
-                logger.debug(f"Telegram heartbeat error: {e}")
-            time.sleep(self._heartbeat_interval)
+def _clip(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, float(v)))
 
-    def _read_equity(self) -> float | None:
-        """Read current account equity from MT5 (Windows) or return None for dry-run.
 
-        Also stores full account info on the risk engine for API access.
-        """
-        if _mt5 is not None and self.live:
-            try:
-                info = _mt5.account_info()
-                if info is not None:
-                    # Store full account info so the API can read it
-                    self.risk._mt5_balance = float(info.balance)
-                    self.risk._mt5_free_margin = float(info.margin_free)
-                    self.risk._mt5_profit = float(info.profit)
-                    return float(info.equity)
-            except Exception as e:
-                logger.debug(f"MT5 equity read failed: {e}")
-                return None
-        # Dry-run mode: no live equity feed — rely on initial bootstrap value
+def _symbol_profile(symbol: str, cfg: dict | None = None) -> dict:
+    base = dict(SYMBOL_EXECUTION_PROFILES.get(str(symbol), SYMBOL_EXECUTION_PROFILES["BTCUSDm"]))
+    trading_cfg = (cfg or {}).get("trading", {}) if isinstance(cfg, dict) else {}
+    symbol_profiles = trading_cfg.get("symbol_profiles", {}) or {}
+    raw = symbol_profiles.get(str(symbol), {}) if isinstance(symbol_profiles, dict) else {}
+    if isinstance(raw, dict):
+        if "ppo_weight" in raw:
+            base["ppo_weight"] = float(raw["ppo_weight"])
+        if "dreamer_weight" in raw:
+            base["dreamer_weight"] = float(raw["dreamer_weight"])
+        if "agi_context_weight" in raw:
+            base["agi_weight"] = float(raw["agi_context_weight"])
+        if "min_actionable_exposure" in raw:
+            base["min_trade_threshold"] = float(raw["min_actionable_exposure"])
+        if "max_policy_exposure" in raw:
+            base["max_abs_target"] = float(raw["max_policy_exposure"])
+        if "min_trade_interval_sec" in raw:
+            base["cooldown_sec"] = int(raw["min_trade_interval_sec"])
+    return base
+
+
+def _blend_symbol_decision(
+    symbol: str,
+    agi_meta: dict | None,
+    ppo_meta: dict | None,
+    dreamer_meta: dict | None,
+    cfg: dict | None = None,
+) -> dict:
+    profile = _symbol_profile(symbol, cfg=cfg)
+
+    ppo_target = float((ppo_meta or {}).get("target", 0.0) or 0.0)
+    dreamer_target = float((dreamer_meta or {}).get("target", 0.0) or 0.0)
+
+    agi_conf = float((agi_meta or {}).get("confidence", 0.0) or 0.0)
+    agi_risk = float((agi_meta or {}).get("risk_scalar", 1.0) or 1.0)
+    agi_bias = float((agi_meta or {}).get("trend_bias", 0.0) or 0.0)
+
+    # Redistribute weights from absent models to AGI so the 150-feature
+    # LSTM signal can drive real decisions before a PPO champion is promoted.
+    # When both PPO and Dreamer are present, weights are used as configured.
+    ppo_w = float(profile["ppo_weight"]) if ppo_meta is not None else 0.0
+    dreamer_w = float(profile["dreamer_weight"]) if dreamer_meta is not None else 0.0
+    agi_w = max(float(profile["agi_weight"]), 1.0 - ppo_w - dreamer_w)
+
+    raw = ppo_w * ppo_target + dreamer_w * dreamer_target + agi_w * agi_bias
+
+    adjusted = raw * agi_risk
+    adjusted = _clip(adjusted, -float(profile["max_abs_target"]), float(profile["max_abs_target"]))
+
+    if abs(adjusted) < float(profile["min_trade_threshold"]):
+        adjusted = 0.0
+
+    return {
+        "target": adjusted,
+        "raw_target": raw,
+        "agi_confidence": agi_conf,
+        "agi_risk_scalar": agi_risk,
+        "ppo_target": ppo_target,
+        "dreamer_target": dreamer_target,
+        "agi_bias": agi_bias,
+        "agi_direction": str((agi_meta or {}).get("direction", (agi_meta or {}).get("signal", "HOLD")) or "HOLD"),
+        "agi_feature_version": str((agi_meta or {}).get("feature_version", "unknown") or "unknown"),
+        "ppo_weight_used": round(ppo_w, 3),
+        "dreamer_weight_used": round(dreamer_w, 3),
+        "agi_weight_used": round(agi_w, 3),
+        "profile": profile,
+    }
+
+
+def _low_volatility_memory_base(trade_memory: dict | None) -> float:
+    memory = trade_memory or {}
+    min_trades = int(os.environ.get("AGI_LOW_VOL_MIN_TRADES", "20") or 20)
+    min_profit_factor = float(os.environ.get("AGI_LOW_VOL_MIN_PROFIT_FACTOR", "1.15") or 1.15)
+    min_expectancy = float(os.environ.get("AGI_LOW_VOL_MIN_EXPECTANCY", "0.0") or 0.0)
+    max_recent_loss_streak = int(os.environ.get("AGI_LOW_VOL_MAX_RECENT_LOSS_STREAK", "3") or 3)
+
+    trades = int(memory.get("trades", 0) or 0)
+    profit_factor = float(memory.get("profit_factor", 0.0) or 0.0)
+    expectancy = float(memory.get("expectancy", 0.0) or 0.0)
+    recent_loss_streak = int(memory.get("recent_loss_streak", 0) or 0)
+
+    if trades < min_trades:
+        return 0.0
+    if profit_factor < min_profit_factor:
+        return 0.0
+    if expectancy < min_expectancy:
+        return 0.0
+    if recent_loss_streak > max_recent_loss_streak:
+        return 0.0
+    return 1.0
+
+
+def _fetch_symbol_df(symbol: str, timeframe, bars=220):
+    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, bars)
+    if rates is None or len(rates) < 80:
         return None
 
-    def _trailing_stop_loop(self):
-        """Background thread: manage trailing stops, breakeven, and partial closes via OrderManager."""
-        logger.info(f"Order management loop started (every {self._trail_interval}s)")
-        time.sleep(30)  # Let positions settle before first check
-        while True:
-            try:
-                results = self.order_manager.manage_all_positions()
-                for r in results:
-                    if r.success:
-                        logger.info(
-                            f"OrderManager: {r.action} on {r.ticket} "
-                            f"SL={r.old_sl:.5f}->{r.new_sl:.5f}"
-                            + (f" closed={r.volume_closed:.2f}" if r.volume_closed else "")
-                        )
-            except Exception as e:
-                logger.warning(f"Order management loop error: {e}")
-            time.sleep(self._trail_interval)
+    df = pd.DataFrame(rates)
+    if df.empty:
+        return None
 
-    def _auto_trade_loop(self):
-        """Background thread: scan ALL symbols each cycle for parallel lane-based trading."""
-        logger.info(f"Auto-trade loop started (every {self._trade_interval}s, symbols={self.symbols})")
-        # Initial delay to let models load
-        time.sleep(15)
-        _last_armed_log = 0
-        while True:
-            # In live mode, refuse to trade unless explicitly armed
-            if self.live and not self.live_armed:
-                now = time.time()
-                if now - _last_armed_log > 60:
-                    logger.warning("Live mode active but NOT ARMED — skipping trades. Send 'arm_live' action to enable.")
-                    _last_armed_log = now
-                time.sleep(self._trade_interval)
-                continue
-            for symbol in self.symbols:
-                try:
-                    # EventGuard check — block trades during event windows
-                    gate = self.event_guard.check(
-                        symbol, exposure=0.0, lots=0.0,
-                        mt5_executor=self.executor if self.live else None
-                    )
-                    if not gate.allowed:
-                        logger.info(f"EVENT-GUARD blocked {symbol}: {gate.reason}")
-                        cache_decision(symbol, {"action": "HOLD", "reason": f"event_guard: {gate.reason}"})
-                        continue
+    df["time"] = pd.to_datetime(df["time"], unit="s")
+    df = df.rename(columns={"tick_volume": "volume"})
+    keep = ["time", "open", "high", "low", "close", "volume"]
+    for k in keep:
+        if k not in df.columns:
+            return None
 
-                    # Flatten positions before major events if configured
-                    if self.event_guard.should_flatten(symbol) and self.live:
-                        logger.info(f"EVENT-GUARD flattening {symbol} positions")
-                        try:
-                            self.executor.close_all_positions(symbol)
-                        except Exception as e:
-                            logger.warning(f"EVENT-GUARD flatten error for {symbol}: {e}")
+    out = df[keep].copy()
+    out["symbol"] = symbol
+    return out
 
-                    result = self._handle_trade(symbol)
-                    action = result.get("action", "UNKNOWN") if result else "ERROR"
-                    reason = result.get("reason", "") if result else ""
-                    exposure = result.get("exposure", 0.0) if result else 0.0
-                    logger.info(f"AUTO-TRADE {symbol}: {action} | exposure={exposure:.4f} | {reason}")
 
-                    # Apply EventGuard size multipliers to the decision
-                    if result and action in ("BUY", "SELL") and gate.exposure_mult != 1.0:
-                        result["exposure"] = result.get("exposure", 0.0) * gate.exposure_mult
-                        logger.info(f"EVENT-GUARD size adjustment for {symbol}: "
-                                    f"exposure x{gate.exposure_mult} (phase={gate.phase})")
-                except Exception as e:
-                    logger.warning(f"Auto-trade error for {symbol}: {e}")
-            time.sleep(self._trade_interval)
+def _account_snapshot():
+    info = mt5.account_info()
+    positions = mt5.positions_get() or []
+    floating = sum(float(getattr(p, "profit", 0.0)) for p in positions)
 
-    def _position_review_loop(self):
-        """Background thread: every 5 minutes, evaluate all open positions against PPO.
-        If PPO now says opposite direction or HOLD for a position's symbol, close it.
-        This ensures positions are always aligned with current model signals.
-        """
-        logger.info(f"Position review loop started (every {self._review_interval}s)")
-        time.sleep(60)  # Wait for initial data load
+    pnl_today = 0.0
+    try:
+        now_utc = _utc_now()
+        day_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+        deals = mt5.history_deals_get(day_start, now_utc)
+        for d in deals or []:
+            if int(getattr(d, "entry", -1)) == int(mt5.DEAL_ENTRY_OUT):
+                pnl_today += float(getattr(d, "profit", 0.0) + getattr(d, "commission", 0.0) + getattr(d, "swap", 0.0))
+    except Exception:
+        pass
 
-        while True:
-            try:
-                if not self.live or _mt5 is None:
-                    time.sleep(self._review_interval)
-                    continue
+    return {
+        "balance": None if info is None else float(info.balance),
+        "equity": None if info is None else float(info.equity),
+        "free_margin": None if info is None else float(info.margin_free),
+        "pnl_today": float(pnl_today),
+        "floating": float(floating),
+        "open_positions": len(positions),
+    }
 
-                if not _mt5.initialize():
-                    time.sleep(self._review_interval)
-                    continue
 
-                try:
-                    positions = _mt5.positions_get()
-                    if not positions:
-                        _mt5.shutdown()
-                        time.sleep(self._review_interval)
-                        continue
+def _expected_usd(symbol: str, side: str, entry: float, tp: float, sl: float, lots: float):
+    try:
+        info = mt5.symbol_info(symbol)
+        tick_size = float(getattr(info, "trade_tick_size", 0.0) or 0.0)
+        tick_value = float(getattr(info, "trade_tick_value", 0.0) or 0.0)
+        if tick_size <= 0 or tick_value <= 0:
+            return None, None
+        usd_per_price = tick_value / tick_size
+        if str(side).upper() == "BUY":
+            tp_outcome = (float(tp) - float(entry)) * usd_per_price * float(lots)
+            sl_outcome = (float(sl) - float(entry)) * usd_per_price * float(lots)
+        else:
+            tp_outcome = (float(entry) - float(tp)) * usd_per_price * float(lots)
+            sl_outcome = (float(entry) - float(sl)) * usd_per_price * float(lots)
+        return tp_outcome, sl_outcome
+    except Exception:
+        return None, None
 
-                    # Group positions by symbol
-                    by_symbol = {}
-                    for p in positions:
-                        if p.symbol not in by_symbol:
-                            by_symbol[p.symbol] = []
-                        by_symbol[p.symbol].append(p)
 
-                    for symbol, sym_positions in by_symbol.items():
-                        try:
-                            # Get PPO prediction for this symbol
-                            df = fetch_training_data(symbol, period="5d", interval="5m")
-                            if df is None or df.empty or len(df) < 100:
-                                continue
+def _tick_spread_bps(symbol: str) -> float | None:
+    try:
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            return None
+        bid = float(getattr(tick, "bid", 0.0) or 0.0)
+        ask = float(getattr(tick, "ask", 0.0) or 0.0)
+        mid = (bid + ask) * 0.5
+        if bid <= 0.0 or ask <= 0.0 or mid <= 0.0:
+            return None
+        return float(((ask - bid) / mid) * 10000.0)
+    except Exception:
+        return None
 
-                            decision = self.brain.decide(symbol, df)
-                            if decision is None:
-                                continue
 
-                            ppo_action = decision.get("action", "HOLD")
-                            ppo_exposure = decision.get("exposure", 0.0)
+def _position_exposure_state(symbol: str, max_lots: float) -> tuple[float, float, int, int]:
+    positions = mt5.positions_get() or []
+    symbol_positions = [p for p in positions if str(getattr(p, "symbol", "")) == str(symbol)]
+    current_symbol_exposure = 0.0
+    total_exposure = 0.0
+    for pos in positions:
+        volume = float(getattr(pos, "volume", 0.0) or 0.0)
+        side = -1.0 if int(getattr(pos, "type", 0)) == int(mt5.ORDER_TYPE_SELL) else 1.0
+        exp = side * (volume / max(max_lots, 1e-8))
+        total_exposure += abs(exp)
+        if str(getattr(pos, "symbol", "")) == str(symbol):
+            current_symbol_exposure += exp
+    return float(current_symbol_exposure), float(total_exposure), len(symbol_positions), len(positions)
 
-                            for p in sym_positions:
-                                pos_side = "BUY" if p.type == 0 else "SELL"
-                                pos_pnl = float(p.profit) if hasattr(p, 'profit') else 0.0
 
-                                should_close = False
-                                close_reason = ""
+def _scan_trade_events(alerter, risk, known_open_tickets, seen_closed_deals, last_deal_check):
+    now_utc = _utc_now()
+    closed_events = []
 
-                                # Close if PPO says opposite direction
-                                if ppo_action == "BUY" and pos_side == "SELL":
-                                    should_close = True
-                                    close_reason = f"PPO flipped to BUY (short losing ${pos_pnl:.2f})"
-                                elif ppo_action == "SELL" and pos_side == "BUY":
-                                    should_close = True
-                                    close_reason = f"PPO flipped to SELL (long losing ${pos_pnl:.2f})"
+    positions = mt5.positions_get() or []
+    current_open = {int(p.ticket): p for p in positions}
+    current_tickets = set(current_open.keys())
 
-                                # Close losing positions if PPO says HOLD
-                                elif ppo_action == "HOLD" and pos_pnl < 0:
-                                    should_close = True
-                                    close_reason = f"PPO says HOLD (position losing ${pos_pnl:.2f})"
+    new_tickets = sorted(current_tickets - known_open_tickets)
+    for ticket in new_tickets:
+        p = current_open[ticket]
+        side = "BUY" if int(getattr(p, "type", 0)) == int(mt5.ORDER_TYPE_BUY) else "SELL"
+        payload = {
+            "ticket": ticket,
+            "symbol": str(getattr(p, "symbol", "?")),
+            "side": side,
+            "volume": float(getattr(p, "volume", 0.0)),
+            "open_price": float(getattr(p, "price_open", 0.0)),
+            "sl": float(getattr(p, "sl", 0.0) or 0.0),
+            "tp": float(getattr(p, "tp", 0.0) or 0.0),
+        }
+        _append_trade_event("trade_open", payload)
 
-                                if should_close:
-                                    logger.info(
-                                        f"POSITION REVIEW: closing {symbol} #{p.ticket} "
-                                        f"{pos_side} {p.volume:.2f}lots — {close_reason}"
-                                    )
-                                    # Close the position
-                                    close_type = _mt5.ORDER_TYPE_BUY if p.type == 1 else _mt5.ORDER_TYPE_SELL
-                                    tick = _mt5.symbol_info_tick(symbol)
-                                    if tick:
-                                        close_price = tick.bid if p.type == 0 else tick.ask
-                                        request = {
-                                            "action": _mt5.TRADE_ACTION_DEAL,
-                                            "symbol": symbol,
-                                            "volume": p.volume,
-                                            "type": close_type,
-                                            "position": p.ticket,
-                                            "price": close_price,
-                                            "comment": "PPO_REVIEW",
-                                        }
-                                        result = _mt5.order_send(request)
-                                        if result.retcode == _mt5.TRADE_RETCODE_DONE:
-                                            logger.success(
-                                                f"POSITION REVIEW CLOSED: {symbol} #{p.ticket} "
-                                                f"PnL=${pos_pnl:.2f} — {close_reason}"
-                                            )
-                                            try:
-                                                self.telegram.trade(
-                                                    symbol=symbol,
-                                                    action=f"REVIEW_CLOSE_{pos_side}",
-                                                    exposure=0,
-                                                    confidence=0,
-                                                    balance=getattr(self.risk, "_mt5_balance", 0) or 0,
-                                                    equity=getattr(self.risk, "_current_equity", 0) or 0,
-                                                    free_margin=getattr(self.risk, "_mt5_free_margin", 0) or 0,
-                                                    tag=close_reason,
-                                                )
-                                            except Exception:
-                                                pass
-                                        else:
-                                            logger.warning(
-                                                f"POSITION REVIEW close failed: {symbol} #{p.ticket} "
-                                                f"retcode={result.retcode}"
-                                            )
-                        except Exception as e:
-                            logger.warning(f"Position review error for {symbol}: {e}")
+        snap = _account_snapshot()
+        alerter.trade(
+            symbol=payload["symbol"],
+            action=side,
+            exposure=payload["volume"],
+            confidence=1.0,
+            balance=0.0 if snap["balance"] is None else snap["balance"],
+            equity=0.0 if snap["equity"] is None else snap["equity"],
+            free_margin=0.0 if snap["free_margin"] is None else snap["free_margin"],
+        )
 
-                finally:
-                    _mt5.shutdown()
+    removed_tickets = sorted(known_open_tickets - current_tickets)
+    for ticket in removed_tickets:
+        _append_trade_event("position_removed", {"ticket": ticket})
 
-            except Exception as e:
-                logger.warning(f"Position review loop error: {e}")
+    try:
+        deals = mt5.history_deals_get(last_deal_check, now_utc) or []
+    except Exception:
+        deals = []
 
-            time.sleep(self._review_interval)
-
-    def run_socket_server(self):
-        """Run the TCP socket server for n8n bridge communication."""
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind((self.host, self.port))
-        server.listen(5)
-        server.settimeout(1.0)  # Allow periodic checking
-        logger.success(f"Socket server listening on {self.host}:{self.port}")
-
-        while True:
-            try:
-                conn, addr = server.accept()
-                threading.Thread(target=self._handle_connection, args=(conn, addr), daemon=True).start()
-            except socket.timeout:
-                continue
-            except Exception as e:
-                logger.error(f"Socket server error: {e}")
-                time.sleep(1)
-
-    def _handle_connection(self, conn, addr):
+    for d in deals:
         try:
-            data = b""
-            while b"\n" not in data:
-                chunk = conn.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
+            if int(getattr(d, "entry", -1)) != int(mt5.DEAL_ENTRY_OUT):
+                continue
+            deal_id = int(getattr(d, "deal", 0))
+            if deal_id <= 0 or deal_id in seen_closed_deals:
+                continue
+            seen_closed_deals.add(deal_id)
 
-            raw = data.decode("utf-8", errors="replace").strip()
-            if not raw:
-                return
-
-            request = json.loads(raw.split("\n")[0])
-            response = self.handle_command(request)
-            conn.sendall((json.dumps(response) + "\n").encode("utf-8"))
-
-        except Exception as e:
-            error_resp = json.dumps({"error": str(e), "action": "ERROR"}) + "\n"
+            pnl = float(getattr(d, "profit", 0.0) + getattr(d, "commission", 0.0) + getattr(d, "swap", 0.0))
+            payload = {
+                "deal_id": deal_id,
+                "ticket": int(getattr(d, "position_id", 0) or 0),
+                "symbol": str(getattr(d, "symbol", "?")),
+                "volume": float(getattr(d, "volume", 0.0)),
+                "price": float(getattr(d, "price", 0.0)),
+                "profit": pnl,
+                "comment": str(getattr(d, "comment", "")),
+            }
+            _append_trade_event("trade_closed", payload)
+            closed_events.append(payload)
             try:
-                conn.sendall(error_resp.encode("utf-8"))
+                risk.record_trade_result(payload["symbol"], pnl)
             except Exception:
                 pass
-        finally:
-            conn.close()
+            alerter.trade_closed(
+                symbol=payload["symbol"],
+                ticket=payload["ticket"],
+                pnl=pnl,
+                volume=payload["volume"],
+                price=payload["price"],
+                reason=payload.get("comment"),
+                deal_id=deal_id,
+            )
+        except Exception:
+            continue
+
+    if len(seen_closed_deals) > 20000:
+        seen_closed_deals = set(sorted(seen_closed_deals)[-10000:])
+
+    return current_tickets, seen_closed_deals, now_utc - datetime.timedelta(seconds=3), closed_events
 
 
 def main(live=False):
-    server = AGIServer(live=live)
+    if not _acquire_single_instance_lock():
+        raise RuntimeError("Server_AGI is already running (lock file exists)")
 
-    # Start HTTP API server for React dashboard (port 8088)
-    start_api_server(server)
+    if live:
+        os.environ["AGI_IS_LIVE"] = "1"
 
-    # Start socket server in background
-    socket_thread = threading.Thread(target=server.run_socket_server, daemon=True)
-    socket_thread.start()
+    cfg = _load_cfg(live=live)
+    ok = _init_mt5(cfg)
+    if not ok:
+        raise RuntimeError(f"MT5 init failed: {mt5.last_error()}")
 
-    # Optionally start autonomy loop
-    try:
-        from Python.autonomy_loop import AutonomyLoop
-        autonomy = AutonomyLoop(server)
-        server.autonomy = autonomy  # Wire for API control actions
+    runtime = _load_runtime_components()
+    risk = runtime["RiskEngine"]()
+    supervisor = runtime["RiskSupervisor"](cfg)
+    executor = runtime["MT5Executor"](risk)
+    brain = runtime["HybridBrain"](risk, executor)
+    agi = runtime["SmartAGI"]()
 
-        async def run_autonomy():
-            await autonomy.start()
+    trading_cfg = cfg.get("trading", {})
+    symbols = resolve_trading_symbols(cfg, env_keys=("AGI_RUNTIME_SYMBOLS",), fallback=DEFAULT_TRADING_SYMBOLS)
+    timeframe = _to_mt5_timeframe(trading_cfg.get("timeframe", "M5"))
+    max_lots = float(cfg.get("risk", {}).get("max_lots", 1.0))
 
-        logger.info("Starting AutonomyLoop...")
-        asyncio.run(run_autonomy())
+    token, chat_id = _load_telegram_cfg(cfg)
+    alerter = runtime["TelegramAlerter"](token, chat_id)
+    event_intel = runtime["EventIntel"](cfg, LOG_DIR)
 
-    except KeyboardInterrupt:
-        logger.info("Server shutting down...")
-    except Exception as e:
-        logger.error(f"Autonomy loop error: {e}")
-        # Fall back to simple heartbeat loop
-        logger.info("Running in simple heartbeat mode...")
-        while True:
-            uptime = int(time.time() - server.start_time)
-            logger.debug(f"Heartbeat: uptime={uptime}s trades={server.risk.daily_trades}")
-            time.sleep(120)
+    alerter.online("Trading engine initialized")
+
+    def _notify_offline():
+        try:
+            snap = _account_snapshot()
+            alerter.offline(
+                f"Balance={0.0 if snap['balance'] is None else snap['balance']:.2f} | "
+                f"Equity={0.0 if snap['equity'] is None else snap['equity']:.2f} | "
+                f"Open={int(snap['open_positions'])}"
+            )
+        except Exception:
+            alerter.offline("Runtime exited")
+
+    atexit.register(_notify_offline)
+
+    known_open_tickets = set()
+    seen_closed_deals = set()
+    last_deal_check = _utc_now() - datetime.timedelta(minutes=30)
+
+    start_time = time.time()
+    heartbeat_sec = int(os.environ.get("AGI_HEARTBEAT_SEC", "600"))
+    symbol_card_sec = int(os.environ.get("AGI_SYMBOL_CARD_SEC", "90"))
+    learning_sec = int(os.environ.get("AGI_TRADE_LEARN_SEC", "600"))
+    loop_sleep_sec = int(os.environ.get("AGI_LOOP_SEC", "20"))
+    last_heartbeat = 0.0
+    last_symbol_cards = 0.0
+    last_learning = 0.0
+    last_models = {"champion": None, "canary": None}
+    last_owner_issue_key = None
+    last_owner_issue_time = 0.0
+    last_daily_profit_date = None
+    last_symbol_state = {str(s): {} for s in symbols}
+    last_closed_by_symbol = {}
+    trade_learning_by_symbol = {}
+
+    while True:
+        now = time.time()
+
+        if now - last_heartbeat >= max(15, heartbeat_sec):
+            uptime = int(now - start_time)
+            acc = mt5.account_info()
+            if acc:
+                risk.update_equity(float(acc.equity))
+
+            snap = _account_snapshot()
+            tr_state = _training_state()
+            models = _read_active_models()
+            event_state = {}
+            try:
+                p = os.path.join(LOG_DIR, "event_intel_state.json")
+                if os.path.exists(p):
+                    with open(p, "r", encoding="utf-8") as f:
+                        event_state = json.load(f)
+            except Exception:
+                event_state = {}
+            alerter.heartbeat_full(
+                uptime=str(uptime) + " sec",
+                mt5_connected=(mt5.terminal_info() is not None),
+                trading_enabled=not risk.halt,
+                snapshot=snap,
+                training=tr_state,
+                models=models,
+                event_intel=event_state,
+            )
+            alerter.snapshot(
+                balance=0.0 if snap["balance"] is None else snap["balance"],
+                equity=0.0 if snap["equity"] is None else snap["equity"],
+                pnl_today=snap["pnl_today"],
+                floating=snap["floating"],
+                open_positions=snap["open_positions"],
+            )
+            _append_audit("snapshot", snap)
+            if models.get("champion") != last_models.get("champion"):
+                alerter.model(f"Champion changed: {models.get('champion') or 'none'}")
+            if models.get("canary") != last_models.get("canary"):
+                alerter.model(f"Canary changed: {models.get('canary') or 'none'}")
+            last_models = models
+            owner_health = _runtime_owner_health()
+            _append_audit("runtime_owner_health", owner_health)
+            if not owner_health.get("ok", True):
+                issue_key = json.dumps(owner_health.get("issues", []), sort_keys=True, ensure_ascii=True)
+                if issue_key != last_owner_issue_key or (now - last_owner_issue_time) > 1800:
+                    lines = []
+                    for it in owner_health.get("issues", []):
+                        lines.append(
+                            f"{it.get('role')}: {it.get('type')} | roots={it.get('root_pids')} | exe={it.get('exe_paths')}"
+                        )
+                    alerter.alert("RUNTIME OWNERSHIP WARNING\n" + "\n".join(lines))
+                    last_owner_issue_key = issue_key
+                    last_owner_issue_time = now
+            last_heartbeat = now
+
+        # Observe-only event intelligence (calendar/news/websocket).
+        try:
+            event_state = event_intel.tick(symbols)
+            _append_audit("event_intel", event_state.get("summary", {}))
+            for msg in event_intel.pop_alerts():
+                alerter.alert(msg)
+        except Exception as e:
+            logger.warning(f"event_intel tick failed: {e}")
+
+        if now - last_learning >= max(120, learning_sec):
+            try:
+                learn = runtime["build_trade_learning"](
+                    log_dir=LOG_DIR,
+                    out_dir=os.path.join(LOG_DIR, "learning"),
+                    lookback_days=int(os.environ.get("AGI_TRADE_LEARN_DAYS", "30")),
+                )
+                _append_audit(
+                    "trade_learning",
+                    {
+                        "trades": int(learn.get("trades", 0)),
+                        "win_rate": float(learn.get("win_rate", 0.0)),
+                        "expectancy": float(learn.get("expectancy", 0.0)),
+                        "profit_factor": float(learn.get("profit_factor", 0.0)),
+                        "total_pnl": float(learn.get("total_pnl", 0.0)),
+                    },
+                )
+                try:
+                    day = _utc_now().date().isoformat()
+                    daily_hour = int(os.environ.get("AGI_DAILY_PROFIT_HOUR_UTC", "0"))
+                    if _utc_now().hour >= max(0, min(23, daily_hour)) and day != last_daily_profit_date:
+                        alerter.profitability_daily(learn)
+                        last_daily_profit_date = day
+                except Exception:
+                    pass
+                trade_learning_by_symbol = {
+                    str((row or {}).get("symbol", "")): dict(row or {})
+                    for row in (learn.get("by_symbol", []) if isinstance(learn, dict) else [])
+                    if isinstance(row, dict) and row.get("symbol")
+                }
+            except Exception as e:
+                logger.warning(f"trade learning update failed: {e}")
+            last_learning = now
+
+        for symbol in symbols:
+            try:
+                df = _fetch_symbol_df(symbol, timeframe)
+                if df is None or df.empty:
+                    continue
+
+                agi_meta = agi.predict(df, production=True)
+                conf = float((agi_meta or {}).get("confidence", 0.0) or 0.0)
+                regime = str((agi_meta or {}).get("regime", (agi_meta or {}).get("signal", "UNKNOWN")))
+                trade_memory = trade_learning_by_symbol.get(str(symbol), {})
+
+                ppo_meta = brain.predict_ppo_action(symbol, df)
+                dreamer_meta = brain.predict_dreamer_action(symbol, df)
+                decision = _blend_symbol_decision(symbol, agi_meta, ppo_meta, dreamer_meta, cfg=cfg)
+                exposure = float(decision["target"])
+
+                logger.info(
+                    "DECISION %s | regime=%s conf=%.4f risk=%.4f agi_bias=%.4f ppo=%.4f dreamer=%.4f raw=%.4f final=%.4f"
+                    % (
+                        symbol,
+                        regime,
+                        float((agi_meta or {}).get("confidence", 0.0) or 0.0),
+                        float((agi_meta or {}).get("risk_scalar", 1.0) or 1.0),
+                        float((agi_meta or {}).get("trend_bias", 0.0) or 0.0),
+                        float((ppo_meta or {}).get("target", 0.0) or 0.0),
+                        float((dreamer_meta or {}).get("target", 0.0) or 0.0),
+                        float(decision["raw_target"]),
+                        float(decision["target"]),
+                    )
+                )
+                _append_audit(
+                    "signal",
+                    {
+                        "symbol": symbol,
+                        "regime": regime,
+                        "confidence": conf,
+                        "risk_scalar": float((agi_meta or {}).get("risk_scalar", 1.0) or 1.0),
+                        "agi_bias": float((agi_meta or {}).get("trend_bias", 0.0) or 0.0),
+                        "ppo_exposure": float((ppo_meta or {}).get("target", 0.0) or 0.0),
+                        "dreamer_exposure": float((dreamer_meta or {}).get("target", 0.0) or 0.0),
+                        "raw_target": float(decision["raw_target"]),
+                        "exposure": float(exposure),
+                        "decision_profile": dict(decision["profile"]),
+                        "trade_memory": {
+                            "trades": int(trade_memory.get("trades", 0) or 0),
+                            "expectancy": float(trade_memory.get("expectancy", 0.0) or 0.0),
+                            "profit_factor": float(trade_memory.get("profit_factor", 0.0) or 0.0),
+                            "recent_loss_streak": int(trade_memory.get("recent_loss_streak", 0) or 0),
+                        },
+                    },
+                )
+                sym_state = last_symbol_state.setdefault(str(symbol), {})
+                sym_state["signal"] = regime
+                sym_state["regime"] = regime
+                sym_state["confidence"] = conf
+                sym_state["risk_scalar"] = float((agi_meta or {}).get("risk_scalar", 1.0) or 1.0)
+                sym_state["trend_bias"] = float((agi_meta or {}).get("trend_bias", 0.0) or 0.0)
+                sym_state["ppo_exposure"] = float((ppo_meta or {}).get("target", 0.0) or 0.0)
+                sym_state["dreamer_exposure"] = float((dreamer_meta or {}).get("target", 0.0) or 0.0)
+                sym_state["raw_target"] = float(decision["raw_target"])
+                sym_state["blend_exposure"] = float(exposure)
+
+                action_meta = ppo_meta or brain.get_last_action_meta(symbol=symbol)
+                current_symbol_exposure, total_exposure, symbol_positions, total_positions = _position_exposure_state(
+                    symbol, max_lots
+                )
+                supervisor_decision = supervisor.allow_trade(
+                    symbol=symbol,
+                    target_exposure=float(exposure),
+                    confidence=conf,
+                    spread_bps=_tick_spread_bps(symbol),
+                    snapshot=snap,
+                    symbol_positions=symbol_positions,
+                    total_positions=total_positions,
+                    current_symbol_exposure=current_symbol_exposure,
+                    total_exposure=total_exposure,
+                    drawdown_pct=float(risk.current_dd),
+                )
+                sym_state["risk_supervisor"] = {
+                    "allowed": bool(supervisor_decision.allowed),
+                    "reason": supervisor_decision.reason,
+                    "current_symbol_exposure": float(current_symbol_exposure),
+                    "total_exposure": float(total_exposure),
+                }
+                if supervisor_decision.allowed:
+                    order_meta = brain.live_trade(
+                        symbol,
+                        exposure,
+                        max_lots,
+                        action_meta=action_meta,
+                        execution_context={
+                            "regime": regime,
+                            "confidence": conf,
+                            "target_exposure": float(exposure),
+                            "raw_target": float(decision["raw_target"]),
+                            "ppo_target": float((ppo_meta or {}).get("target", 0.0) or 0.0),
+                            "dreamer_target": float((dreamer_meta or {}).get("target", 0.0) or 0.0),
+                            "agi_bias": float((agi_meta or {}).get("trend_bias", 0.0) or 0.0),
+                            "agi_risk_scalar": float((agi_meta or {}).get("risk_scalar", 1.0) or 1.0),
+                        },
+                    )
+                    if order_meta:
+                        supervisor.mark_trade(symbol)
+                else:
+                    order_meta = None
+                    _append_audit(
+                        "risk_supervisor_block",
+                        {
+                            "symbol": symbol,
+                            "target_exposure": float(exposure),
+                            "reason": supervisor_decision.reason,
+                            "confidence": conf,
+                            "signal": regime,
+                        },
+                    )
+                executor.manage_open_positions(symbol)
+                if order_meta:
+                    tp_outcome_usd, sl_outcome_usd = _expected_usd(
+                        symbol=symbol,
+                        side=str(order_meta.get("order_type", "BUY")),
+                        entry=float(order_meta.get("entry_price", 0.0) or 0.0),
+                        tp=float(order_meta.get("tp_price", 0.0) or 0.0),
+                        sl=float(order_meta.get("sl_price", 0.0) or 0.0),
+                        lots=float(order_meta.get("volume_lots", 0.0) or 0.0),
+                    )
+                    if tp_outcome_usd is not None:
+                        order_meta["tp_outcome_usd"] = float(tp_outcome_usd)
+                        order_meta["expected_profit_usd"] = float(tp_outcome_usd)
+                    if sl_outcome_usd is not None:
+                        order_meta["sl_outcome_usd"] = float(sl_outcome_usd)
+                        order_meta["expected_loss_usd"] = float(sl_outcome_usd)
+                    _append_audit("trade_action", dict(order_meta))
+                    logger.info(
+                        "ACTION %s | req=%s side=%s volume=%s target=%.4f ppo=%.4f dreamer=%.4f agi=%.4f magic=%s comment=%s ticket=%s retcode=%s TP=%s SL=%s"
+                        % (
+                            symbol,
+                            order_meta.get("request_action"),
+                            order_meta.get("order_type"),
+                            order_meta.get("executed_lots", order_meta.get("volume_lots")),
+                            float(order_meta.get("target_exposure", order_meta.get("exposure", 0.0)) or 0.0),
+                            float(order_meta.get("ppo_target", 0.0) or 0.0),
+                            float(order_meta.get("dreamer_target", 0.0) or 0.0),
+                            float(order_meta.get("agi_bias", 0.0) or 0.0),
+                            order_meta.get("magic"),
+                            order_meta.get("comment"),
+                            order_meta.get("ticket"),
+                            order_meta.get("retcode"),
+                            order_meta.get("tp_price"),
+                            order_meta.get("sl_price"),
+                        )
+                    )
+                    alerter.trade_action(symbol, order_meta)
+
+                acc = mt5.account_info()
+                if acc:
+                    risk.update_equity(float(acc.equity))
+            except Exception as exc:
+                risk.record_error()
+                alerter.alert(f"Execution loop error on {symbol}: {exc}")
+                logger.exception(f"Execution loop error on {symbol}: {exc}")
+
+        known_open_tickets, seen_closed_deals, last_deal_check, closed_events = _scan_trade_events(
+            alerter,
+            risk,
+            known_open_tickets,
+            seen_closed_deals,
+            last_deal_check,
+        )
+        for c in closed_events:
+            try:
+                last_closed_by_symbol[str(c.get("symbol", "?"))] = c
+            except Exception:
+                pass
+
+        if now - last_symbol_cards >= max(15, symbol_card_sec):
+            for symbol in symbols:
+                sym = str(symbol)
+                sstate = dict(last_symbol_state.get(sym, {}))
+                pos_rows = mt5.positions_get(symbol=sym) or []
+                sstate["open_positions"] = len(pos_rows)
+                sstate["floating_pnl"] = sum(float(getattr(p, "profit", 0.0)) for p in pos_rows)
+                if pos_rows:
+                    p0 = pos_rows[0]
+                    p_side = "BUY" if int(getattr(p0, "type", 0)) == int(mt5.ORDER_TYPE_BUY) else "SELL"
+                    p_vol = float(getattr(p0, "volume", 0.0) or 0.0)
+                    p_entry = float(getattr(p0, "price_open", 0.0) or 0.0)
+                    p_tp = float(getattr(p0, "tp", 0.0) or 0.0)
+                    p_sl = float(getattr(p0, "sl", 0.0) or 0.0)
+                    sstate["position_side"] = p_side
+                    sstate["position_volume"] = p_vol
+                    sstate["position_entry"] = p_entry
+                    sstate["position_tp"] = p_tp
+                    sstate["position_sl"] = p_sl
+                    tpv, slv = _expected_usd(sym, p_side, p_entry, p_tp, p_sl, p_vol)
+                    sstate["position_tp_value_usd"] = None if tpv is None else float(tpv)
+                    sstate["position_sl_value_usd"] = None if slv is None else float(slv)
+                else:
+                    sstate["position_side"] = None
+                    sstate["position_volume"] = None
+                    sstate["position_entry"] = None
+                    sstate["position_tp"] = None
+                    sstate["position_sl"] = None
+                    sstate["position_tp_value_usd"] = None
+                    sstate["position_sl_value_usd"] = None
+                sstate["last_closed"] = last_closed_by_symbol.get(sym)
+                alerter.symbol_status(sym, sstate)
+            last_symbol_cards = now
+
+        time.sleep(max(5, loop_sleep_sec))
 
 
 if __name__ == "__main__":
-    live_flag = "--live" in sys.argv or "--production" in sys.argv
+    import sys
+
+    live_flag = "--live" in sys.argv
     main(live=live_flag)
