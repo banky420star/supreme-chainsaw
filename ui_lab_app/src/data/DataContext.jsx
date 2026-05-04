@@ -22,7 +22,7 @@ async function fetchJSON(path, fallback = null) {
   }
 }
 
-function mapStatusToState(status, trades = [], tradeReview = null, learning = null, ppoDiag = null, lstmExpl = null, scenarios = null, perf = null, strategies = null, lanes = null, health = null, backup = null) {
+function mapStatusToState(status, trades = [], tradeReview = null, learning = null, ppoDiag = null, lstmExpl = null, scenarios = null, perf = null, strategies = null, lanes = null, health = null, backup = null, trainingMetrics = null, trainingAnalysis = null) {
   const visual = status?.training?.visual || {};
   const ppo = visual.ppo || {};
   const lstm = visual.lstm || {};
@@ -267,6 +267,8 @@ function mapStatusToState(status, trades = [], tradeReview = null, learning = nu
     backup: backup || { count: 0, auto_enabled: false, max_backups: 7 },
     reversal: status?.reversal || { enabled: true },
     speed: status?.speed || { enabled: false },
+    trainingMetrics: trainingMetrics || { per_symbol_metrics: {}, timeframe_selections: {} },
+    trainingAnalysis: trainingAnalysis || { description: null, trajectory: null, insights: [] },
     _tick: Date.now(),
   };
 }
@@ -281,7 +283,7 @@ export function DataProvider({ children, pollMs = 3000 }) {
 
   const poll = useCallback(async () => {
     try {
-      const [status, trades, tradeReview, learning, ppoDiag, lstmExpl, scenarios, perf, strategies, lanes, health, backup] = await Promise.all([
+      const [status, trades, tradeReview, learning, ppoDiag, lstmExpl, scenarios, perf, strategies, lanes, health, backup, trainingMetrics, trainingAnalysis] = await Promise.all([
         fetchJSON("/status"),
         fetchJSON("/trades?limit=30"),
         fetchJSON("/trade_review"),
@@ -294,6 +296,8 @@ export function DataProvider({ children, pollMs = 3000 }) {
         fetchJSON("/lanes"),
         fetchJSON("/health"),
         fetchJSON("/backup/status"),
+        fetchJSON("/training/metrics"),
+        fetchJSON("/training/analysis"),
       ]);
 
       if (cancelledRef.current) return;
@@ -307,7 +311,7 @@ export function DataProvider({ children, pollMs = 3000 }) {
 
       let mapped;
       try {
-        mapped = mapStatusToState(status, trades, tradeReview, learning, ppoDiag, lstmExpl, scenarios, perf, strategies, lanes, health, backup);
+        mapped = mapStatusToState(status, trades, tradeReview, learning, ppoDiag, lstmExpl, scenarios, perf, strategies, lanes, health, backup, trainingMetrics, trainingAnalysis);
       } catch (mapErr) {
         console.error("mapStatusToState error:", mapErr);
         // Build minimal state so the dashboard still renders

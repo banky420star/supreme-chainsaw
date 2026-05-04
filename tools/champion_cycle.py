@@ -163,11 +163,70 @@ def _write_cycle_report(report: dict, name: str = "champion_cycle_last_report.js
     path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
 
+def _run_symbol_simulation(symbols: list[str]) -> dict[str, str]:
+    """Run trading simulations to select best symbol/timeframe combinations.
+
+    Returns dict mapping symbol to recommended timeframe.
+    """
+    logger.info(f"Running symbol simulations for {symbols}")
+
+    try:
+        # Import simulation logic
+        sys.path.insert(0, str(PROJECT_ROOT))
+        from scripts.run_symbol_simulations import calculate_micro_account_results, generate_recommendations
+
+        all_results = []
+        timeframes = ["5m", "15m", "1h"]
+
+        for symbol in symbols:
+            for tf in timeframes:
+                result = calculate_micro_account_results(symbol, tf)
+                all_results.append(result)
+
+        recommendations = generate_recommendations(all_results)
+
+        # Get best timeframe per symbol
+        best_timeframes = {}
+        for symbol in symbols:
+            symbol_recs = [r for r in recommendations if r["symbol"] == symbol and r["recommendation"] in ("TRADE", "TEST")]
+            if symbol_recs:
+                # Sort by score
+                best = max(symbol_recs, key=lambda x: x.get("score", 0))
+                best_timeframes[symbol] = best["timeframe"]
+                logger.info(f"Simulation recommends {symbol} on {best['timeframe']}: {best['reason']}")
+
+        return best_timeframes
+    except Exception as e:
+        logger.error(f"Simulation failed: {e}")
+        return {}
+
+
 def _run_train_drl(symbol: str | None = None):
+    """Run enhanced DRL training with per-symbol metrics and multi-timeframe optimization."""
     env = os.environ.copy()
     if symbol:
         env["AGI_DRL_SYMBOL"] = symbol
-    subprocess.check_call([sys.executable, "training/train_drl.py"], cwd=PROJECT_ROOT, env=env)
+
+    # Check if enhanced training is enabled
+    enhanced_enabled = os.environ.get("AGI_ENHANCED_TRAINING", "1") == "1"
+    timeframe_opt = os.environ.get("AGI_TIMEFRAME_OPTIMIZATION", "1") == "1"
+    per_symbol_metrics = os.environ.get("AGI_PER_SYMBOL_METRICS", "1") == "1"
+
+    if enhanced_enabled:
+        # Use enhanced training script
+        cmd = [
+            sys.executable, "training/enhanced_train_drl.py",
+            "--per-symbol-metrics",
+        ]
+        if timeframe_opt:
+            cmd.append("--timeframe-opt")
+        if symbol:
+            cmd.extend(["--symbols", symbol])
+        logger.info(f"Running enhanced DRL training: {' '.join(cmd)}")
+        subprocess.check_call(cmd, cwd=PROJECT_ROOT, env=env)
+    else:
+        # Fall back to standard training
+        subprocess.check_call([sys.executable, "training/train_drl.py"], cwd=PROJECT_ROOT, env=env)
 
 
 def _run_train_lstm(symbols: list[str]):
@@ -310,6 +369,15 @@ def main():
         _run_symbol_jobs("Dreamer", dreamer_pending, cfg, lambda symbol: _run_train_dreamer_symbol(cfg, symbol))
         dreamer_trained = True
 
+    # Run symbol simulations to optimize timeframe selection
+    logger.info(f"Cycle step: running symbol simulations for {symbols}")
+    try:
+        best_timeframes = _run_symbol_simulation(symbols)
+        logger.info(f"Simulation results: {best_timeframes}")
+    except Exception as e:
+        logger.error(f"Simulation step failed: {e}")
+        best_timeframes = {}
+
     reg = ModelRegistry()
     cycle_report = {
         "mode": "per_symbol" if per_symbol else "global",
@@ -323,6 +391,7 @@ def main():
         "skip_lstm": skip_lstm,
         "skip_dreamer": skip_dreamer,
         "dreamer_trained": bool(dreamer_trained),
+        "simulation_results": best_timeframes,
     }
 
     try:

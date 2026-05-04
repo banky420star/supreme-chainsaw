@@ -1,6 +1,8 @@
 import React from "react";
-import { Activity, Brain, Sparkles, Workflow, TrendingUp, GitBranch, Cpu, Layers } from "lucide-react";
+import { Activity, Brain, Sparkles, Workflow, TrendingUp, GitBranch, Cpu, Layers, BarChart3, Clock, Award, AlertTriangle } from "lucide-react";
 import { Panel, MetricTile, ProgressBar, Gauge, JOURNEY_STEPS, PipelineStageBoard, StatRow, dollars, money, pct, shortDuration } from "../components/Common";
+import { EnhancedTrainingMetrics } from "../components/TrainingMetrics";
+import { TrainingAnalysisPanel, TrainingTradingConnection } from "../components/TrainingAnalysis";
 
 function TrainingLossChart({ data, label, colorKey }) {
   if (!data || data.length === 0) return <div className="empty-state">No loss data yet</div>;
@@ -73,6 +75,12 @@ export default function TrainingScreen({ data, selectedSymbol }) {
       <Panel title="Intelligence Pipeline" subtitle="Five-stage model authority pipeline" icon={Workflow}>
         <PipelineStageBoard data={data} activeIndex={activePhaseIndex} />
       </Panel>
+
+      {/* AI Training Analysis - What the model is learning */}
+      <TrainingAnalysisPanel data={data} />
+
+      {/* Training to Trading Connection */}
+      <TrainingTradingConnection data={data} selectedSymbol={selectedSymbol} />
 
       {/* Three Model Panels */}
       <div className="grid-3" style={{ gap: 16 }}>
@@ -220,6 +228,47 @@ export default function TrainingScreen({ data, selectedSymbol }) {
           </div>
         </div>
       </Panel>
+
+      {/* Enhanced Training Metrics - Per-Symbol Profit, Balance, Drawdown */}
+      <Panel title="Enhanced Training Metrics" subtitle="Per-symbol profit, balance, drawdown, and timeframe optimization" icon={BarChart3}>
+        <EnhancedTrainingMetrics data={data} />
+      </Panel>
+
+      {/* Timeframe Optimization Info */}
+      {training.configuredSymbols && training.configuredSymbols.length > 0 && (
+        <Panel title="Multi-Timeframe Optimization" subtitle="Automatic timeframe selection based on Sharpe, ADX, and data quality" icon={Clock}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <div style={{ padding: 12, background: "rgba(90,215,255,0.04)", borderRadius: 8, border: "1px solid rgba(90,215,255,0.1)" }}>
+              <div style={{ fontSize: "0.82rem", color: "var(--text-secondary)", lineHeight: 1.5 }}>
+                <strong>Available Timeframes:</strong> M1, M5, M15, M30, H1
+                <br />
+                <strong>Selection Criteria:</strong> Sharpe ratio × Data quality × Timeframe bonus
+                <br />
+                <em style={{ color: "var(--text-muted)", fontSize: "0.75rem" }}>
+                  Higher timeframes (H1, M30) receive bonus weight for more reliable patterns
+                </em>
+              </div>
+            </div>
+            <div className="grid-3" style={{ gap: 10 }}>
+              <div style={{ padding: 12, borderRadius: 8, background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.05)" }}>
+                <div style={{ fontSize: "0.72rem", color: "var(--text-muted)", marginBottom: 4 }}>Best For</div>
+                <div style={{ fontSize: "0.85rem", fontWeight: 600 }}>Scalping</div>
+                <div style={{ fontSize: "0.7rem", color: "var(--text-muted)" }}>M1, M5</div>
+              </div>
+              <div style={{ padding: 12, borderRadius: 8, background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.05)" }}>
+                <div style={{ fontSize: "0.72rem", color: "var(--text-muted)", marginBottom: 4 }}>Best For</div>
+                <div style={{ fontSize: "0.85rem", fontWeight: 600 }}>Intraday</div>
+                <div style={{ fontSize: "0.7rem", color: "var(--text-muted)" }}>M15, M30</div>
+              </div>
+              <div style={{ padding: 12, borderRadius: 8, background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.05)" }}>
+                <div style={{ fontSize: "0.72rem", color: "var(--text-muted)", marginBottom: 4 }}>Best For</div>
+                <div style={{ fontSize: "0.85rem", fontWeight: 600 }}>Swing</div>
+                <div style={{ fontSize: "0.7rem", color: "var(--text-muted)" }}>H1, H4</div>
+              </div>
+            </div>
+          </div>
+        </Panel>
+      )}
 
       {/* Scenarios */}
       {data?.scenarios?.regimes && Object.keys(data.scenarios.regimes).length > 0 && (

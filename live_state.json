@@ -1,42 +1,42 @@
 {
-  "timestamp": 1777926934.363443,
+  "timestamp": 1777934134.5134404,
   "registry": {
-    "champion": "C:\\Users\\Administrator\\chain_gambler\\models\\registry\\candidates\\ppo_20260416_031344",
+    "champion": null,
     "canary": null
   },
   "symbols": {
     "EURUSDm": {
-      "champion": "C:\\Users\\Administrator\\chain_gambler\\models\\registry\\per_symbol\\EURUSDm\\candidates\\ppo_20260424_141609",
+      "champion": null,
       "canary": null,
-      "canary_pnl": -15.799999999999995,
+      "canary_pnl": 0.0,
       "canary_set_time": null,
       "canary_trades": 0
     },
     "GBPUSDm": {
-      "champion": "C:\\Users\\Administrator\\chain_gambler\\models\\registry\\per_symbol\\GBPUSDm\\candidates\\ppo_20260424_184553",
+      "champion": null,
       "canary": null,
-      "canary_pnl": -51.199999999999996,
+      "canary_pnl": 0.0,
       "canary_set_time": null,
       "canary_trades": 0
     },
     "XAUUSDm": {
-      "champion": "C:\\Users\\Administrator\\chain_gambler\\models\\registry\\per_symbol\\XAUUSDm\\candidates\\ppo_20260424_184539",
+      "champion": null,
       "canary": null,
-      "canary_pnl": 0,
+      "canary_pnl": 0.0,
       "canary_set_time": null,
       "canary_trades": 0
     },
     "BTCUSDm": {
-      "champion": "C:\\Users\\Administrator\\chain_gambler\\models\\registry\\per_symbol\\BTCUSDm\\candidates\\ppo_20260424_185633",
+      "champion": null,
       "canary": null,
-      "canary_pnl": -7370.440000000001,
+      "canary_pnl": 0.0,
       "canary_set_time": null,
       "canary_trades": 0
     },
     "ETHUSDm": {
       "champion": null,
       "canary": null,
-      "canary_pnl": -11.549999999999999,
+      "canary_pnl": 0.0,
       "canary_set_time": null,
       "canary_trades": 0
     }
@@ -44,14 +44,14 @@
   "trading": {
     "account": {
       "balance": 0,
-      "equity": 3648.86,
-      "floatingPnl": -2.15,
+      "equity": 53.33,
+      "floatingPnl": -34.1,
       "realizedToday": 0.0
     },
     "risk": {
-      "drawdownPct": 0.4952250055903665,
+      "drawdownPct": 98.54568559756969,
       "canTrade": false,
-      "haltReason": ""
+      "haltReason": "max_drawdown"
     }
   },
   "training": {

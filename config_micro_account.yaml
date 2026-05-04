@@ -1,0 +1,67 @@
+# Micro Account Configuration for $54 equity
+# WARNING: Trading with <$100 is extremely high risk
+
+trading:
+  mode: LIVE
+  symbols:
+    - EURUSDm  # Lowest margin requirement
+
+  # Ultra-small position sizing
+  lot_size: 0.01
+  min_lots: 0.01
+  max_lots: 0.01  # Fixed at minimum
+
+  # Aggressive risk settings (required for small account)
+  risk_per_trade: 5.0  # 5% per trade (normally 1-2%)
+  max_positions_per_symbol: 1
+  max_total_positions: 1
+
+risk:
+  # Relaxed limits for micro account
+  max_daily_loss_pct: 20  # 20% daily loss allowed (normally 3%)
+  max_drawdown_pct: 50   # 50% max drawdown (normally 10%)
+  max_hourly_loss: 10      # $10 hourly loss
+
+  # Position sizing
+  size_cap: 0.01  # Maximum 0.01 lots
+
+  # Kill switch settings
+  halt_on_drawdown: false  # Don't halt on drawdown (account too small)
+  halt_on_daily_loss: true
+
+mt5:
+  # Your MT5 credentials
+  login: ${MT5_LOGIN}
+  password: ${MT5_PASSWORD}
+  server: ${MT5_SERVER}
+
+symbols:
+  EURUSDm:
+    # Ultra-tight settings for micro account
+    spread_max: 20  # pips
+    slippage_max: 10  # pips
+    min_actionable_exposure: 0.001  # Very small signal threshold
+
+    # Position sizing
+    lot_size: 0.01
+    min_lots: 0.01
+    max_lots: 0.01
+
+    # Tight stops for small account
+    sl_multiplier: 1.0
+    tp_multiplier: 1.0
+
+    # Trading hours
+    trading_start_hour: 0
+    trading_end_hour: 24
+
+# Disable expensive symbols
+excluded_symbols:
+  - BTCUSDm  # Too volatile for $54
+  - XAUUSDm  # Gold margin too high
+  - GBPUSDm  # Higher spreads
+
+# Logging
+logging:
+  level: INFO
+  file: logs/micro_account_trading.log

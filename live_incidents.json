@@ -1,5 +1,12 @@
 [
   {
+    "id": "LIV-0534",
+    "type": "learning",
+    "severity": "fail",
+    "timestamp": "Just now",
+    "message": "[XAUUSDm] Canary rolled back (DD: 0.988, PnL: $0.00)"
+  },
+  {
     "id": "LIV-2350",
     "type": "learning",
     "severity": "fail",
