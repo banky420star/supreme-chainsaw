@@ -1,0 +1,61 @@
+{
+  "timestamp": 1777926934.363443,
+  "registry": {
+    "champion": "C:\\Users\\Administrator\\chain_gambler\\models\\registry\\candidates\\ppo_20260416_031344",
+    "canary": null
+  },
+  "symbols": {
+    "EURUSDm": {
+      "champion": "C:\\Users\\Administrator\\chain_gambler\\models\\registry\\per_symbol\\EURUSDm\\candidates\\ppo_20260424_141609",
+      "canary": null,
+      "canary_pnl": -15.799999999999995,
+      "canary_set_time": null,
+      "canary_trades": 0
+    },
+    "GBPUSDm": {
+      "champion": "C:\\Users\\Administrator\\chain_gambler\\models\\registry\\per_symbol\\GBPUSDm\\candidates\\ppo_20260424_184553",
+      "canary": null,
+      "canary_pnl": -51.199999999999996,
+      "canary_set_time": null,
+      "canary_trades": 0
+    },
+    "XAUUSDm": {
+      "champion": "C:\\Users\\Administrator\\chain_gambler\\models\\registry\\per_symbol\\XAUUSDm\\candidates\\ppo_20260424_184539",
+      "canary": null,
+      "canary_pnl": 0,
+      "canary_set_time": null,
+      "canary_trades": 0
+    },
+    "BTCUSDm": {
+      "champion": "C:\\Users\\Administrator\\chain_gambler\\models\\registry\\per_symbol\\BTCUSDm\\candidates\\ppo_20260424_185633",
+      "canary": null,
+      "canary_pnl": -7370.440000000001,
+      "canary_set_time": null,
+      "canary_trades": 0
+    },
+    "ETHUSDm": {
+      "champion": null,
+      "canary": null,
+      "canary_pnl": -11.549999999999999,
+      "canary_set_time": null,
+      "canary_trades": 0
+    }
+  },
+  "trading": {
+    "account": {
+      "balance": 0,
+      "equity": 3648.86,
+      "floatingPnl": -2.15,
+      "realizedToday": 0.0
+    },
+    "risk": {
+      "drawdownPct": 0.4952250055903665,
+      "canTrade": false,
+      "haltReason": ""
+    }
+  },
+  "training": {
+    "active_canary": false,
+    "cycles_completed": 0
+  }
+}

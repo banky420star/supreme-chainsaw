@@ -22,7 +22,7 @@ async function fetchJSON(path, fallback = null) {
   }
 }
 
-function mapStatusToState(status, trades = [], tradeReview = null, learning = null, ppoDiag = null, lstmExpl = null, scenarios = null, perf = null, strategies = null, lanes = null) {
+function mapStatusToState(status, trades = [], tradeReview = null, learning = null, ppoDiag = null, lstmExpl = null, scenarios = null, perf = null, strategies = null, lanes = null, health = null, backup = null) {
   const visual = status?.training?.visual || {};
   const ppo = visual.ppo || {};
   const lstm = visual.lstm || {};
@@ -236,6 +236,7 @@ function mapStatusToState(status, trades = [], tradeReview = null, learning = nu
     },
     controls: {
       runtimeStatus: status?.server?.running ? "running" : "stopped",
+      botPid: status?.server?.bot_pid || null,
       processes,
       availableActions: [
         "start_lstm",
@@ -247,6 +248,8 @@ function mapStatusToState(status, trades = [], tradeReview = null, learning = nu
         "restart_server",
         "unblock",
         "arm_live",
+        "start_bot",
+        "stop_bot",
       ],
       blockedReasons: [],
       notifications: "telegram+ui",
@@ -260,6 +263,10 @@ function mapStatusToState(status, trades = [], tradeReview = null, learning = nu
     scenarios: scenarios || {},
     perf: perf || { equity_curve: [], pnl_curve: [], confidence_curve: [], lstm_loss_curve: [] },
     strategies: strategies || { strategies: [], patterns: [], meta: {} },
+    health: health || { status: "unknown", checks: {} },
+    backup: backup || { count: 0, auto_enabled: false, max_backups: 7 },
+    reversal: status?.reversal || { enabled: true },
+    speed: status?.speed || { enabled: false },
     _tick: Date.now(),
   };
 }
@@ -274,7 +281,7 @@ export function DataProvider({ children, pollMs = 3000 }) {
 
   const poll = useCallback(async () => {
     try {
-      const [status, trades, tradeReview, learning, ppoDiag, lstmExpl, scenarios, perf, strategies, lanes] = await Promise.all([
+      const [status, trades, tradeReview, learning, ppoDiag, lstmExpl, scenarios, perf, strategies, lanes, health, backup] = await Promise.all([
         fetchJSON("/status"),
         fetchJSON("/trades?limit=30"),
         fetchJSON("/trade_review"),
@@ -285,6 +292,8 @@ export function DataProvider({ children, pollMs = 3000 }) {
         fetchJSON("/perf"),
         fetchJSON("/strategies"),
         fetchJSON("/lanes"),
+        fetchJSON("/health"),
+        fetchJSON("/backup/status"),
       ]);
 
       if (cancelledRef.current) return;
@@ -298,7 +307,7 @@ export function DataProvider({ children, pollMs = 3000 }) {
 
       let mapped;
       try {
-        mapped = mapStatusToState(status, trades, tradeReview, learning, ppoDiag, lstmExpl, scenarios, perf, strategies, lanes);
+        mapped = mapStatusToState(status, trades, tradeReview, learning, ppoDiag, lstmExpl, scenarios, perf, strategies, lanes, health, backup);
       } catch (mapErr) {
         console.error("mapStatusToState error:", mapErr);
         // Build minimal state so the dashboard still renders

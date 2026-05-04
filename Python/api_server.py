@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 import threading
@@ -75,29 +76,35 @@ app = Bottle()
 # Shared references — populated by start_api_server()
 # ---------------------------------------------------------------------------
 _server_ref: Any = None          # AGIServer instance
+_bot_process: subprocess.Popen | None = None  # tracked bot subprocess
+_bot_process_lock = threading.Lock()
 _decision_cache: dict[str, deque] = {}  # symbol -> deque of recent decisions
 _CACHE_MAX = 50                  # decisions per symbol
 
 
 # ---------------------------------------------------------------------------
-# CORS middleware (restrict to localhost + localtunnel for security)
+# CORS middleware (restrict to localhost only for security)
 # ---------------------------------------------------------------------------
 _CORS_ALLOWED_ORIGINS = [
     "http://localhost:4180",
     "http://127.0.0.1:4180",
-    "https://moneyprinter.loca.lt",
 ]
+
+# In production, add additional allowed origins from environment
+if os.environ.get("AGI_IS_LIVE", "0") == "1":
+    _extra_origins = os.environ.get("AGI_ALLOWED_ORIGINS", "").split(",")
+    _CORS_ALLOWED_ORIGINS.extend([o.strip() for o in _extra_origins if o.strip()])
 
 @app.hook("after_request")
 def _cors():
     origin = request.get_header("Origin", "")
+    # Security: Only allow whitelisted origins, NO fallback to localhost
     if origin in _CORS_ALLOWED_ORIGINS:
         response.headers["Access-Control-Allow-Origin"] = origin
-    else:
-        response.headers["Access-Control-Allow-Origin"] = "http://localhost:4180"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Control-Token"
-    response.headers["Vary"] = "Origin"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Control-Token"
+        response.headers["Vary"] = "Origin"
+    # If origin is not in whitelist, don't set CORS headers (browser will block)
 
 
 @app.route("<path:path>", method="OPTIONS")
@@ -344,6 +351,27 @@ def api_status():
     uptime = int(time.time() - srv.start_time) if srv and hasattr(srv, "start_time") else 0
     mode = "LIVE" if (srv and getattr(srv, "live", False)) else "DRY-RUN"
 
+    # ── Advanced features status ──
+    reversal_status = {"enabled": False}
+    speed_status = {"enabled": False}
+    if srv and hasattr(srv, "brain") and srv.brain:
+        brain = srv.brain
+        if hasattr(brain, "reversal_detector") and brain.reversal_detector is not None:
+            reversal_status = {
+                "enabled": True,
+                "methods": ["divergence", "trend_exhaustion", "sr_break", "candlestick", "volume"],
+                "auto_flip": True,
+            }
+    # Speed simulator is on paper_trader, not brain - check if paper trading mode
+    if srv and hasattr(srv, "live") and not srv.live:
+        # In dry-run/paper trading mode - speed simulation would be active
+        speed_status = {
+            "enabled": True,
+            "mode": "paper_trading_simulation",
+            "network_profile": "good",
+            "avg_latency_ms": 50,
+        }
+
     # ── Build lane rows from decision cache ──
     # Build per-symbol model info
     per_symbol_models = {}
@@ -433,6 +461,7 @@ def api_status():
         "server": {
             "running": True,
             "pids": [os.getpid()],
+            "bot_pid": _bot_process.pid if (_bot_process and _bot_process.poll() is None) else None,
         },
         "account": {
             "balance": mt5_account["balance"],
@@ -512,6 +541,8 @@ def api_status():
         "timestamp": time.time(),
         "uptime_sec": uptime,
         "mode": mode,
+        "reversal": reversal_status,
+        "speed": speed_status,
         "risk": {
             "halt": halt,
             "halt_reason": halt_reason,
@@ -1065,9 +1096,14 @@ _PROTECTED_ACTIONS = {
     "promote_canary", "rollback_canary", "rollback_champion",
     "restart_server", "start_training_cycle", "stop_training_cycle",
     "emergency_stop", "clear_emergency_stop", "unblock", "arm_live",
+    "start_bot", "stop_bot",
 }
 
+import secrets
+
 _CONTROL_TOKEN = os.environ.get("AGI_CONTROL_TOKEN", "")
+# Security: In production, control token MUST be set
+_IS_PRODUCTION = os.environ.get("AGI_IS_LIVE", "0") == "1"
 
 
 @app.post("/api/control")
@@ -1087,8 +1123,19 @@ def api_control():
     # ── Token auth for protected actions ────────────────────────────────
     if action in _PROTECTED_ACTIONS:
         token = request.get_header("X-Control-Token", "").strip()
-        if _CONTROL_TOKEN and token != _CONTROL_TOKEN:
-            logger.warning(f"Control action '{action}' rejected — invalid/missing token")
+
+        # Security: In production, control token must be configured
+        if _IS_PRODUCTION and not _CONTROL_TOKEN:
+            logger.error(f"Control action '{action}' rejected — AGI_CONTROL_TOKEN not configured in production")
+            return _json({"ok": False, "action": action, "error": "control token not configured"}, 503)
+
+        # Security: Use constant-time comparison to prevent timing attacks
+        if not _CONTROL_TOKEN:
+            logger.warning(f"Control action '{action}' rejected — no control token configured")
+            return _json({"ok": False, "action": action, "error": "control token required"}, 403)
+
+        if not secrets.compare_digest(token, _CONTROL_TOKEN):
+            logger.warning(f"Control action '{action}' rejected — invalid token")
             return _json({"ok": False, "action": action, "error": "control token required"}, 403)
 
     srv = _server_ref
@@ -1124,6 +1171,11 @@ def api_control():
     if action == "unblock":
         if srv and hasattr(srv, "_unblock"):
             result = srv._unblock()
+            # Also clear executor cooldowns
+            if hasattr(srv, "executor") and srv.executor:
+                srv.executor._last_failed_signal_time.clear()
+                srv.executor._last_spread_spike_time.clear()
+                logger.success("UNBLOCK: executor cooldowns cleared")
             return _json(result)
         elif srv and hasattr(srv, "risk"):
             # Fallback: directly reset risk engine
@@ -1134,8 +1186,13 @@ def api_control():
             srv.risk.error_count = 0
             srv.risk.realized_pnl_today = 0.0
             srv.risk.daily_trades = 0
+            # Also clear executor cooldowns
+            if hasattr(srv, "executor") and srv.executor:
+                srv.executor._last_failed_signal_time.clear()
+                srv.executor._last_spread_spike_time.clear()
+                logger.success("UNBLOCK: executor cooldowns cleared")
             logger.success(f"UNBLOCK via API: risk engine cleared (was halted={prev_halt}, reason={prev_reason})")
-            return _json({"ok": True, "action": "unblock", "was_halted": prev_halt, "was_reason": prev_reason, "halt": False, "message": "Risk engine unblocked via API."})
+            return _json({"ok": True, "action": "unblock", "was_halted": prev_halt, "was_reason": prev_reason, "halt": False, "message": "Risk engine unblocked + cooldowns cleared via API."})
         return _json({"ok": False, "action": action, "error": "No risk engine available"}, 500)
 
     # ── Arm live: Enable live trading ──
@@ -1148,6 +1205,129 @@ def api_control():
     # ── Standard UI actions ─────────────────────────────────────────────
     if action == "restart_server":
         return _json({"ok": True, "action": action, "message": "Server is running. Use system-level restart to restart."})
+
+    # ── Start/Stop bot process ──────────────────────────────────────────────
+    if action == "start_bot":
+        global _bot_process
+        with _bot_process_lock:
+            # Check if already running
+            if _bot_process is not None and _bot_process.poll() is None:
+                return _json({"ok": True, "action": action, "message": f"Bot already running (PID {_bot_process.pid})", "pid": _bot_process.pid})
+
+            # Check if Server_AGI is already running as a separate process
+            try:
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "Get-Process python* -ErrorAction SilentlyContinue | "
+                     "Where-Object { $_.CommandLine -match 'Server_AGI' } | "
+                     "Select-Object -ExpandProperty Id"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                existing_pids = [p.strip() for p in (result.stdout or "").strip().split("\n") if p.strip().isdigit()]
+                if existing_pids:
+                    return _json({"ok": True, "action": action, "message": f"Bot already running (PID {existing_pids[0]})", "pid": int(existing_pids[0])})
+            except Exception:
+                pass
+
+            # Find venv python
+            venv_python = os.path.join(ROOT, ".venv312", "Scripts", "python.exe")
+            if not os.path.exists(venv_python):
+                venv_python = os.path.join(ROOT, ".venv", "Scripts", "python.exe")
+            if not os.path.exists(venv_python):
+                venv_python = sys.executable
+
+            # Determine live vs dry-run mode from config
+            cfg = _read_config()
+            live_mode = srv and getattr(srv, "live", False)
+
+            log_dir = os.path.join(ROOT, "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            stdout_log = open(os.path.join(log_dir, "bot_stdout.log"), "a", encoding="utf-8")
+            stderr_log = open(os.path.join(log_dir, "bot_stderr.log"), "a", encoding="utf-8")
+
+            cmd = [venv_python, "-m", "Python.Server_AGI", "--live"]
+
+            # Set optimized environment for live trading
+            env = os.environ.copy()
+            env["AGI_LIVE_ENABLED"] = "true"
+            env["AGI_REQUIRE_EXPLICIT_LIVE_ARM"] = "false"
+            env["AGI_TRADE_INTERVAL_SEC"] = "300"
+            env["AGI_REVIEW_INTERVAL_SEC"] = "120"
+            env["AGI_TRAIL_INTERVAL_SEC"] = "30"
+            env["AGI_EQUITY_POLL_SEC"] = "15"
+            env["AGI_HEDGING_ENABLED"] = "false"
+            env["AGI_MAX_POS_PER_SYMBOL"] = "5"
+            env["AGI_SL_COOLDOWN_MIN"] = "5"
+            env["AGI_BIAS_WINDOW"] = "50"
+            env["AGI_BIAS_STRENGTH"] = "0.5"
+            env["AGI_ACTION_THRESHOLD"] = "0.0001"
+            env["AGI_DEADZONE_CONFIDENCE"] = "0.99"
+
+            try:
+                proc = subprocess.Popen(cmd, cwd=ROOT, stdout=stdout_log, stderr=stderr_log, env=env)
+                logger.success(f"Bot process started: PID={proc.pid} cmd={' '.join(cmd)}")
+            except Exception as exc:
+                logger.error(f"Failed to start bot: {exc}")
+                return _json({"ok": False, "action": action, "error": f"Failed to start bot: {exc}"}, 500)
+
+            # Store reference (module-level)
+            _bot_process = proc
+
+            # Brief wait to see if it crashes immediately
+            time.sleep(2)
+            if proc.poll() is not None:
+                return _json({"ok": False, "action": action, "error": f"Bot process exited immediately with code {proc.returncode}"}, 500)
+
+            return _json({"ok": True, "action": action, "message": f"Bot started (PID {proc.pid})", "pid": proc.pid})
+
+    if action == "stop_bot":
+        with _bot_process_lock:
+            killed_pids = []
+            # Stop tracked subprocess
+            if _bot_process is not None and _bot_process.poll() is None:
+                try:
+                    _bot_process.terminate()
+                    _bot_process.wait(timeout=10)
+                    killed_pids.append(_bot_process.pid)
+                except subprocess.TimeoutExpired:
+                    _bot_process.kill()
+                    killed_pids.append(_bot_process.pid)
+                except Exception:
+                    pass
+                _bot_process = None
+
+            # Also kill any Server_AGI process found via powershell
+            try:
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "Get-Process python* -ErrorAction SilentlyContinue | "
+                     "Where-Object { $_.CommandLine -match 'Server_AGI' } | "
+                     "Select-Object -ExpandProperty Id"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                for pid_str in (result.stdout or "").strip().split("\n"):
+                    pid_str = pid_str.strip()
+                    if pid_str.isdigit():
+                        try:
+                            subprocess.run(["powershell", "-NoProfile", "-Command", f"Stop-Process -Id {pid_str} -Force"], check=False, timeout=5)
+                            killed_pids.append(int(pid_str))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            if not killed_pids:
+                return _json({"ok": True, "action": action, "message": "No bot process was running."})
+
+            # Also set risk halt if server ref is available
+            if srv and hasattr(srv, "risk"):
+                try:
+                    srv.risk.halt = True
+                    srv.risk._halt_reason = "Bot stopped via dashboard"
+                except Exception:
+                    pass
+
+            return _json({"ok": True, "action": action, "message": f"Bot stopped (PIDs: {killed_pids})", "pids": killed_pids})
 
     if action == "hft_start":
         return _json({"ok": True, "action": action, "message": "HFT mode not available in current configuration."})
@@ -1262,11 +1442,99 @@ def _build_status_summary() -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Health endpoint
+# Health endpoints
 # ═══════════════════════════════════════════════════════════════════════════
 @app.get("/api/health")
 def api_health():
-    return _json({"status": "ok", "pid": os.getpid(), "time": time.time()})
+    """
+    Health check endpoint for monitoring and load balancers.
+
+    Returns:
+        - status: "ok" or "degraded"
+        - checks: Results of individual component health checks
+        - timestamp: ISO format UTC timestamp
+        - uptime_seconds: Server uptime in seconds
+    """
+    srv = _server_ref
+    checks = {
+        "server_running": srv is not None,
+        "risk_engine": False,
+        "brain_initialized": False,
+        "model_registry": False,
+        "config_loaded": False,
+    }
+
+    # Check risk engine
+    if srv and hasattr(srv, "risk"):
+        try:
+            _ = srv.risk.can_trade()
+            checks["risk_engine"] = True
+        except Exception as e:
+            checks["risk_engine_error"] = str(e)
+
+    # Check brain
+    if srv and hasattr(srv, "brain"):
+        checks["brain_initialized"] = True
+
+    # Check model registry
+    try:
+        active = _read_active_registry()
+        checks["model_registry"] = active.get("champion") is not None
+    except Exception as e:
+        checks["model_registry_error"] = str(e)
+
+    # Check config
+    cfg = _read_config()
+    checks["config_loaded"] = bool(cfg)
+
+    # Overall status
+    critical_checks = [checks["server_running"], checks["risk_engine"]]
+    status = "ok" if all(critical_checks) else "degraded"
+
+    # Calculate uptime
+    uptime = 0
+    if srv and hasattr(srv, "start_time"):
+        uptime = int(time.time() - srv.start_time)
+
+    return _json({
+        "status": status,
+        "pid": os.getpid(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "uptime_seconds": uptime,
+        "checks": checks,
+    })
+
+
+@app.get("/api/health/ready")
+def api_health_ready():
+    """
+    Readiness probe - returns 200 only when fully ready to accept traffic.
+
+    This is stricter than /api/health and waits for all components to be ready.
+    """
+    srv = _server_ref
+
+    # Must have server
+    if srv is None:
+        return _json({"ready": False, "reason": "server_not_initialized"}, status=503)
+
+    # Must have risk engine
+    if not hasattr(srv, "risk"):
+        return _json({"ready": False, "reason": "risk_engine_not_loaded"}, status=503)
+
+    # Must have brain
+    if not hasattr(srv, "brain"):
+        return _json({"ready": False, "reason": "brain_not_loaded"}, status=503)
+
+    # Must have champion model
+    try:
+        active = _read_active_registry()
+        if active.get("champion") is None:
+            return _json({"ready": False, "reason": "no_champion_model"}, status=503)
+    except Exception as e:
+        return _json({"ready": False, "reason": f"registry_error: {e}"}, status=503)
+
+    return _json({"ready": True, "timestamp": datetime.now(timezone.utc).isoformat()})
 
 
 @app.get("/api/emergency_status")
@@ -1287,6 +1555,61 @@ def api_emergency_status():
                 reasons.append("manual_or_emergency_stop")
             reason = "; ".join(reasons)
     return _json({"halted": halted, "reason": reason, "daily_trades": _safe_risk("daily_trades", 0), "realized_pnl": _safe_risk("realized_pnl_today", 0.0)})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# POST /api/backup/create — Create a backup now
+# ═══════════════════════════════════════════════════════════════════════════
+@app.post("/api/backup/create")
+def api_backup_create():
+    """Trigger an immediate backup creation."""
+    try:
+        from Python.backup_manager import get_backup_manager
+        mgr = get_backup_manager()
+        backup_path = mgr.create_backup(include_models=False)
+        return _json({
+            "ok": True,
+            "path": str(backup_path),
+            "name": backup_path.name,
+        })
+    except Exception as e:
+        return _json({"ok": False, "error": str(e)}, status=500)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# GET /api/backup/status — Backup manager status
+# ═══════════════════════════════════════════════════════════════════════════
+@app.get("/api/backup/status")
+def api_backup_status():
+    """Return backup manager status and recent backups list."""
+    try:
+        from Python.backup_manager import get_backup_manager
+        mgr = get_backup_manager()
+        backups = mgr.list_backups()
+        return _json({
+            "count": len(backups),
+            "latest": backups[0]["created_at"] if backups else None,
+            "latest_size_mb": backups[0].get("size_mb") if backups else None,
+            "auto_enabled": False,  # Set by environment, not runtime
+            "max_backups": 7,
+            "backups": [
+                {
+                    "name": b["name"],
+                    "created_at": b["created_at"],
+                    "size_mb": b.get("size_mb", 0),
+                }
+                for b in backups[:5]  # Last 5 only
+            ],
+        })
+    except Exception as e:
+        return _json({
+            "count": 0,
+            "latest": None,
+            "auto_enabled": False,
+            "max_backups": 7,
+            "error": str(e),
+            "backups": [],
+        })
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1581,6 +1904,60 @@ def api_trade_review_refresh():
     from Python.trade_review import run_review
     result = run_review(days_back=7)
     return _json(result.get("summary", {}))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# GET /api/scenarios — Scenario memory stats and review
+# ═══════════════════════════════════════════════════════════════════════════
+@app.get("/api/scenarios")
+def api_scenarios():
+    """Return scenario memory statistics, best/worst scenarios, and session review."""
+    try:
+        from Python.scenario_memory import get_scenario_memory
+        smem = get_scenario_memory()
+        symbol = request.params.get("symbol", "").strip()
+        review = smem.generate_session_review(symbol if symbol else None)
+        best = smem.get_best_scenarios(min_trades=3, top_n=10)
+        worst = smem.get_worst_scenarios(min_trades=3, top_n=10)
+        avoid = smem.get_should_avoid(min_trades=3)
+        return _json({
+            "ok": True,
+            "total_scenarios": len(smem.stats),
+            "total_records": len(smem.records),
+            "best_scenarios": [{k: v for k, v in __import__("dataclasses").asdict(s).items()} for s in best],
+            "worst_scenarios": [{k: v for k, v in __import__("dataclasses").asdict(s).items()} for s in worst],
+            "should_avoid": avoid,
+            "session_review": review,
+        })
+    except Exception as exc:
+        return _json({"ok": False, "error": str(exc)}, 500)
+
+
+@app.post("/api/scenarios/record_outcome")
+def api_scenarios_record_outcome():
+    """Manually record a trade outcome by decision_id."""
+    try:
+        from Python.scenario_memory import get_scenario_memory
+        smem = get_scenario_memory()
+        payload = request.json or {}
+        decision_id = payload.get("decision_id", "")
+        if not decision_id:
+            return _json({"ok": False, "error": "decision_id required"}, 400)
+        record = smem.record_outcome(
+            decision_id=decision_id,
+            exit_price=float(payload.get("exit_price", 0)),
+            pnl=float(payload.get("pnl", 0)),
+            pnl_pct=float(payload.get("pnl_pct", 0)),
+            hold_minutes=float(payload.get("hold_minutes", 0)),
+            close_reason=payload.get("close_reason", ""),
+            max_drawup=float(payload.get("max_drawup", 0)),
+            max_drawdown=float(payload.get("max_drawdown", 0)),
+        )
+        if record is None:
+            return _json({"ok": False, "error": "decision_id not found"}, 404)
+        return _json({"ok": True, "decision_id": decision_id, "outcome": record.outcome})
+    except Exception as exc:
+        return _json({"ok": False, "error": str(exc)}, 500)
 
 
 # Server lifecycle

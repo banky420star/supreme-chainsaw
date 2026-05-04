@@ -30,7 +30,10 @@ export default function Layout({ screen, onNavigate, selectedSymbol, onSelectSym
       <aside className="sidebar">
         <div className="sidebar-brand">
           <img src="/app_icon.ico" alt="CG" />
-          <span className="sidebar-brand-text">Money Printer</span>
+          <div style={{ display: "flex", flexDirection: "column" }}>
+            <span className="sidebar-brand-text" style={{ fontSize: "0.95rem" }}>Chain Gambler</span>
+            <span style={{ fontSize: "0.65rem", opacity: 0.7, fontWeight: 400 }}>Money Printer Edition</span>
+          </div>
         </div>
 
         <nav className="sidebar-nav">

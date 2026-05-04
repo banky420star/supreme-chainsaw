@@ -101,13 +101,15 @@ class PortfolioAllocator:
     def _compute_performance_scores(self) -> dict[str, float]:
         """Compute performance score per symbol from trade history.
 
-        Uses a Sharpe-like metric: win_rate * avg_win - (1 - win_rate) * avg_loss
-        Normalized to [0.1, 1.0] range.
+        Uses Kelly Criterion-inspired scoring for optimal position sizing.
+        Formula: Score = (WinRate * Win/Loss_Ratio - LossRate) * Volatility_Adjustment
+
+        Higher scores = more allocation to that symbol.
         """
         scores = {}
         for sym in self.symbols:
             history = self._history.get(sym, [])
-            if len(history) < 5:
+            if len(history) < 10:
                 scores[sym] = 0.5  # neutral for new symbols
                 continue
 
@@ -115,17 +117,75 @@ class PortfolioAllocator:
             wins = [p for p in pnls if p > 0]
             losses = [p for p in pnls if p < 0]
 
-            win_rate = len(wins) / len(pnls) if pnls else 0.5
-            avg_win = np.mean(wins) if wins else 0
-            avg_loss = abs(np.mean(losses)) if losses else 1
+            if not wins or not losses:
+                scores[sym] = 0.4  # No edge detected yet
+                continue
 
-            # Expectancy = win_rate * avg_win - (1 - win_rate) * avg_loss
-            expectancy = (win_rate * avg_win) - ((1 - win_rate) * avg_loss)
+            win_rate = len(wins) / len(pnls)
+            loss_rate = 1 - win_rate
 
-            # Normalize to [0.1, 1.0] — 0.5 = break-even
-            scores[sym] = max(0.1, min(1.0, 0.5 + expectancy * 10))
+            avg_win = np.mean(wins)
+            avg_loss = abs(np.mean(losses))
+
+            if avg_loss == 0:
+                scores[sym] = 0.5
+                continue
+
+            # Kelly edge calculation
+            win_loss_ratio = avg_win / avg_loss
+            kelly_edge = (win_rate * win_loss_ratio - loss_rate) / win_loss_ratio if win_loss_ratio > 0 else 0
+
+            # Volatility adjustment (penalize high volatility)
+            volatility = np.std(pnls) if len(pnls) > 1 else 1
+            avg_abs_pnl = np.mean([abs(p) for p in pnls])
+            vol_ratio = volatility / (avg_abs_pnl + 1e-10)
+            vol_adjustment = max(0.5, min(1.0, 1.0 / (1.0 + vol_ratio)))
+
+            # Sharpe-like component
+            if volatility > 0:
+                sharpe = np.mean(pnls) / volatility
+                sharpe_adjustment = min(1.0, max(0.5, 0.5 + sharpe * 0.1))
+            else:
+                sharpe_adjustment = 0.5
+
+            # Combined score
+            base_score = 0.5 + kelly_edge * 5  # Scale Kelly to [0, 1]
+            final_score = base_score * vol_adjustment * sharpe_adjustment
+
+            # Clamp to reasonable range
+            scores[sym] = max(0.1, min(1.0, final_score))
 
         return scores
+
+    def get_kelly_fraction(self, symbol: str) -> float:
+        """
+        Calculate Kelly-optimal fraction for a symbol.
+
+        Returns the fraction of portfolio to allocate based on edge.
+        """
+        history = self._history.get(symbol, [])
+        if len(history) < 20:
+            return 0.25  # Conservative default
+
+        pnls = [p for p, _ in history]
+        wins = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p < 0]
+
+        if not wins or not losses:
+            return 0.2
+
+        p = len(wins) / len(pnls)
+        q = 1 - p
+        b = np.mean(wins) / abs(np.mean(losses)) if np.mean(losses) != 0 else 1
+
+        if b <= 0:
+            return 0.1
+
+        # Kelly formula: f* = (p*b - q) / b
+        kelly = (p * b - q) / b
+
+        # Use fractional Kelly (Half-Kelly for safety)
+        return max(0.05, min(0.5, kelly * 0.5))
 
     def _apply_correlation_penalty(self, scores: dict[str, float]) -> dict[str, float]:
         """Reduce allocation for highly correlated symbols.

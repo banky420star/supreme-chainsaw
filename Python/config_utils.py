@@ -1,15 +1,92 @@
-﻿import os
-from typing import Any
+﻿"""
+Configuration utilities for Chain Gambler.
+
+Centralizes config loading patterns to reduce code duplication and ensure consistency.
+"""
+import os
+from typing import Any, Optional
+from pathlib import Path
 
 import yaml
 
 DEFAULT_TRADING_SYMBOLS = ["BTCUSDm", "XAUUSDm"]
 
-
 _PLACEHOLDERS = {
     "YOUR_BOT_TOKEN_HERE",
     "YOUR_CHAT_ID_HERE",
 }
+
+# Centralized project root path
+# Use Path for cross-platform compatibility
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def get_project_root() -> Path:
+    """Get the project root directory as a Path object."""
+    return PROJECT_ROOT
+
+
+def get_symbol_config(symbol: str, config_dir: str = "configs") -> Optional[dict]:
+    """
+    Load per-symbol configuration from YAML file.
+
+    Args:
+        symbol: Trading symbol (e.g., "EURUSDm")
+        config_dir: Directory containing config files (default: "configs")
+
+    Returns:
+        Dict with symbol configuration, or None if file not found/invalid
+
+    Usage:
+        cfg = get_symbol_config("EURUSDm")
+        if cfg:
+            spread = cfg.get("max_spread_pips", 50)
+    """
+    config_path = PROJECT_ROOT / config_dir / f"{symbol}.yaml"
+
+    if not config_path.exists():
+        return None
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except (yaml.YAMLError, OSError) as e:
+        # Log error but don't crash - return empty config
+        import logging
+        logging.getLogger(__name__).warning(
+            f"Failed to load config for {symbol} from {config_path}: {e}"
+        )
+        return None
+
+
+def get_main_config_path() -> Path:
+    """Get the path to the main config.yaml file."""
+    return PROJECT_ROOT / "config.yaml"
+
+
+def load_yaml_config(path: Path | str, default: Any = None) -> Any:
+    """
+    Safely load a YAML configuration file.
+
+    Args:
+        path: Path to YAML file
+        default: Default value to return if file not found or invalid
+
+    Returns:
+        Parsed YAML content, or default value on error
+    """
+    path = Path(path) if isinstance(path, str) else path
+
+    if not path.exists():
+        return default
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or default
+    except (yaml.YAMLError, OSError) as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Failed to load YAML from {path}: {e}")
+        return default
 
 
 def parse_symbol_list(raw: Any) -> list[str]:

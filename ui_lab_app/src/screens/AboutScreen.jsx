@@ -1,5 +1,5 @@
 import React from "react";
-import { BrainCircuit, Database, GitMerge, Rocket, ShieldAlert, Workflow } from "lucide-react";
+import { BrainCircuit, Database, GitMerge, Rocket, ShieldAlert, Workflow, TrendingUp, Gauge, DatabaseBackup, HeartPulse, Zap } from "lucide-react";
 import { Panel } from "../components/Common";
 
 const steps = [
@@ -9,7 +9,7 @@ const steps = [
     icon: Database,
     tone: "info",
     purpose: "The entire system feeds on live price, volume, and depth data before mathematically expanding it into hundreds of features.",
-    description: "Data is retrieved natively in pure Python via a specialized MetaTrader5 HFT pipeline running at granular minute resolutions. Raw ticks are aggressively engineered into 150+ advanced mathematical features before touching any neural network.",
+    description: "Data is retrieved natively in pure Python via a specialized MetaTrader5 HFT pipeline running at granular minute resolutions. Raw ticks are aggressively engineered into 150+ advanced mathematical features (v2: 21 features, v3: 25 features) before touching any neural network.",
   },
   {
     title: "Latent Context Engine",
@@ -28,12 +28,52 @@ const steps = [
     description: "DreamerV3 simulates thousands of potential future ticks before execution, issuing direct alerts if a trajectory leads to a highly probable disaster. PPO precisely merges the LSTM context with Dreamer warnings to map optimal pathways.",
   },
   {
+    title: "Reversal Detection System",
+    technical: "5-Method Confirmation",
+    icon: TrendingUp,
+    tone: "pass",
+    purpose: "Advanced trend exhaustion detection with automatic direction flipping for counter-trend entries.",
+    description: "Five independent detection methods: divergence analysis (RSI/MACD), trend exhaustion (ADX + momentum), support/resistance breaks, candlestick patterns (engulfing/doji), and volume confirmation. When 3+ methods confirm, the system can automatically flip trade direction to capture reversals.",
+  },
+  {
+    title: "Signal Quality & Kelly Sizing",
+    technical: "Optimal Position Sizing",
+    icon: Zap,
+    tone: "pass",
+    purpose: "Multi-dimensional signal filtering with Kelly Criterion-based position sizing for maximum edge.",
+    description: "Signal optimizer evaluates 5 quality dimensions: trend alignment, volatility regime, volume confirmation, support/resistance distance, and momentum strength. Kelly criterion calculates optimal f* = (p*b - q) / b for mathematically optimal position sizing based on win rate and payoff ratio.",
+  },
+  {
+    title: "Speed Simulation Engine",
+    technical: "Realistic Execution",
+    icon: Gauge,
+    tone: "info",
+    purpose: "Realistic paper trading with network latency, broker fill probability, and slippage simulation.",
+    description: "Simulates real-world execution conditions with configurable network profiles (excellent/good/average/poor/mobile) and broker profiles (ECN fast/MM premium/MM standard). Models fill probability, slippage, and latency to provide realistic backtesting and paper trading results.",
+  },
+  {
     title: "Risk Overlord Interception",
     technical: "Hard Cutoff Hierarchy",
     icon: ShieldAlert,
     tone: "fail",
     purpose: "Absolute mathematical preservation of capital supersedes any AI model confidence.",
-    description: "Risk calculation is completely decoupled from the autonomous AI brains. The risk_supervisor module strictly audits incoming PPO execution decisions. Rigid cutoff constraints physically intercept and kill trade pipelines if daily limits or maximum drawdowns are threatened.",
+    description: "Risk calculation is completely decoupled from the autonomous AI brains. The risk_supervisor module strictly audits incoming PPO execution decisions. Rigid cutoff constraints physically intercept and kill trade pipelines if daily limits or maximum drawdowns are threatened. Memory-leak protected with bounded deques (720 hourly PnL, 5000 equity points).",
+  },
+  {
+    title: "Backup & Recovery System",
+    technical: "Automated Data Protection",
+    icon: DatabaseBackup,
+    tone: "pass",
+    purpose: "Comprehensive backup of registry, configs, models, and trading history with automatic restoration.",
+    description: "Creates compressed archives of model registry (champion/canary), configuration files, trading logs (decisions.jsonl), and monitoring data. Supports automated scheduled backups, retention policies (default 7 days), and point-in-time restoration with dry-run verification.",
+  },
+  {
+    title: "Health Monitoring & Observability",
+    technical: "System Status API",
+    icon: HeartPulse,
+    tone: "pass",
+    purpose: "Real-time health checks and readiness probes for production monitoring.",
+    description: "Exposes /api/health endpoint with comprehensive component status (server, risk engine, brain, model registry, config). Includes readiness probe for load balancers, uptime tracking, and structured logging of all trade decisions with full reasoning chains.",
   },
   {
     title: "The Evolutionary Loop",
@@ -41,7 +81,7 @@ const steps = [
     icon: GitMerge,
     tone: "pass",
     purpose: "A continuous survival-of-the-fittest architecture constantly replaces underperforming neural models with hyper-tuned mutations.",
-    description: "When trades result in stop-losses, setup boundaries are mathematically isolated and specific neural action-weights are physically shifted. Mutated canary models trade continuously in the background; once they mathematically outperform the live champion, they instantly take control.",
+    description: "When trades result in stop-losses, setup boundaries are mathematically isolated and specific neural action-weights are physically shifted. Mutated canary models trade continuously in the background; once they mathematically outperform the live champion, they instantly take control. Parallel training support via SubprocVecEnv for 4-8x speedup.",
   },
 ];
 

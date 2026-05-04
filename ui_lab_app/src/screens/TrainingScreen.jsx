@@ -1,5 +1,5 @@
 import React from "react";
-import { Activity, Brain, Sparkles, Workflow, TrendingUp, GitBranch } from "lucide-react";
+import { Activity, Brain, Sparkles, Workflow, TrendingUp, GitBranch, Cpu, Layers } from "lucide-react";
 import { Panel, MetricTile, ProgressBar, Gauge, JOURNEY_STEPS, PipelineStageBoard, StatRow, dollars, money, pct, shortDuration } from "../components/Common";
 
 function TrainingLossChart({ data, label, colorKey }) {
@@ -247,6 +247,42 @@ export default function TrainingScreen({ data, selectedSymbol }) {
           </div>
         </Panel>
       )}
+
+      {/* Training Configuration & Optimizations */}
+      <Panel title="Training Infrastructure" subtitle="Performance optimizations and configuration" icon={Cpu}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 16 }}>
+          <div style={{ padding: 16, background: "rgba(255,255,255,0.02)", borderRadius: 10, border: "1px solid rgba(255,255,255,0.05)" }}>
+            <div className="eyebrow" style={{ marginBottom: 8 }}><Layers size={12} /> Vectorization</div>
+            <div style={{ fontSize: "0.9rem", marginBottom: 8 }}>
+              <strong>{import.meta.env?.AGI_USE_SUBPROC_VECENV === "1" ? "SubprocVecEnv" : "DummyVecEnv"}</strong>
+            </div>
+            <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
+              {import.meta.env?.AGI_USE_SUBPROC_VECENV === "1"
+                ? "Multi-process training with 4-8x speedup on multi-core systems"
+                : "Single-process training (default, maximum compatibility)"}
+            </div>
+          </div>
+
+          <div style={{ padding: 16, background: "rgba(255,255,255,0.02)", borderRadius: 10, border: "1px solid rgba(255,255,255,0.05)" }}>
+            <div className="eyebrow" style={{ marginBottom: 8 }}><Activity size={12} /> Memory Protection</div>
+            <div style={{ fontSize: "0.9rem", marginBottom: 8 }}>
+              <strong>Bounded Deques</strong>
+            </div>
+            <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
+              Risk: 720 hourly PnL · Env: 5000 equity points · Prevents OOM in long runs
+            </div>
+          </div>
+
+          <div style={{ padding: 16, background: "rgba(255,255,255,0.02)", borderRadius: 10, border: "1px solid rgba(255,255,255,0.05)" }}>
+            <div className="eyebrow" style={{ marginBottom: 8 }}><GitBranch size={12} /> NumPy Compatibility</div>
+            <div style={{ fontSize: "0.9rem", marginBottom: 8 }}>
+              <strong>Centralized Shim</strong>
+            </div>
+            <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
+              Handles numpy 1.x/2.x pickle compatibility automatically
+            </div>
+          </div>
+        </div>      </Panel>
     </div>
   );
 }

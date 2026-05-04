@@ -1,5 +1,5 @@
 import React from "react";
-import { Brain, GitBranch, Shield, Sparkles } from "lucide-react";
+import { Brain, GitBranch, Shield, Sparkles, Cpu, Layers, Zap } from "lucide-react";
 import { Panel, MetricTile, ProgressBar, Gauge, StatRow, dollars, pct } from "../components/Common";
 
 export default function ModelsScreen({ data }) {
@@ -10,6 +10,8 @@ export default function ModelsScreen({ data }) {
   const lstm = training.lstm || {};
   const ppo = training.ppo || {};
   const dreamer = training.dreamerV3 || {};
+  const reversal = data?.reversal || {};
+  const speed = data?.speed || {};
 
   const champion = learning?.champion || {};
   const canary = learning?.canary || {};
@@ -21,6 +23,10 @@ export default function ModelsScreen({ data }) {
   // Per-symbol model information from the registry
   const perSymbolModels = registry.perSymbolModels || {};
   const configuredSymbols = training.configuredSymbols || ["BTCUSDm", "XAUUSDm", "EURUSDm", "GBPUSDm"];
+
+  // Feature versions
+  const featureVersion = data?.meta?.featureVersion || "ultimate_150";
+  const isV3 = featureVersion.includes("v3") || featureVersion.includes("2503");
 
   return (
     <div className="stack animate-in">
@@ -199,6 +205,52 @@ export default function ModelsScreen({ data }) {
           })()}
         </Panel>
       )}
+
+      {/* Feature Engineering & Advanced Systems */}
+      <div className="grid-2" style={{ gap: 16 }}>
+        <Panel title="Feature Engineering" subtitle="Input pipeline configuration" icon={Layers}>
+          <div className="metric-grid" style={{ gridTemplateColumns: "repeat(2, 1fr)" }}>
+            <MetricTile label="Version" value={featureVersion} tone="pass" />
+            <MetricTile label="Features" value={isV3 ? "25" : "21"} />
+            <MetricTile label="Window" value="100" />
+            <MetricTile label="Total Dim" value={isV3 ? "2503" : "2103"} />
+          </div>
+          <div style={{ marginTop: 12, fontSize: "0.78rem", color: "var(--text-muted)" }}>
+            {isV3
+              ? "V3: 25 features (OHLCV + engineered) × 100 window + 3 portfolio = 2503 dims"
+              : "V2: 21 features (OHLCV + engineered) × 100 window + 3 portfolio = 2103 dims"}
+          </div>
+        </Panel>
+
+        <Panel title="Advanced Systems" subtitle="Auxiliary AI components" icon={Zap}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <Cpu size={14} />
+                <span style={{ fontSize: "0.85rem" }}>Reversal Detector</span>
+              </div>
+              <span className={`lane-chip ${reversal?.enabled ? "tone-pass" : ""}`} style={{ fontSize: "0.7rem" }}>
+                {reversal?.enabled ? "ACTIVE" : "OFF"}
+              </span>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <Zap size={14} />
+                <span style={{ fontSize: "0.85rem" }}>Signal Optimizer</span>
+              </div>
+              <span className="lane-chip tone-pass" style={{ fontSize: "0.7rem" }}>KELLY</span>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <GitBranch size={14} />
+                <span style={{ fontSize: "0.85rem" }}>Training Mode</span>
+              </div>
+              <span className="lane-chip" style={{ fontSize: "0.7rem" }}>
+                {process.env.AGI_USE_SUBPROC_VECENV === "1" ? "PARALLEL" : "SINGLE"}
+              </span>
+            </div>
+          </div>        </Panel>
+      </div>
     </div>
   );
 }

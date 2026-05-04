@@ -1,0 +1,65 @@
+[
+  {
+    "id": "LIV-2350",
+    "type": "learning",
+    "severity": "fail",
+    "timestamp": "Just now",
+    "message": "[BTCUSDm] Canary rolled back (DD: 0.000, PnL: $-78.04)"
+  },
+  {
+    "id": "LIV-2350",
+    "type": "learning",
+    "severity": "fail",
+    "timestamp": "Just now",
+    "message": "[GBPUSDm] Canary rolled back (DD: 0.000, PnL: $-22.46)"
+  },
+  {
+    "id": "LIV-9432",
+    "type": "learning",
+    "severity": "fail",
+    "timestamp": "Just now",
+    "message": "[BTCUSDm] Canary rolled back (DD: 0.490, PnL: $-78.04)"
+  },
+  {
+    "id": "LIV-9432",
+    "type": "learning",
+    "severity": "fail",
+    "timestamp": "Just now",
+    "message": "[XAUUSDm] Canary rolled back (DD: 0.490, PnL: $162.25)"
+  },
+  {
+    "id": "LIV-9432",
+    "type": "learning",
+    "severity": "fail",
+    "timestamp": "Just now",
+    "message": "[GBPUSDm] Canary rolled back (DD: 0.490, PnL: $-24.76)"
+  },
+  {
+    "id": "LIV-2232",
+    "type": "learning",
+    "severity": "fail",
+    "timestamp": "Just now",
+    "message": "[EURUSDm] Canary rolled back (DD: 0.000, PnL: $-207.43)"
+  },
+  {
+    "id": "LIV-7657",
+    "type": "learning",
+    "severity": "fail",
+    "timestamp": "Just now",
+    "message": "[EURUSDm] Canary rolled back (DD: 0.000, PnL: $-203.66)"
+  },
+  {
+    "id": "LIV-7973",
+    "type": "learning",
+    "severity": "fail",
+    "timestamp": "Just now",
+    "message": "[BTCUSDm] Canary rolled back (DD: 0.000, PnL: $-36.61)"
+  },
+  {
+    "id": "LIV-7973",
+    "type": "learning",
+    "severity": "fail",
+    "timestamp": "Just now",
+    "message": "[EURUSDm] Canary rolled back (DD: 0.000, PnL: $-201.54)"
+  }
+]

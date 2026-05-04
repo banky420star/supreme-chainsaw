@@ -1,0 +1,2 @@
+- [Config Priority Conflicts](config_priority_conflicts.md) — YAML min_lots dead code, env var overrides, lot_step hardcoded
+- [Unbound Variable & Float Drift](unbound_min_lots_float_drift.md) — NameError on ATR fallback path, float rounding artifacts in lot computation

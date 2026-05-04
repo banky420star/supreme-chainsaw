@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { Activity, ArrowRightLeft, BarChart3, Brain, Calendar, CandlestickChart, GitBranch, Shield, Sparkles, Target, TrendingDown, TrendingUp } from "lucide-react";
+import { Activity, ArrowRightLeft, BarChart3, Brain, Calendar, CandlestickChart, GitBranch, Shield, Sparkles, Target, TrendingDown, TrendingUp, Zap, Gauge, TrendingUpDown } from "lucide-react";
 import { Panel, KpiCard, MetricTile, LargeSparkline, Button, dollars, money, pct } from "../components/Common";
 
 export default function TradingScreen({ data, selectedSymbol }) {
@@ -12,6 +12,8 @@ export default function TradingScreen({ data, selectedSymbol }) {
   const economicCalendar = data?.economicCalendar || [];
   const equityHistory = data?._history?.equity || [];
   const pnlHistory = data?._history?.pnl || [];
+  const reversal = data?.reversal || {};
+  const speed = data?.speed || {};
 
   const openTrades = lanes.filter((l) => l.status === "live");
   const [timeframe, setTimeframe] = useState("1d");
@@ -132,8 +134,14 @@ export default function TradingScreen({ data, selectedSymbol }) {
                     </div>
                     {lane.reason && (
                       <div style={{ marginTop: 12, padding: 12, background: "rgba(255,255,255,0.02)", borderRadius: 8, border: "1px solid rgba(255,255,255,0.05)" }}>
-                        <div className="eyebrow" style={{ marginBottom: 6 }}><Brain size={12} /> Rationale</div>
-                        <p style={{ color: "rgba(255,255,255,0.85)", fontSize: "0.9rem", lineHeight: 1.5 }}>{lane.reason}</p>
+                        <div className="eyebrow" style={{ marginBottom: 6 }}><Brain size={12} /> Decision Reasoning</div>
+                        <p style={{ color: "rgba(255,255,255,0.85)", fontSize: "0.85rem", lineHeight: 1.5, fontFamily: "var(--mono)" }}>{lane.reason}</p>
+                        {lane.confidence > 0 && (
+                          <div style={{ marginTop: 8, display: "flex", gap: 8, flexWrap: "wrap" }}>
+                            <span className="lane-chip" style={{ fontSize: "0.65rem" }}>Conf: {(lane.confidence * 100).toFixed(1)}%</span>
+                            {lane.is_canary && <span className="lane-chip tone-warn" style={{ fontSize: "0.65rem" }}>CANARY</span>}
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>
@@ -236,6 +244,63 @@ export default function TradingScreen({ data, selectedSymbol }) {
           )}
         </Panel>
       )}
+
+      {/* Advanced Systems Status */}
+      <div className="grid-2" style={{ gap: 16 }}>
+        <Panel title="Reversal Detection" subtitle="Trend exhaustion monitoring" icon={TrendingUpDown}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <Zap size={16} style={{ color: reversal?.enabled ? "var(--accent-green)" : "var(--text-muted)" }} />
+                <span style={{ fontWeight: 600 }}>Status</span>
+              </div>
+              <span className={`lane-chip ${reversal?.enabled ? "tone-pass" : ""}`}>
+                {reversal?.enabled ? "ACTIVE" : "STANDBY"}
+              </span>
+            </div>
+            {reversal?.enabled && (
+              <>
+                <div className="metric-grid" style={{ gridTemplateColumns: "repeat(2, 1fr)" }}>
+                  <MetricTile label="Methods" value="5" />
+                  <MetricTile label="Auto-Flip" value={reversal?.auto_flip ? "ON" : "OFF"} tone={reversal?.auto_flip ? "pass" : ""} />
+                  <MetricTile label="Divergence" value="RSI/MACD" />
+                  <MetricTile label="S/R Breaks" value="Enabled" tone="pass" />
+                </div>
+                <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", padding: "8px 0" }}>
+                  Detection: Trend exhaustion · Candlestick patterns · Volume confirmation
+                </div>
+              </>
+            )}
+          </div>
+        </Panel>
+
+        <Panel title="Execution Simulation" subtitle="Realistic fill modeling" icon={Gauge}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <Gauge size={16} style={{ color: speed?.enabled ? "var(--accent-cyan)" : "var(--text-muted)" }} />
+                <span style={{ fontWeight: 600 }}>Status</span>
+              </div>
+              <span className={`lane-chip ${speed?.enabled ? "tone-pass" : ""}`}>
+                {speed?.enabled ? "ACTIVE" : "STANDBY"}
+              </span>
+            </div>
+            {speed?.enabled && (
+              <>
+                <div className="metric-grid" style={{ gridTemplateColumns: "repeat(2, 1fr)" }}>
+                  <MetricTile label="Network" value={speed?.network_profile || "good"} />
+                  <MetricTile label="Broker" value={speed?.mode === "paper_trading_simulation" ? "Paper" : "Live"} />
+                  <MetricTile label="Latency" value={`${speed?.avg_latency_ms || "~50"}ms`} />
+                  <MetricTile label="Slippage" value="Simulated" tone="pass" />
+                </div>
+                <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", padding: "8px 0" }}>
+                  Fill probability · Slippage modeling · Network latency simulation
+                </div>
+              </>
+            )}
+          </div>
+        </Panel>
+      </div>
 
       {/* Economic Calendar */}
       <Panel title="Economic Calendar" subtitle="Upcoming market-moving events" icon={Calendar}>

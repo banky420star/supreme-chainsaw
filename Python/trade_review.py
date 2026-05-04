@@ -565,6 +565,43 @@ def run_review(days_back: int = 7) -> dict:
     )
     logger.info(f"Tag distribution: {summary.get('tag_distribution', {})}")
 
+    # ── Update scenario memory with trade outcomes ──
+    try:
+        from Python.scenario_memory import get_scenario_memory
+        smem = get_scenario_memory()
+        enriched = result.get("enriched", [])
+        matched = 0
+        for trade in enriched:
+            profit = float(trade.get("profit", 0) or 0)
+            # Try to match trade to a scenario record by symbol + time
+            symbol = trade.get("symbol", "")
+            side = trade.get("type", "").lower()
+            hold_minutes = float(trade.get("hold_minutes", 0) or 0)
+            close_reason = "SL" if trade.get("is_sl") else "TP" if trade.get("is_tp") else "manual"
+
+            # Find matching open scenario record
+            for dec_id, record in list(smem.records.items()):
+                if (record.symbol == symbol and
+                    record.outcome == "open" and
+                    record.action.lower() == side):
+                    smem.record_outcome(
+                        decision_id=dec_id,
+                        exit_price=float(trade.get("price_close", 0) or trade.get("price", 0) or 0),
+                        pnl=profit,
+                        pnl_pct=profit / max(float(trade.get("price_open", 1) or 1), 0.01) * 100,
+                        hold_minutes=hold_minutes,
+                        close_reason=close_reason,
+                        max_drawup=float(trade.get("max_drawup", 0) or 0),
+                        max_drawdown=float(trade.get("max_drawdown", 0) or abs(profit) * 0.5),
+                    )
+                    matched += 1
+                    break
+        if matched > 0:
+            logger.info(f"ScenarioMemory: matched {matched} trade outcomes to entry scenarios")
+            smem.save_stats()
+    except Exception as e:
+        logger.debug(f"Scenario memory update skipped: {e}")
+
     # ── Ollama advisor: auto-analyze losing trades ──
     try:
         from Python.ollama_advisor import get_advisor

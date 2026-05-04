@@ -1,6 +1,7 @@
 ﻿import datetime
 import json
 import os
+from collections import deque
 
 import gymnasium as gym
 import numpy as np
@@ -74,7 +75,8 @@ class TradingEnv(gym.Env):
         self.trailing_trigger_pct = float(os.environ.get("AGI_TRAILING_TRIGGER_PCT", "0.003"))
         self.trailing_distance_pct = float(os.environ.get("AGI_TRAILING_DISTANCE_PCT", "0.002"))
         self.trailing_step_pct = float(os.environ.get("AGI_TRAILING_STEP_PCT", "0.001"))
-        self.equity_curve = []
+        # Capped at 5000 entries to prevent memory growth in long-running sessions
+        self.equity_curve = deque(maxlen=5000)
         self._trade_metrics = {}
         self.memory_features = self._build_memory_features(self.trade_memory)
         self.max_portfolio_features = MAX_PORTFOLIO_FEATURE_COUNT
@@ -525,7 +527,7 @@ class TradingEnv(gym.Env):
             },
             "trade_state": self._trade_state_snapshot(current_price),
             "profitability": {
-                "equity_curve": list(self.equity_curve[-5:]),
+                "equity_curve": list(self.equity_curve)[-5:] if self.equity_curve else [],
                 "trade_metrics": dict(self._trade_metrics),
             },
         }

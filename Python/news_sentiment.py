@@ -451,5 +451,5 @@ class NewsSentimentEngine:
             }
             with open(self._sentiment_log, "a") as f:
                 f.write(json.dumps(entry) + "\n")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Failed to write sentiment log: {e}")

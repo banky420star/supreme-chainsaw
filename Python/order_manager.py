@@ -38,9 +38,45 @@ _config_cache: dict[str, dict] = {}
 _config_cache_ts: dict[str, float] = {}
 _CONFIG_TTL = 60.0  # Re-read config every 60 seconds
 
+# Security: Allowed symbols whitelist to prevent path traversal
+ALLOWED_SYMBOLS = {
+    "EURUSDm", "EURUSD", "GBPUSDm", "GBPUSD", "USDJPYm", "USDJPY",
+    "AUDUSDm", "AUDUSD", "USDCADm", "USDCAD", "XAUUSDm", "XAUUSD",
+    "BTCUSDm", "BTCUSD", "ETHUSDm", "ETHUSD", "US30", "NAS100",
+    "SPX500", "GER30", "UK100", "JP225",
+}
+
+
+def _validate_symbol(symbol: str) -> str:
+    """
+    Validate symbol against whitelist to prevent path traversal attacks.
+
+    Raises:
+        ValueError: If symbol contains path traversal characters or is not in whitelist.
+    """
+    if not symbol or not isinstance(symbol, str):
+        raise ValueError("Symbol must be a non-empty string")
+
+    # Reject any path traversal attempts
+    if ".." in symbol or "/" in symbol or "\\" in symbol or "%" in symbol:
+        raise ValueError(f"Invalid symbol '{symbol}': contains path traversal characters")
+
+    # Normalize symbol (remove suffix for validation)
+    base_symbol = symbol.replace("m", "").upper()
+    normalized = symbol.upper()
+
+    # Check against whitelist
+    if normalized not in ALLOWED_SYMBOLS and base_symbol not in {s.replace("m", "").upper() for s in ALLOWED_SYMBOLS}:
+        raise ValueError(f"Symbol '{symbol}' not in allowed symbols list")
+
+    return symbol
+
 
 def _load_symbol_risk_config(symbol: str) -> dict:
     """Load risk config for a symbol from configs/{symbol}.yaml with TTL cache."""
+    # Security: Validate symbol first
+    _validate_symbol(symbol)
+
     now = time.time()
     if symbol in _config_cache and (now - _config_cache_ts.get(symbol, 0)) < _CONFIG_TTL:
         return _config_cache[symbol]
@@ -776,7 +812,13 @@ class OrderManager:
 
             if dollar_profit >= quick_tp_dollars and quick_tp_dollars > 0:
                 close_volume = round(pos.volume * quick_tp_pct, 2)
-                min_lots = _MIN_LOTS
+                # Use broker volume_min (not global _MIN_LOTS) to prevent retcode=10014
+                broker_vol_min = 0.01
+                if _mt5:
+                    sym_info = _mt5.symbol_info(symbol)
+                    if sym_info:
+                        broker_vol_min = float(getattr(sym_info, 'volume_min', 0.01))
+                min_lots = max(_MIN_LOTS, broker_vol_min)
                 if close_volume < min_lots:
                     close_volume = min_lots
                 if close_volume >= pos.volume:
@@ -921,10 +963,48 @@ class OrderManager:
             )
             return False
 
+    # Track partial close failure counts to prevent log spam
+    _partial_close_fail_count: dict[int, int] = {}
+
     def _apply_partial_close(self, mt5_position, close_volume: float) -> bool:
-        """Close part of a position."""
+        """Close part of a position, respecting broker volume_min/volume_step."""
+        symbol = mt5_position.symbol
+        ticket = mt5_position.ticket
+        remaining_volume = mt5_position.volume - close_volume
+
+        # Read broker volume constraints from MT5 symbol info
+        vol_min = 0.01
+        vol_step = 0.01
+        if _mt5:
+            sym_info = _mt5.symbol_info(symbol)
+            if sym_info:
+                vol_min = float(getattr(sym_info, 'volume_min', 0.01))
+                vol_step = float(getattr(sym_info, 'volume_step', 0.01))
+
+        # Align close_volume to volume_step
+        close_volume = round(close_volume / vol_step) * vol_step
+
+        # If remaining volume would be less than volume_min, close entire position
+        if remaining_volume < vol_min and close_volume < mt5_position.volume:
+            logger.info(
+                f"OrderManager: {symbol} #{ticket} partial close {close_volume:.2f} would leave "
+                f"{remaining_volume:.2f} < vol_min {vol_min:.2f} — closing entire position"
+            )
+            close_volume = mt5_position.volume
+
+        # If close_volume is less than volume_min and we're not closing everything, skip
+        if close_volume < vol_min and close_volume < mt5_position.volume:
+            fail_count = self._partial_close_fail_count.get(ticket, 0) + 1
+            self._partial_close_fail_count[ticket] = fail_count
+            if fail_count <= 3:
+                logger.warning(
+                    f"OrderManager: {symbol} #{ticket} partial close volume {close_volume:.2f} "
+                    f"< vol_min {vol_min:.2f} — skipping partial close"
+                )
+            return False
+
         close_type = _mt5.ORDER_TYPE_SELL if mt5_position.type == 0 else _mt5.ORDER_TYPE_BUY
-        tick = _mt5.symbol_info_tick(mt5_position.symbol)
+        tick = _mt5.symbol_info_tick(symbol)
         if tick is None:
             return False
 
@@ -932,26 +1012,31 @@ class OrderManager:
 
         request = {
             "action": _mt5.TRADE_ACTION_DEAL,
-            "symbol": mt5_position.symbol,
+            "symbol": symbol,
             "volume": close_volume,
             "type": close_type,
-            "position": mt5_position.ticket,
+            "position": ticket,
             "price": close_price,
             "comment": "OM partial close",
         }
 
         result = _mt5.order_send(request)
         if result.retcode == _mt5.TRADE_RETCODE_DONE:
+            # Reset failure count on success
+            self._partial_close_fail_count.pop(ticket, None)
             logger.info(
-                f"OrderManager partial close: {mt5_position.symbol} #{mt5_position.ticket} "
+                f"OrderManager partial close: {symbol} #{ticket} "
                 f"closed {close_volume} lots"
             )
             return True
         else:
-            logger.warning(
-                f"OrderManager partial close failed: {mt5_position.symbol} #{mt5_position.ticket} "
-                f"retcode={result.retcode}"
-            )
+            fail_count = self._partial_close_fail_count.get(ticket, 0) + 1
+            self._partial_close_fail_count[ticket] = fail_count
+            if fail_count <= 3:
+                logger.warning(
+                    f"OrderManager partial close failed: {symbol} #{ticket} "
+                    f"retcode={result.retcode}"
+                )
             return False
 
     # ── Lifecycle ───────────────────────────────────────────────────────

@@ -1,8 +1,11 @@
-import React from "react";
-import { Activity, Brain, Shield, Zap, TrendingUp, Calendar, GitBranch, CandlestickChart } from "lucide-react";
+import React, { useState } from "react";
+import { Activity, Brain, Shield, Zap, TrendingUp, Calendar, GitBranch, CandlestickChart, Play, Square, HeartPulse, Database, Gauge, TrendingDown, AlertTriangle } from "lucide-react";
 import { Panel, KpiCard, MetricTile, ProgressBar, LargeSparkline, Button, EventList, dollars, money } from "../components/Common";
+import { useData } from "../data/DataContext";
 
 export default function DashboardScreen({ data, selectedSymbol }) {
+  const { dispatch } = useData();
+  const [botBusy, setBotBusy] = useState(false);
   const account = data?.trading?.account || {};
   const risk = data?.trading?.risk || {};
   const lanes = data?.trading?.lanes || [];
@@ -13,6 +16,23 @@ export default function DashboardScreen({ data, selectedSymbol }) {
   const incidents = data?.incidents || [];
   const timeline = data?.timeline || [];
   const equityHistory = data?._history?.equity || [];
+  const controls = data?.controls || {};
+  const health = data?.health || {};
+  const backup = data?.backup || {};
+  const reversal = data?.reversal || {};
+  const speed = data?.speed || {};
+  const botRunning = controls.runtimeStatus === "running" || controls.botPid;
+  const botPid = controls.botPid;
+
+  async function handleBotToggle() {
+    setBotBusy(true);
+    try {
+      const action = botRunning ? "stop_bot" : "start_bot";
+      await dispatch(action);
+    } finally {
+      setBotBusy(false);
+    }
+  }
 
   return (
     <div className="stack animate-in">
@@ -22,9 +42,21 @@ export default function DashboardScreen({ data, selectedSymbol }) {
           <div className="hero-monitor-label">Total Account Equity</div>
           <div className="hero-monitor-value">{dollars(account.equity)}</div>
           <div className="status-lamps">
-            <div className="status-lamp"><div className="lamp-dot active" /><span>Neural Core Live</span></div>
+            <div className="status-lamp"><div className={`lamp-dot ${botRunning ? "active" : ""}`} /><span>{botRunning ? "Bot Live" : "Bot Stopped"}</span></div>
             <div className="status-lamp"><div className="lamp-dot pass" /><span>Data Stream</span></div>
             <div className="status-lamp"><div className="lamp-dot" /><span>Risk Shields</span></div>
+            <div className="status-lamp"><div className={`lamp-dot ${health?.status === "ok" ? "pass" : ""}`} /><span>{health?.status === "ok" ? "System Healthy" : "Health Check"}</span></div>
+          </div>
+          <div style={{ marginTop: 12, display: "flex", gap: 8, alignItems: "center" }}>
+            <Button
+              icon={botRunning ? Square : Play}
+              tone={botRunning ? "danger" : "primary"}
+              onClick={handleBotToggle}
+              disabled={botBusy}
+            >
+              {botBusy ? (botRunning ? "Stopping..." : "Starting...") : (botRunning ? "Stop Bot" : "Start Bot")}
+            </Button>
+            {botPid && <span style={{ fontFamily: "var(--mono)", fontSize: "0.72rem", color: "var(--text-muted)" }}>PID {botPid}</span>}
           </div>
         </div>
         <div className="hero-monitor-side">
@@ -183,6 +215,72 @@ export default function DashboardScreen({ data, selectedSymbol }) {
               <MetricTile label="Daily Cap" value={`${risk.maxDailyLossPct || 3}%`} />
               <MetricTile label="Kill Switch" value={risk.killSwitchArmed ? "ARMED" : "Safe"} tone={risk.killSwitchArmed ? "warn" : "pass"} />
               <MetricTile label="Size Cap" value={`${((risk.sizeCap || 0) * 100).toFixed(0)}%`} />
+            </div>
+          </Panel>
+
+          {/* System Health */}
+          <Panel title="System Health" subtitle="Component status & uptime" icon={HeartPulse}>
+            <div className="metric-grid" style={{ gridTemplateColumns: "repeat(2, 1fr)" }}>
+              <MetricTile label="Status" value={health?.status === "ok" ? "ONLINE" : health?.status || "Unknown"} tone={health?.status === "ok" ? "pass" : "warn"} />
+              <MetricTile label="Uptime" value={`${Math.floor((health?.uptime_seconds || 0) / 3600)}h ${Math.floor(((health?.uptime_seconds || 0) % 3600) / 60)}m`} />
+              <MetricTile label="Risk Engine" value={health?.checks?.risk_engine ? "OK" : "FAIL"} tone={health?.checks?.risk_engine ? "pass" : "fail"} />
+              <MetricTile label="Brain" value={health?.checks?.brain_initialized ? "OK" : "FAIL"} tone={health?.checks?.brain_initialized ? "pass" : "fail"} />
+            </div>
+            {(health?.checks?.server_running || health?.checks?.model_registry || health?.checks?.config_loaded) > (
+              <div style={{ marginTop: 12, display: "flex", gap: 8, flexWrap: "wrap" }}>
+                {health?.checks?.server_running && <span className="lane-chip tone-pass">Server OK</span>}
+                {health?.checks?.model_registry && <span className="lane-chip tone-pass">Registry OK</span>}
+                {health?.checks?.config_loaded && <span className="lane-chip tone-pass">Config OK</span>}
+              </div>
+            )}
+          </Panel>
+
+          {/* Backup Status */}
+          <Panel title="Backup Manager" subtitle="Automated backup status" icon={Database}>
+            <div className="metric-grid" style={{ gridTemplateColumns: "repeat(2, 1fr)" }}>
+              <MetricTile label="Backups" value={String(backup?.count || 0)} />
+              <MetricTile label="Latest" value={backup?.latest ? new Date(backup.latest).toLocaleDateString() : "None"} />
+              <MetricTile label="Auto-Backup" value={backup?.auto_enabled ? "ENABLED" : "DISABLED"} tone={backup?.auto_enabled ? "pass" : "warn"} />
+              <MetricTile label="Retention" value={`${backup?.max_backups || 7} days`} />
+            </div>
+            {backup?.latest_size_mb && (
+              <div style={{ marginTop: 8, fontSize: "0.75rem", color: "var(--text-muted)" }}>
+                Latest backup size: {backup.latest_size_mb} MB
+              </div>
+            )}
+          </Panel>
+
+          {/* Reversal Detection & Speed Simulator */}
+          <Panel title="Advanced Systems" subtitle="Reversal detection & execution speed" icon={Gauge}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <TrendingDown size={16} style={{ color: "var(--accent-purple)" }} />
+                  <span style={{ fontSize: "0.85rem", fontWeight: 600 }}>Reversal Detector</span>
+                </div>
+                <span className={`lane-chip ${reversal?.enabled ? "tone-pass" : ""}`}>
+                  {reversal?.enabled ? "ACTIVE" : "STANDBY"}
+                </span>
+              </div>
+              {reversal?.enabled && (
+                <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", paddingLeft: 24 }}>
+                  5-method confirmation • Auto-flip enabled • Divergence + Exhaustion + S/R breaks
+                </div>
+              )}
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 4 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <Gauge size={16} style={{ color: "var(--accent-cyan)" }} />
+                  <span style={{ fontSize: "0.85rem", fontWeight: 600 }}>Speed Simulator</span>
+                </div>
+                <span className={`lane-chip ${speed?.enabled ? "tone-pass" : ""}`}>
+                  {speed?.enabled ? "ACTIVE" : "STANDBY"}
+                </span>
+              </div>
+              {speed?.enabled && (
+                <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", paddingLeft: 24 }}>
+                  Profile: {speed?.network_profile || "excellent"} • Latency: {speed?.avg_latency_ms || "~50"}ms • Slippage sim active
+                </div>
+              )}
             </div>
           </Panel>
 

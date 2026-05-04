@@ -1,0 +1,2 @@
+- [Session Filter Disabled-Session Bug](session_filter_bug.md) — _check_session_filter can never return False; disabled sessions default to allowed
+- [Risk Engine Hardening Test Notes](project_risk_engine_hardening.md) — Key findings for testing Phase 1 hardening in risk_engine.py

@@ -1,5 +1,5 @@
 import React from "react";
-import { ArrowRightLeft, BarChart3, Clock, TrendingDown, TrendingUp } from "lucide-react";
+import { ArrowRightLeft, BarChart3, Clock, TrendingDown, TrendingUp, Brain, FileText } from "lucide-react";
 import { Panel, KpiCard, MetricTile, dollars, money, pct } from "../components/Common";
 
 export default function HistoryScreen({ data }) {
@@ -7,6 +7,8 @@ export default function HistoryScreen({ data }) {
   const review = data?.tradeReview || {};
   const learning = data?.learning || {};
   const log = learning?.learning_log || {};
+  const health = data?.health || {};
+  const backup = data?.backup || {};
 
   const bySymbol = review.bySymbol || review.by_symbol || log.by_symbol || {};
   const isLiveData = review.totalTrades > 0;
@@ -24,6 +26,64 @@ export default function HistoryScreen({ data }) {
         <span style={{ color: "var(--text-muted)", fontSize: "0.78rem" }}>
           {isLiveData ? `${review.totalTrades} live trades from MT5` : "Simulated backtest data — not from live trading"}
         </span>
+      </div>
+
+      {/* System Status Overview */}
+      <div className="grid-3" style={{ gap: 16 }}>
+        <Panel title="System Health" subtitle="Component status" icon={Brain}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span style={{ fontSize: "0.85rem" }}>Status</span>
+              <span className={`lane-chip ${health?.status === "ok" ? "tone-pass" : ""}`}>
+                {health?.status === "ok" ? "ONLINE" : health?.status || "Unknown"}
+              </span>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span style={{ fontSize: "0.85rem" }}>Uptime</span>
+              <span style={{ fontFamily: "var(--mono)", fontSize: "0.85rem" }}>
+                {Math.floor((health?.uptime_seconds || 0) / 3600)}h {Math.floor(((health?.uptime_seconds || 0) % 3600) / 60)}m
+              </span>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span style={{ fontSize: "0.85rem" }}>PID</span>
+              <span style={{ fontFamily: "var(--mono)", fontSize: "0.85rem" }}>{health?.pid || "-"}</span>
+            </div>
+          </div>
+        </Panel>
+
+        <Panel title="Backup Status" subtitle="Data protection" icon={FileText}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span style={{ fontSize: "0.85rem" }}>Backups</span>
+              <span style={{ fontFamily: "var(--mono)", fontSize: "0.85rem" }}>{backup?.count || 0}</span>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span style={{ fontSize: "0.85rem" }}>Latest</span>
+              <span style={{ fontFamily: "var(--mono)", fontSize: "0.75rem" }}>
+                {backup?.latest ? new Date(backup.latest).toLocaleDateString() : "None"}
+              </span>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span style={{ fontSize: "0.85rem" }}>Retention</span>
+              <span style={{ fontFamily: "var(--mono)", fontSize: "0.85rem" }}>{backup?.max_backups || 7} days</span>
+            </div>
+          </div>        </Panel>
+
+        <Panel title="Trade Log" subtitle="Decision tracking" icon={Clock}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span style={{ fontSize: "0.85rem" }}>Total Trades</span>
+              <span style={{ fontFamily: "var(--mono)", fontSize: "0.85rem" }}>{review.totalTrades || log.trades || 0}</span>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span style={{ fontSize: "0.85rem" }}>Decision Log</span>
+              <span className="lane-chip tone-pass" style={{ fontSize: "0.7rem" }}>JSONL</span>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span style={{ fontSize: "0.85rem" }}>Outcomes Tagged</span>
+              <span style={{ fontFamily: "var(--mono)", fontSize: "0.85rem" }}>{Object.keys(review.tagDistribution || {}).length} types</span>
+            </div>
+          </div>        </Panel>
       </div>
 
       {/* Trade Review KPIs */}

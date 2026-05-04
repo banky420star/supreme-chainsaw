@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useRef, useCallback } from "react";
-import { Activity, Shield, Cpu, Network, Zap, Brain, CandlestickChart, GitBranch, Rocket, Eye, Lock, Sparkles } from "lucide-react";
+import { Activity, Shield, Cpu, Network, Zap, Brain, CandlestickChart, GitBranch, Rocket, Eye, Lock, Sparkles, TrendingUp, Gauge, Database, HeartPulse } from "lucide-react";
 
 const BOOT_SEQUENCE = [
   { label: "Initializing neural pathways...", icon: Brain, duration: 1200, quip: "Synapses firing up" },
@@ -7,6 +7,10 @@ const BOOT_SEQUENCE = [
   { label: "Loading LSTM context memory...", icon: Cpu, duration: 1100, quip: "150 features, zero excuses" },
   { label: "Warming up PPO champion model...", icon: Activity, duration: 1000, quip: "Policy mode: engaged" },
   { label: "Scanning symbol lanes...", icon: CandlestickChart, duration: 800, quip: "4 symbols, 1 brain" },
+  { label: "Initializing reversal detector...", icon: TrendingUp, duration: 700, quip: "5 methods, zero mercy" },
+  { label: "Calibrating speed simulator...", icon: Gauge, duration: 600, quip: "Latency profiles loaded" },
+  { label: "Mounting backup manager...", icon: Database, duration: 500, quip: "7-day retention active" },
+  { label: "Starting health check endpoint...", icon: HeartPulse, duration: 400, quip: "/api/health ready" },
   { label: "Verifying risk authority...", icon: Shield, duration: 700, quip: "Drawdown check: passed" },
   { label: "Arming trailing stop manager...", icon: Zap, duration: 600, quip: "Profits, protected" },
   { label: "Calibrating deadzone threshold...", icon: Eye, duration: 500, quip: "LOW_VOL = hold tight" },
@@ -155,8 +159,11 @@ export default function LoadingScreen() {
 
         {/* Brand */}
         <h1 className={`brand-title ${isComplete ? "brand-ready" : ""}`}>
-          MONEY PRINTER
+          CHAIN GAMBLER
         </h1>
+        <div className="brand-subtitle" style={{ fontSize: "0.85rem", opacity: 0.7, marginTop: -8, marginBottom: 8 }}>
+          Money Printer Edition
+        </div>
         <div className="brand-subtitle">
           {isComplete ? "SYSTEM ONLINE" : "AUTONOMOUS TRADING PIPELINE"}
         </div>

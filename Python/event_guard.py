@@ -385,8 +385,8 @@ class EventGuard:
             if tick is not None:
                 point = mt5_executor._point_size(symbol)
                 return round(abs(tick.ask - tick.bid) / point * 10000, 1)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Failed to get current spread for {symbol}: {e}")
         return 0.0
 
     @staticmethod

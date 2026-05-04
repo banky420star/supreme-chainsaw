@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { Brain, BarChart3, Clock, TrendingUp, ArrowUpDown, Lightbulb } from "lucide-react";
+import { Brain, BarChart3, Clock, TrendingUp, ArrowUpDown, Lightbulb, Zap, TrendingUpDown } from "lucide-react";
 import { Panel, MetricTile, pct, dollars } from "../components/Common";
 
 function useMoney(v) {
@@ -157,6 +157,63 @@ export default function StrategiesScreen({ data }) {
           ))}
         </div>
       </Panel>
+
+      {/* Signal Optimization & Kelly Criterion */}
+      <div className="grid-2" style={{ gap: 16 }}>
+        <Panel title="Signal Quality Filters" subtitle="Multi-dimensional signal validation" icon={TrendingUpDown}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {[
+              { name: "Trend Alignment", desc: "Price action aligns with signal direction" },
+              { name: "Volatility Regime", desc: "Appropriate for current LSTM regime" },
+              { name: "Volume Confirmation", desc: "Sufficient volume for execution" },
+              { name: "S/R Distance", desc: "Adequate distance from support/resistance" },
+              { name: "Momentum Strength", desc: "ADX and momentum indicators confirm" },
+            ].map((filter, i) => (
+              <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 12px", background: "rgba(255,255,255,0.02)", borderRadius: 6 }}>
+                <div style={{ width: 6, height: 6, borderRadius: "50%", background: "var(--accent-cyan)" }} />
+                <div>
+                  <div style={{ fontSize: "0.85rem", fontWeight: 600 }}>{filter.name}</div>
+                  <div style={{ fontSize: "0.72rem", color: "var(--text-muted)" }}>{filter.desc}</div>
+                </div>
+              </div>
+            ))}
+          </div>          <div style={{ marginTop: 12, padding: 12, background: "rgba(90,215,255,0.04)", borderRadius: 8, border: "1px solid rgba(90,215,255,0.1)" }}>
+            <div style={{ fontSize: "0.78rem", color: "var(--text-secondary)" }}>
+              <strong>Quality Score Threshold:</strong> 0.40 minimum to pass. Blocked signals prevent low-confidence trades.
+            </div>
+          </div>        </Panel>
+
+        <Panel title="Kelly Criterion Sizing" subtitle="Mathematically optimal position sizing" icon={Zap}>
+          <div style={{ padding: 16, background: "rgba(255,255,255,0.02)", borderRadius: 10, marginBottom: 12 }}>
+            <div style={{ fontFamily: "var(--mono)", fontSize: "1.1rem", textAlign: "center", marginBottom: 12, color: "var(--accent-cyan)" }}>
+              f* = (p·b - q) / b
+            </div>
+            <div style={{ fontSize: "0.78rem", color: "var(--text-secondary)", lineHeight: 1.5 }}>
+              <strong>f*</strong> = Kelly fraction · <strong>p</strong> = win rate · <strong>q</strong> = loss rate (1-p) · <strong>b</strong> = avg win/avg loss ratio
+            </div>
+          </div>
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", padding: "8px 0", borderBottom: "1px solid rgba(255,255,255,0.04)" }}>
+              <span style={{ fontSize: "0.85rem" }}>Full Kelly</span>
+              <span style={{ fontFamily: "var(--mono)", fontSize: "0.85rem", color: "var(--accent-green)" }}>100% of f*</span>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", padding: "8px 0", borderBottom: "1px solid rgba(255,255,255,0.04)" }}>
+              <span style={{ fontSize: "0.85rem" }}>Half Kelly (default)</span>
+              <span style={{ fontFamily: "var(--mono)", fontSize: "0.85rem", color: "var(--accent-amber)" }}>50% of f*</span>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", padding: "8px 0" }}>
+              <span style={{ fontSize: "0.85rem" }}>Quarter Kelly</span>
+              <span style={{ fontFamily: "var(--mono)", fontSize: "0.85rem", color: "var(--text-muted)" }}>25% of f* (conservative)</span>
+            </div>
+          </div>
+
+          <div style={{ marginTop: 12, padding: 12, background: "rgba(243,187,74,0.04)", borderRadius: 8, border: "1px solid rgba(243,187,74,0.1)" }}>
+            <div style={{ fontSize: "0.78rem", color: "var(--text-secondary)" }}>
+              Kelly sizing applied when win rate > 50% and sufficient trade history (30+ trades) for statistical significance.
+            </div>
+          </div>        </Panel>
+      </div>
     </div>
   );
 }
