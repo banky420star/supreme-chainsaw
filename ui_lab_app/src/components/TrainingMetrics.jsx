@@ -1,9 +1,9 @@
-"""
-Training Metrics Dashboard Component
-
-Shows per-symbol profit, balance, drawdown, and timeframe optimization results
-during and after training.
-"""
+/**
+ * Training Metrics Dashboard Component
+ *
+ * Shows per-symbol profit, balance, drawdown, and timeframe optimization results
+ * during and after training.
+ */
 
 import React, { useState, useEffect } from "react";
 import { Activity, TrendingUp, TrendingDown, BarChart3, Clock, Target, Award, AlertTriangle } from "lucide-react";

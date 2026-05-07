@@ -1,8 +1,8 @@
 @echo off
 setlocal EnableDelayedExpansion
 REM ============================================================
-REM  Chain Gambler - Money Printer Desktop Launcher v2.0
-REM  Includes: Ollama AI, Training Analysis, Symbol Simulations
+REM  Chain Gambler - Money Printer Desktop Launcher v3.0
+REM  Includes: Guardian Trader, Ollama AI, Training Analysis
 REM ============================================================
 
 title Chain Gambler - Money Printer Edition
@@ -15,12 +15,15 @@ echo   Chain Gambler - Money Printer Desktop Launcher v2.0
 echo  ============================================================
 echo.
 echo   Features:
+echo   [✓] Guardian Trader - Professional Risk Management
+echo   [✓] Market Guardian - Regime Classification
+echo   [✓] Market Quality Scorer - 0-100 Trade Filter
+echo   [✓] Strategy Selector - Trend/MeanRev/Breakout
+echo   [✓] R-Based Exit Engine - Professional Trade Management
+echo   [✓] Trade Journal - Post-Trade Learning
 echo   [✓] Ollama AI for training descriptions
 echo   [✓] Per-symbol metrics tracking
 echo   [✓] Multi-timeframe optimization
-echo   [✓] Symbol simulations for $54 micro account
-echo   [✓] Training-Trading connection analysis
-echo   [✓] Real-time learning process visualization
 echo.
 echo  ============================================================
 echo.
@@ -60,7 +63,9 @@ set AGI_MAX_POS_PER_SYMBOL=1
 set AGI_MIN_LOTS=0.01
 set AGI_ACTION_THRESHOLD=0.001
 
-:: Micro Account Settings
+:: Guardian Trader Settings (Micro Account)
+set GUARDIAN_TRADER_ENABLED=true
+set GUARDIAN_CONFIG=configs/guardian_trader_micro.yaml
 set MICRO_ACCOUNT_MODE=true
 set MICRO_EQUITY=54
 
@@ -68,6 +73,13 @@ set MICRO_EQUITY=54
 set TRAINING_AI_ENABLED=true
 set TRAINING_TIMEFRAMES=1m,5m,15m,30m,1h
 set SYMBOL_SIMULATION_ENABLED=true
+
+:: Risk Settings
+set AGI_RISK_PERCENT=0.46
+set AGI_MAX_DAILY_LOSS=2.0
+set AGI_MAX_TRADE_RISK=0.25
+set AGI_MAX_OPEN_POSITIONS=1
+set AGI_COOLDOWN_AFTER_SL=30
 
 REM ── Start Ollama Server ──
 echo [*] Starting Ollama AI Server (port 11434)...
@@ -124,14 +136,18 @@ echo   [✓] Ollama AI Server    : http://localhost:11434
 echo   [✓] API Server          : http://localhost:5000/api/status
 echo   [✓] Training Endpoints  : /api/training/analysis
 echo                            : /api/training/metrics
-echo   [✓] Money Printer UI    : http://localhost:4183/ (or 4180-4182)
+echo   [✓] Money Printer UI    : http://localhost:5178/
 echo.
-echo   Micro Account Settings ($54):
-echo   ────────────────────────────
+echo   Guardian Trader Settings ($54 Micro):
+echo   ─────────────────────────────────────
 echo   • Position Size    : 0.01 lots (fixed)
-echo   • Risk per Trade   : 5%% ($2.70)
+echo   • Risk per Trade   : $0.25 (0.46%%)
+echo   • Max Daily Loss   : $2.00 (3.7%%)
 echo   • Max Positions    : 1
-necho   • Symbol Simulations: Running (check logs/symbol_sims_*.log)
+echo   • Quality Score    : Minimum 70/100 to trade
+echo   • Exit Engine      : R-based (BE @ 0.8R, Scale 33%% @ 1R/1.5R)
+echo   • News Block       : 60min before / 45min after
+echo   • Time Exit        : 4 hours if under 0.5R
 echo.
 echo   Quick Commands:
 echo   ───────────────
@@ -147,7 +163,7 @@ echo.
 timeout /t 5 /nobreak >nul
 
 REM ── Open Browser ──
-start "" "http://localhost:4183/"
+start "" "http://localhost:5178/"
 
 REM ── Keep console open for logs ──
 echo.

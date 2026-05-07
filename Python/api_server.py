@@ -2062,7 +2062,36 @@ def api_training_metrics():
         result["current_timesteps"] = progress["ppo"].get("timesteps", 0)
         result["target_timesteps"] = progress["ppo"].get("target_timesteps", 100000)
 
-    # Look for per-symbol training results
+    # Load combined training results file (contains per-symbol metrics)
+    # Note: Must NOT match per-symbol files like enhanced_training_results_BTCUSDm_*.json
+    combined_results_path = os.path.join(ROOT, "logs", "enhanced_training_results_*.json")
+    combined_files = glob.glob(combined_results_path)
+    # Filter out per-symbol files (they have symbol name after the underscore)
+    combined_files = [f for f in combined_files if not any(s in os.path.basename(f) for s in ['BTCUSDm', 'XAUUSDm', 'EURUSDm', 'GBPUSDm', 'ETHUSDm'])]
+    combined_training_data = {}
+    if combined_files:
+        combined_files.sort(reverse=True)
+        try:
+            with open(combined_files[0], "r", encoding="utf-8") as f:
+                combined_training_data = json.load(f)
+            # Populate per-symbol metrics from combined file
+            result["per_symbol_metrics"] = combined_training_data.get("per_symbol_metrics", {})
+            result["timeframe_selections"] = combined_training_data.get("timeframe_selections", {})
+            # Calculate summary stats
+            all_returns = [m.get("return_pct", 0) for m in result["per_symbol_metrics"].values()]
+            all_drawdowns = [m.get("max_drawdown_pct", 0) for m in result["per_symbol_metrics"].values()]
+            if all_returns:
+                result["average_return"] = sum(all_returns) / len(all_returns)
+                result["max_drawdown"] = max(all_drawdowns) if all_drawdowns else 0
+                # Find best/worst symbols by return
+                sorted_by_return = sorted(result["per_symbol_metrics"].items(), key=lambda x: x[1].get("return_pct", 0), reverse=True)
+                if sorted_by_return:
+                    result["best_symbol"] = sorted_by_return[0][0]
+                    result["worst_symbol"] = sorted_by_return[-1][0]
+        except Exception:
+            pass
+
+    # Look for per-symbol training results (fallback for timeframe data)
     for symbol in symbols:
         # Try to load enhanced training results
         training_results_path = os.path.join(ROOT, "logs", f"enhanced_training_results_{symbol}_*.json")
@@ -2158,19 +2187,22 @@ def api_training_metrics():
                     ],
                 }
 
-    # Calculate aggregate metrics
-    if result["per_symbol_metrics"]:
-        returns = [m["return_pct"] for m in result["per_symbol_metrics"].values()]
-        drawdowns = [m["max_drawdown_pct"] for m in result["per_symbol_metrics"].values()]
+    # Calculate aggregate metrics (defensive - ensure values are dicts)
+    if result["per_symbol_metrics"] and isinstance(result["per_symbol_metrics"], dict):
+        # Filter to only dict values
+        metrics_dicts = {k: v for k, v in result["per_symbol_metrics"].items() if isinstance(v, dict)}
+        if metrics_dicts:
+            returns = [m.get("return_pct", 0) for m in metrics_dicts.values()]
+            drawdowns = [m.get("max_drawdown_pct", 0) for m in metrics_dicts.values()]
 
-        result["average_return"] = sum(returns) / len(returns) if returns else 0
-        result["max_drawdown"] = max(drawdowns) if drawdowns else 0
+            result["average_return"] = sum(returns) / len(returns) if returns else 0
+            result["max_drawdown"] = max(drawdowns) if drawdowns else 0
 
-        # Find best and worst symbols
-        sorted_by_return = sorted(result["per_symbol_metrics"].items(), key=lambda x: x[1]["return_pct"], reverse=True)
-        if sorted_by_return:
-            result["best_symbol"] = sorted_by_return[0][0]
-            result["worst_symbol"] = sorted_by_return[-1][0]
+            # Find best and worst symbols
+            sorted_by_return = sorted(metrics_dicts.items(), key=lambda x: x[1].get("return_pct", 0), reverse=True)
+            if sorted_by_return:
+                result["best_symbol"] = sorted_by_return[0][0]
+                result["worst_symbol"] = sorted_by_return[-1][0]
 
     # Read timeframe optimization reports if available
     report_files = glob.glob(os.path.join(ROOT, "logs", "enhanced_training_report_*.txt"))

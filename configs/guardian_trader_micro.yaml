@@ -1,0 +1,155 @@
+# Guardian Trader Configuration - $54 Micro Account
+# Strict risk management for small account survival
+
+# Account Settings
+account:
+  initial_balance: 54.0
+  currency: USD
+  is_micro: true
+
+# Guardian Trader Settings
+guardian_trader:
+  enabled: true
+  version: "1.0.0"
+
+  # Market Guardian Settings
+  market_guardian:
+    enabled: true
+    atr_low_vol_pct: 0.3          # ATR as % of price
+    atr_high_vol_pct: 1.0
+    adx_trending_threshold: 25
+    adx_strong_trend_threshold: 40
+    bb_width_low: 0.5             # % of price
+    bb_width_high: 2.0
+
+  # Market Quality Scorer Settings
+  market_quality:
+    enabled: true
+    min_score_trade: 70           # Minimum quality score to trade
+    min_score_full_size: 85       # Score needed for full size
+    weights:
+      no_major_news: 20
+      spread_normal: 15
+      volatility_tradable: 15
+      session_liquid: 10
+      trend_or_range_clear: 15
+      reward_risk_available: 10
+      no_recent_sl_chop: 10
+      model_agrees: 5
+
+  # Strategy Selector Settings
+  strategy_selector:
+    enabled: true
+    min_strategy_confidence: 0.6
+
+    # Trend Module Settings
+    trend_ema_fast: 9
+    trend_ema_slow: 21
+    pullback_threshold: 0.5       # % of ATR
+    trend_adx_min: 25
+
+    # Mean Reversion Settings
+    mr_bb_period: 20
+    mr_bb_std: 2.0
+    mr_rsi_overbought: 70
+    mr_rsi_oversold: 30
+
+    # Breakout Settings
+    bo_range_lookback: 20
+    bo_threshold: 0.3             # % of range
+    bo_volume_confirm: true
+
+  # Exit Engine R Settings
+  exit_engine_r:
+    enabled: true
+    breakeven_trigger_r: 0.8      # Move to BE at 0.8R
+    scale_out_1_r: 1.0            # Close 33% at 1R
+    scale_out_1_pct: 0.33
+    scale_out_2_r: 1.5            # Close 33% at 1.5R
+    scale_out_2_pct: 0.33
+    runner_trigger_r: 2.0         # Activate runner at 2R
+    profit_retrace_pct: 0.35      # Close if profit retraces 35%
+    time_exit_minutes: 240        # 4 hour time limit
+    max_runner_r: 4.0             # Close full at 4R
+    trailing_distance_r: 1.0      # Trail 1R behind
+
+  # Trade Journal Settings
+  trade_journal:
+    enabled: true
+    data_dir: "logs/trade_journal"
+    max_history: 1000
+
+# Risk Settings - STRICT for $54 account
+risk:
+  # Daily/Session Limits
+  max_daily_loss: 2.0             # $2 max daily loss (3.7%)
+  max_daily_loss_pct: 3.7
+  max_drawdown_pct: 8.0           # Stop trading at 8% DD
+
+  # Per Trade Risk
+  max_trade_risk: 0.25            # $0.25 per trade (0.46%)
+  max_trade_risk_pct: 0.46
+  max_risk_per_symbol: 0.5        # $0.50 per symbol
+
+  # Position Limits
+  max_daily_trades: 5
+  max_open_positions: 1           # Only 1 position at a time
+  max_positions_per_symbol: 1
+  stop_after_consecutive_losses: 3
+
+  # Size Limits
+  max_lots: 0.01                  # Fixed 0.01 lots
+  min_lots: 0.01
+  size_cap: 0.01
+
+  # Spread/Slippage
+  max_spread_bps: 25              # 2.5 pips max
+  max_slippage_points: 5
+  enforce_slippage: true
+
+  # Intervals
+  min_trade_interval_sec: 120     # 2 min between trades
+  cooldown_after_sl_minutes: 30   # 30 min after stop loss
+
+# Event Guard Settings (News Avoidance)
+event_guard:
+  enabled: true
+  pre_event_min: 60               # Block 60 min before
+  event_live_min: 5               # Block during event
+  post_event_min: 45              # Block 45 min after
+  flat_before: true
+  half_size_during_post: true
+  max_spread_mult_post: 2.0
+  enforce_slippage: true
+
+  # Extreme Events (longer blocks)
+  extreme_events:
+    - NFP
+    - CPI
+    - FOMC
+    - interest_rate_decision
+    - Powell_speech
+    - unemployment
+  extreme_pre_min: 180            # 3 hours before
+  extreme_post_min: 90            # 1.5 hours after
+
+# Trading Mode
+mode: DRY-RUN                     # Keep in DRY-RUN until proven
+
+# Symbols (limited for micro account)
+symbols:
+  - XAUUSDm                        # Gold only - most predictable
+
+# Sessions
+trading_sessions:
+  london: true
+  new_york: true
+  asian: false                    # Skip low liquidity Asian session
+
+# Telegram Notifications
+telegram:
+  enabled: true
+  notify_on_trade: true
+  notify_on_stop_loss: true
+  notify_daily_summary: true
+  notify_quality_score_block: true
