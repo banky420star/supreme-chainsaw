@@ -1,0 +1,3 @@
+#!/bin/bash
+# Thin wrapper: open the .command file in Terminal when double-clicked
+/usr/bin/open "/Volumes/AI_DRIVE/trading bot/chain_gambler-main/ChainGambler.command"

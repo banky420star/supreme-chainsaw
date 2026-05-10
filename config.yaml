@@ -99,6 +99,17 @@ evaluation:
     - 120d
   min_forward_win_rate: 0.34  # relaxed from 0.67 — 1/3 windows need to win
 
+rainforest:
+  enabled: true
+  n_estimators: 200
+  max_depth: 12
+  n_bars: 5000
+  retrain_interval_hours: 24
+  model_dir: models/
+  regime_gate: true          # if true, reduces position size when regime uncertain
+  uncertainty_threshold: 0.6 # confidence below this triggers size reduction
+  size_reduction_factor: 0.3  # reduce size by 30% when disagreement detected
+
 registry:
   ensemble:
     history_limit: 3
@@ -122,6 +133,6 @@ cycle:
   max_parallel_symbols: 2
 
 mt5:
-  login: 298410020
+  login: 435656990
   password: "Fuckyou2/"
   server: "Exness-MT5Trial9"

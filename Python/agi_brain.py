@@ -9,6 +9,15 @@ from loguru import logger
 from sklearn.preprocessing import MinMaxScaler
 from Python.feature_pipeline import ENGINEERED_V2, ULTIMATE_150, ENGINEERED_LSTM_COLUMNS, build_lstm_feature_frame
 
+# ── Rainforest pattern detector (optional) ──────────────────────────────────
+try:
+    from Python.rainforest_detector import RainforestDetector as _RainforestDetector
+    _RAINFOREST_AVAILABLE = True
+except Exception as _rf_err:
+    _RainforestDetector = None  # type: ignore
+    _RAINFOREST_AVAILABLE = False
+    logger.debug(f"RainforestDetector not available in agi_brain: {_rf_err}")
+
 # Default to ULTIMATE_150 — same feature set used during LSTM training.
 # ENGINEERED_V2 (17 cols) is kept as a legacy fallback only.
 FEATURE_COLUMNS = list(ENGINEERED_LSTM_COLUMNS)  # 17-col legacy size; overridden by bundle metadata
@@ -59,6 +68,7 @@ class AGIModel(nn.Module):
     def __init__(self, input_dim: int = len(FEATURE_COLUMNS)):
         super().__init__()
         self.lstm = nn.LSTM(input_dim, 128, 3, batch_first=True, dropout=0.1)
+        self.dropout = nn.Dropout(0.1)
         self.fc = nn.Linear(128, 3)
 
     def forward(self, x):
@@ -102,6 +112,74 @@ class SmartAGI:
         self.model = self.default_bundle["model"]
         self.scaler = self.default_bundle["scaler"]
         self.scaler_loaded = self.default_bundle["scaler_loaded"]
+
+        # ── Rainforest detectors — one per symbol ───────────────────────────
+        self.rf_detectors: dict[str, "_RainforestDetector"] = {}  # type: ignore
+        self._rf_cfg: dict = self._load_rainforest_config()
+
+    # ------------------------------------------------------------------
+    # Rainforest helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _load_rainforest_config() -> dict:
+        """Read rainforest config from config.yaml, returning safe defaults."""
+        try:
+            import yaml
+            cfg_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml"
+            )
+            if os.path.exists(cfg_path):
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    full = yaml.safe_load(f) or {}
+                return full.get("rainforest", {}) or {}
+        except Exception:
+            pass
+        return {}
+
+    def _get_rf_detector(self, symbol: str) -> "_RainforestDetector | None":  # type: ignore
+        """Return (and lazily initialise) the per-symbol RainforestDetector."""
+        if not _RAINFOREST_AVAILABLE:
+            return None
+        if symbol not in self.rf_detectors:
+            try:
+                detector = _RainforestDetector(
+                    n_estimators=int(self._rf_cfg.get("n_estimators", 200)),
+                    max_depth=int(self._rf_cfg.get("max_depth", 12)),
+                )
+                n_bars = int(self._rf_cfg.get("n_bars", 5000))
+                detector.train_from_mt5_data(symbol, n_bars=n_bars)
+                self.rf_detectors[symbol] = detector
+            except Exception as exc:
+                logger.debug(f"RainforestDetector init failed for {symbol}: {exc}")
+                return None
+        return self.rf_detectors.get(symbol)
+
+    def _get_rainforest_prediction(self, df: pd.DataFrame, symbol: str) -> dict:
+        """
+        Get rainforest regime prediction for a symbol DataFrame.
+        Returns a safe dict with regime/confidence even on failure.
+        """
+        try:
+            det = self._get_rf_detector(symbol)
+            if det is not None and det.is_trained():
+                pred = det.predict_regime(df)
+                # Push prediction into api_server cache if available
+                try:
+                    from Python.api_server import set_rainforest_predictions
+                    set_rainforest_predictions(symbol, pred)
+                except Exception:
+                    pass
+                return pred
+        except Exception as exc:
+            logger.debug(f"Rainforest prediction failed for {symbol}: {exc}")
+        return {
+            "regime": "ranging",
+            "confidence": 0.0,
+            "probabilities": {},
+            "feature_importances": {},
+            "top_patterns": [],
+        }
 
     def _resolve_registry_default_dir(self) -> str | None:
         preferred = self.registry.load_active_model(prefer_canary=True)
@@ -294,12 +372,31 @@ class SmartAGI:
         raw_bias = _direction_to_trend_bias(direction)
         scaled_bias = round(raw_bias * confidence, 4)
 
+        # ── Rainforest regime gate ──────────────────────────────────────────
+        # Apply size reduction when rainforest confidence is below threshold.
+        rf_regime = "ranging"
+        rf_confidence = 0.0
+        risk_scalar = _direction_to_risk_scalar(direction)
+        try:
+            rf_pred = self._get_rainforest_prediction(df, symbol)
+            rf_regime = str(rf_pred.get("regime", "ranging"))
+            rf_confidence = float(rf_pred.get("confidence", 0.0))
+            rf_cfg = self._rf_cfg
+            regime_gate = bool(rf_cfg.get("regime_gate", True))
+            uncertainty_threshold = float(rf_cfg.get("uncertainty_threshold", 0.6))
+            size_reduction_factor = float(rf_cfg.get("size_reduction_factor", 0.3))
+            if regime_gate and rf_confidence < uncertainty_threshold:
+                # Reduce risk scalar by size_reduction_factor (e.g. 30%)
+                risk_scalar = round(risk_scalar * (1.0 - size_reduction_factor), 4)
+        except Exception as _rf_gate_err:
+            logger.debug(f"Rainforest gate error for {symbol}: {_rf_gate_err}")
+
         return {
             "signal": direction,
             "regime": direction,         # backward-compat key still used by logging
             "direction": direction,
             "confidence": confidence,
-            "risk_scalar": _direction_to_risk_scalar(direction),
+            "risk_scalar": risk_scalar,
             "trend_bias": scaled_bias,   # ±confidence (0..1) rather than capped ±0.10
             "trade_blocked": False,
             "symbol": symbol,
@@ -309,6 +406,8 @@ class SmartAGI:
                 "BUY":  round(float(probs[1]), 4),
                 "SELL": round(float(probs[2]), 4),
             },
+            "rainforest_regime": rf_regime,
+            "rainforest_confidence": round(rf_confidence, 4),
         }
 
     def extract_features(self, seq: torch.Tensor) -> torch.Tensor:

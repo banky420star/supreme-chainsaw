@@ -1,0 +1,167 @@
+version: '3.9'
+
+# =============================================================================
+# Chain Gambler — Production Docker Compose
+# Usage: docker compose -f docker-compose.prod.yml up -d
+# Prerequisites: .env file populated from .env.example
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Backend — Chain Gambler AGI trading engine + Bottle API
+  # Runs Python.Server_AGI in live mode; exposes REST/SSE on port 9090.
+  # NOTE: Live MT5 trading requires Windows. On Linux/Mac this runs in
+  #       simulation/dry-run mode (MT5 init will fail gracefully).
+  # ---------------------------------------------------------------------------
+  backend:
+    build: .
+    restart: always
+    ports:
+      - "9090:9090"
+    env_file: .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTORCH_ENABLE_MPS_FALLBACK=1
+      # Redis URL for any future state-sharing between services
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./models:/app/models          # Trained model weights (persist across restarts)
+      - ./logs:/app/logs              # Application and access logs
+      - ./data:/app/data              # Market data cache
+      - ./runtime:/app/runtime        # Runtime state files (lock files, etc.)
+      - ./backups:/app/backups        # Model/state backup snapshots
+      - ./config.yaml:/app/config.yaml:ro  # Read-only config mount
+      - state-data:/app/state         # Named volume for transient shared state
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s   # Allow extra time for model loading at startup
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: '2.0'
+        reservations:
+          memory: 1G
+          cpus: '0.5'
+
+  # ---------------------------------------------------------------------------
+  # Frontend — React SPA (Vite build served by nginx)
+  # ---------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.frontend
+    restart: always
+    # Not exposed directly; nginx reverse-proxies to this container
+    expose:
+      - "80"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.25'
+
+  # ---------------------------------------------------------------------------
+  # nginx — Reverse proxy: routes /api/* → backend, /* → frontend
+  # Terminates HTTP; add TLS termination here or in a load-balancer above.
+  # ---------------------------------------------------------------------------
+  nginx:
+    image: nginx:1.27-alpine
+    restart: always
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - backend
+      - frontend
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.25'
+
+  # ---------------------------------------------------------------------------
+  # Redis — In-memory broker / state cache
+  # AOF persistence enabled so state survives container restarts.
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    restart: always
+    expose:
+      - "6379"
+    volumes:
+      - redis-data:/data
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          memory: 640M
+          cpus: '0.5'
+
+  # ---------------------------------------------------------------------------
+  # n8n — Workflow automation (Telegram alerts, trade webhooks, etc.)
+  # Protected by HTTP basic auth; change N8N_PASSWORD in .env before deploying.
+  # ---------------------------------------------------------------------------
+  n8n:
+    image: n8nio/n8n:1.47.1
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    env_file: .env
+    environment:
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=admin
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_PASSWORD:-changeme}
+      - GENERIC_TIMEZONE=Africa/Johannesburg
+      - N8N_HOST=0.0.0.0
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      # Disable telemetry in production
+      - N8N_DIAGNOSTICS_ENABLED=false
+      - N8N_VERSION_NOTIFICATIONS_ENABLED=false
+    volumes:
+      - n8n-data:/home/node/.n8n
+      - ./n8n-workflow:/home/node/workflows:ro
+    depends_on:
+      - backend
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+
+# -----------------------------------------------------------------------------
+# Named volumes — survive docker compose down (not removed unless --volumes)
+# -----------------------------------------------------------------------------
+volumes:
+  redis-data:
+    driver: local
+  n8n-data:
+    driver: local
+  state-data:
+    driver: local

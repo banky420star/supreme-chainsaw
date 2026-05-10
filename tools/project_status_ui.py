@@ -2635,7 +2635,7 @@ def control_action(action, payload):
                     os.remove(lock_path)
                 except Exception:
                     pass
-            pid = _spawn([_venv_python(), "-m", "Python.Server_AGI", "--live"], "server_stdout.log", "server_stderr.log")
+            pid = _spawn([_venv_python(), "-m", "Python.Server_AGI"], "server_stdout.log", "server_stderr.log")
             time.sleep(1.2)
             if not _is_running("python.server_agi"):
                 try:

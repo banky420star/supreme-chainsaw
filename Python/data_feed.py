@@ -106,6 +106,16 @@ def _load_data_cfg() -> dict:
 
 
 def _initialize_mt5() -> bool:
+    # Check if already initialized and connected to avoid re-auth failures
+    try:
+        tinfo = mt5.terminal_info()
+        if tinfo is not None and getattr(tinfo, "connected", False):
+            ainfo = mt5.account_info()
+            if ainfo is not None and getattr(ainfo, "login", 0):
+                return True
+    except Exception:
+        pass
+
     mt5_cfg = _load_mt5_cfg()
     login_raw = os.environ.get("MT5_LOGIN") or _resolve_cfg_value(mt5_cfg.get("login", ""))
     password = os.environ.get("MT5_PASSWORD") or _resolve_cfg_value(mt5_cfg.get("password", ""))
@@ -114,9 +124,20 @@ def _initialize_mt5() -> bool:
         login = int(str(login_raw).strip()) if str(login_raw).strip() else 0
     except Exception:
         login = 0
-    if login and password and server:
-        return bool(mt5.initialize(login=login, password=str(password), server=str(server)))
-    return bool(mt5.initialize())
+    if not (login and password and server):
+        return bool(mt5.initialize())
+
+    # Terminal may be initialized but not logged in — try login first, then initialize
+    try:
+        tinfo = mt5.terminal_info()
+        if tinfo is not None:
+            login_ok = mt5.login(login=login, password=str(password), server=str(server))
+            if login_ok:
+                return True
+    except Exception:
+        pass
+
+    return bool(mt5.initialize(login=login, password=str(password), server=str(server)))
 
 
 def _ensure_symbol_ready(symbol: str) -> bool:

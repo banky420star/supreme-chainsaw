@@ -1,7 +1,24 @@
 import os
+import sys
+import time
+from datetime import datetime, timedelta, timezone
 
 from loguru import logger
-from Python.mt5_compat import mt5
+from Python.mt5_compat import mt5 as _mt5
+
+try:
+    from Python import paper_trading as _paper
+except Exception:
+    _paper = None
+
+try:
+    from Python import live_safety
+except Exception:
+    live_safety = None
+
+
+def _is_paper_mode() -> bool:
+    return _paper is not None and _paper.get_mode() == "paper"
 
 
 MAGIC_BY_SYMBOL = {
@@ -37,7 +54,7 @@ class MT5Executor:
 
     def __init__(self, risk):
         self.risk = risk
-        self._is_live = _mt5 is not None and sys.platform == "win32"
+        self._is_live = _mt5 is not None
         self._last_order_meta = {}  # carry context for close orders
         self._last_sl_hit_time = {}  # symbol -> timestamp of last SL hit (cooldown tracking)
         self._last_spread_spike_time = {}  # symbol -> timestamp of last spread spike rejection
@@ -79,6 +96,18 @@ class MT5Executor:
     def set_server_ref(self, server):
         """Set reference to AGIServer for live_armed and other runtime checks."""
         self._server_ref = server
+
+    def _assert_live_gate(self, action_desc: str) -> tuple[bool, str]:
+        """Return (allowed, reason) for live order_send. Paper mode always passes."""
+        if _is_paper_mode():
+            return True, "paper_mode"
+        if live_safety is not None:
+            gate = live_safety.live_trading_allowed()
+            if not gate["allowed"]:
+                return False, f"live_gate_blocked:{gate['gates']}"
+        else:
+            return False, "live_safety_module_missing"
+        return True, "live_allowed"
 
     def _preflight_check(self, symbol: str, side: str, lots: float) -> tuple:
         """
@@ -189,7 +218,6 @@ class MT5Executor:
             if not sessions:
                 return True, "ok"  # No session filter = all allowed
 
-            from datetime import datetime, timezone
             utc_hour = datetime.now(timezone.utc).hour
 
             # Determine which sessions COVER this hour (regardless of enabled/disabled)
@@ -477,7 +505,6 @@ class MT5Executor:
             return
 
         try:
-            from datetime import datetime, timedelta
             # Get last 30 days of deals
             to_dt = datetime.now()
             from_dt = to_dt - timedelta(days=30)
@@ -616,10 +643,10 @@ class MT5Executor:
         return lot_size
 
     def _symbol_info(self, symbol):
-        return mt5.symbol_info(symbol)
+        return _mt5.symbol_info(symbol)
 
     def _symbol_tick(self, symbol):
-        return mt5.symbol_info_tick(symbol)
+        return _mt5.symbol_info_tick(symbol)
 
     def get_tick(self, symbol):
         return self._symbol_tick(symbol)
@@ -728,19 +755,19 @@ class MT5Executor:
     def _select_filling_mode(self, symbol):
         info = self._symbol_info(symbol)
         if info is None:
-            return mt5.ORDER_FILLING_RETURN
+            return _mt5.ORDER_FILLING_RETURN
 
-        fm = int(getattr(info, "filling_mode", mt5.ORDER_FILLING_RETURN))
+        fm = int(getattr(info, "filling_mode", _mt5.ORDER_FILLING_RETURN))
 
         # Some brokers expose bitmask-like values (e.g. 3 => FOK/IOC allowed).
         if fm == 3:
-            return mt5.ORDER_FILLING_IOC
+            return _mt5.ORDER_FILLING_IOC
 
-        if fm in (mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_RETURN):
+        if fm in (_mt5.ORDER_FILLING_FOK, _mt5.ORDER_FILLING_IOC, _mt5.ORDER_FILLING_RETURN):
             return fm
 
         # Safe fallback for market execution when RETURN is unsupported.
-        return mt5.ORDER_FILLING_IOC
+        return _mt5.ORDER_FILLING_IOC
 
     def _min_stop_distance(self, symbol):
         info = self._symbol_info(symbol)
@@ -767,7 +794,7 @@ class MT5Executor:
         new_sl = float(sl) if sl else None
         new_tp = float(tp) if tp else None
 
-        if order_type == mt5.ORDER_TYPE_BUY:
+        if order_type == _mt5.ORDER_TYPE_BUY:
             # Buy SL must stay below bid, TP must stay above ask.
             max_sl = bid - min_dist
             min_tp = ask + min_dist
@@ -809,10 +836,13 @@ class MT5Executor:
         if not self._is_live:
             return longs, shorts
 
-        positions = _mt5.positions_get(symbol=symbol)
+        if _is_paper_mode():
+            positions = _paper.paper_positions_get(symbol=symbol)
+        else:
+            positions = _mt5.positions_get(symbol=symbol)
         if positions:
             for p in positions:
-                if p.type == mt5.ORDER_TYPE_BUY:
+                if p.type == _mt5.ORDER_TYPE_BUY or (isinstance(p, dict) and p.get("type") == "BUY"):
                     longs.append(p)
                 else:
                     shorts.append(p)
@@ -851,7 +881,7 @@ class MT5Executor:
             if add_lots >= 0.01:
                 result_meta = self.open_position(
                     symbol,
-                    mt5.ORDER_TYPE_BUY,
+                    _mt5.ORDER_TYPE_BUY,
                     add_lots,
                     order_meta=order_meta,
                     execution_context=execution_context,
@@ -868,7 +898,7 @@ class MT5Executor:
             if add_lots >= 0.01:
                 result_meta = self.open_position(
                     symbol,
-                    mt5.ORDER_TYPE_SELL,
+                    _mt5.ORDER_TYPE_SELL,
                     add_lots,
                     order_meta=order_meta,
                     execution_context=execution_context,
@@ -885,8 +915,8 @@ class MT5Executor:
                 self.risk.record_error()
                 continue
 
-            close_type = mt5.ORDER_TYPE_SELL if p.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
-            close_price = tick.bid if close_type == mt5.ORDER_TYPE_SELL else tick.ask
+            close_type = _mt5.ORDER_TYPE_SELL if p.type == _mt5.ORDER_TYPE_BUY else _mt5.ORDER_TYPE_BUY
+            close_price = tick.bid if close_type == _mt5.ORDER_TYPE_SELL else tick.ask
 
             request = {
                 "action": _mt5.TRADE_ACTION_DEAL,
@@ -896,20 +926,29 @@ class MT5Executor:
                 "position": p.ticket,
                 "price": close_price,
                 "deviation": 20,
-                "type_time": mt5.ORDER_TIME_GTC,
+                "type_time": _mt5.ORDER_TIME_GTC,
                 "type_filling": self._select_filling_mode(p.symbol),
             }
             request["magic"] = self._magic_for_order(p.symbol, order_meta, request_kind="close")
             request["comment"] = self._order_comment(p.symbol, order_meta, request_kind="close")
-            result = mt5.order_send(request)
+            if _is_paper_mode():
+                result = _paper.paper_close_position(p.ticket, close_price, p.volume)
+            else:
+                allowed, reason = self._assert_live_gate("close")
+                if not allowed:
+                    logger.error(f"Live gate blocked close for {p.symbol}: {reason}")
+                    self.risk.record_error()
+                    result = None
+                else:
+                    result = _mt5.order_send(request)
             last_meta = self._log_order_send(p.symbol, "close", request, result, order_meta)
-            last_meta["executed"] = bool(result is not None and result.retcode == mt5.TRADE_RETCODE_DONE)
-            if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+            last_meta["executed"] = bool(result is not None and result.retcode == _mt5.TRADE_RETCODE_DONE)
+            if result is None or result.retcode != _mt5.TRADE_RETCODE_DONE:
                 self.risk.record_error()
         return last_meta
 
     def _atr_points(self, symbol, bars=120, period=14):
-        rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, bars)
+        rates = _mt5.copy_rates_from_pos(symbol, _mt5.TIMEFRAME_M5, 0, bars)
         info = self._symbol_info(symbol)
         if rates is None or len(rates) < period + 2 or info is None:
             return None
@@ -966,7 +1005,7 @@ class MT5Executor:
         sl_dist = sl_points * point
         tp_dist = tp_points * point
 
-        if order_type == mt5.ORDER_TYPE_BUY:
+        if order_type == _mt5.ORDER_TYPE_BUY:
             sl = round(entry_price - sl_dist, digits)
             tp = round(entry_price + tp_dist, digits)
         else:
@@ -982,7 +1021,7 @@ class MT5Executor:
             self.risk.record_error()
             return {"request_action": "open", "executed": False}
 
-        price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
+        price = tick.ask if order_type == _mt5.ORDER_TYPE_BUY else tick.bid
         sl, tp, deviation = self._get_sl_tp(symbol, order_type, price)
 
         request = {
@@ -992,7 +1031,7 @@ class MT5Executor:
             "type": order_type,
             "price": price,
             "deviation": deviation,
-            "type_time": mt5.ORDER_TIME_GTC,
+            "type_time": _mt5.ORDER_TIME_GTC,
             "type_filling": self._select_filling_mode(symbol),
         }
         request["magic"] = self._magic_for_order(symbol, order_meta, request_kind="open")
@@ -1003,15 +1042,27 @@ class MT5Executor:
         if tp is not None:
             request["tp"] = tp
 
-        result = mt5.order_send(request)
+        if _is_paper_mode():
+            result = _paper.paper_order_send(request)
+        else:
+            allowed, reason = self._assert_live_gate("open")
+            if not allowed:
+                logger.error(f"Live gate blocked open for {symbol}: {reason}")
+                self.risk.record_error()
+                result = None
+            else:
+                result = _mt5.order_send(request)
         meta = self._log_order_send(symbol, "open", request, result, order_meta)
-        meta["executed"] = bool(result is not None and result.retcode == mt5.TRADE_RETCODE_DONE)
-        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+        meta["executed"] = bool(result is not None and result.retcode == _mt5.TRADE_RETCODE_DONE)
+        if result is None or result.retcode != _mt5.TRADE_RETCODE_DONE:
             self.risk.record_error()
         return meta
 
     def manage_open_positions(self, symbol):
-        positions = mt5.positions_get(symbol=symbol)
+        if _is_paper_mode():
+            positions = _paper.paper_positions_get(symbol=symbol)
+        else:
+            positions = _mt5.positions_get(symbol=symbol)
         info = self._symbol_info(symbol)
         tick = self._symbol_tick(symbol)
         if not positions or info is None or tick is None:
@@ -1027,10 +1078,10 @@ class MT5Executor:
         trailing_step = int(profile.get("trailing_step_points", max(10, dyn_sl // 8)))
 
         for p in positions:
-            current_price = tick.bid if p.type == mt5.ORDER_TYPE_BUY else tick.ask
+            current_price = tick.bid if p.type == _mt5.ORDER_TYPE_BUY else tick.ask
             profit_points = (
                 (current_price - p.price_open) / point
-                if p.type == mt5.ORDER_TYPE_BUY
+                if p.type == _mt5.ORDER_TYPE_BUY
                 else (p.price_open - current_price) / point
             )
 
@@ -1042,7 +1093,7 @@ class MT5Executor:
                 tp_dist = dyn_tp * point
                 new_tp = (
                     p.price_open + tp_dist
-                    if p.type == mt5.ORDER_TYPE_BUY
+                    if p.type == _mt5.ORDER_TYPE_BUY
                     else p.price_open - tp_dist
                 )
 
@@ -1051,11 +1102,11 @@ class MT5Executor:
                 be_buffer = 5 * point
                 be_sl = (
                     p.price_open + be_buffer
-                    if p.type == mt5.ORDER_TYPE_BUY
+                    if p.type == _mt5.ORDER_TYPE_BUY
                     else p.price_open - be_buffer
                 )
-                if (p.type == mt5.ORDER_TYPE_BUY and (new_sl is None or be_sl > new_sl)) or (
-                    p.type == mt5.ORDER_TYPE_SELL and (new_sl is None or be_sl < new_sl)
+                if (p.type == _mt5.ORDER_TYPE_BUY and (new_sl is None or be_sl > new_sl)) or (
+                    p.type == _mt5.ORDER_TYPE_SELL and (new_sl is None or be_sl < new_sl)
                 ):
                     new_sl = be_sl
 
@@ -1064,11 +1115,11 @@ class MT5Executor:
                 trail_dist = trailing_step * point
                 trail_sl = (
                     current_price - trail_dist
-                    if p.type == mt5.ORDER_TYPE_BUY
+                    if p.type == _mt5.ORDER_TYPE_BUY
                     else current_price + trail_dist
                 )
-                if (p.type == mt5.ORDER_TYPE_BUY and (new_sl is None or trail_sl > new_sl)) or (
-                    p.type == mt5.ORDER_TYPE_SELL and (new_sl is None or trail_sl < new_sl)
+                if (p.type == _mt5.ORDER_TYPE_BUY and (new_sl is None or trail_sl > new_sl)) or (
+                    p.type == _mt5.ORDER_TYPE_SELL and (new_sl is None or trail_sl < new_sl)
                 ):
                     new_sl = trail_sl
 
@@ -1086,7 +1137,7 @@ class MT5Executor:
                 continue
 
             req = {
-                "action": mt5.TRADE_ACTION_SLTP,
+                "action": _mt5.TRADE_ACTION_SLTP,
                 "symbol": symbol,
                 "position": p.ticket,
             }
@@ -1097,8 +1148,17 @@ class MT5Executor:
             req["magic"] = self._magic_for_order(symbol, None, request_kind="manage")
             req["comment"] = self._order_comment(symbol, None, request_kind="manage")
 
-            result = mt5.order_send(req)
+            if _is_paper_mode():
+                result = _paper.paper_order_send(req)
+            else:
+                allowed, reason = self._assert_live_gate("manage")
+                if not allowed:
+                    logger.error(f"Live gate blocked manage for {symbol}: {reason}")
+                    self.risk.record_error()
+                    result = None
+                else:
+                    result = _mt5.order_send(req)
             self._log_order_send(symbol, "manage", req, result, {"symbol": symbol})
-            if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+            if result is None or result.retcode != _mt5.TRADE_RETCODE_DONE:
                 self.risk.record_error()
 

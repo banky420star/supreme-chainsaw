@@ -2,6 +2,7 @@ import os
 from datetime import datetime, timezone
 
 import yaml
+from loguru import logger
 
 _CFG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml")
 
@@ -69,7 +70,6 @@ class RiskEngine:
         if self.realized_pnl_today <= -abs(self.max_daily_loss):
             self.halt = True
             self._halt_reason = "daily_loss"
-            logger.error(f"🛑 KILL SWITCH: Daily loss ${self.realized_pnl_today:.2f} exceeded limit ${daily_limit:.2f} ({self.max_daily_loss_pct}% of ${self._current_equity:.2f})")
 
     def record_trade_result(self, symbol, pnl):
         self.maybe_roll_day()

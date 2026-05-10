@@ -290,7 +290,7 @@ def get_mt5_equity(default_balance: float = 10000.0, cfg: dict | None = None) ->
     server = os.environ.get("MT5_SERVER", mt5_cfg.get("server", ""))
 
     try:
-        import MetaTrader5 as mt5
+        from Python.mt5_compat import mt5
 
         if login and password and server:
             connected = mt5.initialize(login=login, password=password, server=server)
@@ -809,9 +809,12 @@ def _train_once(symbols: list[str], cfg: dict, total_timesteps: int, initial_bal
 
     stage_model = latest_model
     stage_vec = latest_vec
-    if not _is_vecnorm_compatible(stage_vec, feature_version=feature_version):
-        best_model = os.path.join(best_dir, "best_model.zip")
-        best_vec = os.path.join(best_dir, "vec_normalize.pkl")
+    best_model = os.path.join(best_dir, "best_model.zip")
+    best_vec = os.path.join(best_dir, "vec_normalize.pkl")
+    if os.path.exists(best_model) and os.path.exists(best_vec) and _is_vecnorm_compatible(best_vec, feature_version=feature_version):
+        stage_model = best_model
+        stage_vec = best_vec
+    elif not _is_vecnorm_compatible(stage_vec, feature_version=feature_version):
         if os.path.exists(best_model) and os.path.exists(best_vec) and _is_vecnorm_compatible(best_vec, feature_version=feature_version):
             stage_model = best_model
             stage_vec = best_vec

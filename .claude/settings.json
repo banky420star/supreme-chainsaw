@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s *)",
+      "Bash(curl -sI *)",
+      "Bash(xattr -l *)",
+      "Bash(sample *)"
+    ]
+  }
+}

@@ -134,7 +134,7 @@ class TestSymbolArtifactValidation:
             reg = ModelRegistry(root=str(root), registry_config={})
             xau_path = _make_candidate(root, "xau_v1", "XAUUSDm")
 
-            with pytest.raises(RuntimeError, match="Symbol mismatch"):
+            with pytest.raises(RuntimeError, match="artifact is not tagged for that symbol"):
                 reg.set_canary(xau_path, symbol="BTCUSDm")
         finally:
             shutil.rmtree(root, ignore_errors=True)
@@ -183,7 +183,7 @@ class TestPerSymbolCanaryMetrics:
             }
             reg._write_active(active)
 
-            with pytest.raises(RuntimeError, match="has not met promotion thresholds"):
+            with pytest.raises(RuntimeError, match="Canary promotion blocked"):
                 reg.promote_canary_to_champion(symbol="XAUUSDm")
         finally:
             shutil.rmtree(root, ignore_errors=True)
@@ -332,7 +332,7 @@ class TestGetActiveModel:
             global_champ = _make_candidate(root, "global_v1", "EURUSDm")
             reg.set_canary(global_champ)
             reg.update_canary_metrics(10, 1.0, 0.01, 10.0)
-            reg.promote_canary_to_champion()
+            reg.promote_canary_to_champion(force=True)
 
             eur_canary = _make_candidate(root, "eur_canary_v1", "EURUSDm")
             reg.set_canary(eur_canary, symbol="EURUSDm")
@@ -350,7 +350,7 @@ class TestGetActiveModel:
             global_champ = _make_candidate(root, "global_v1", symbol=None)
             reg.set_canary(global_champ)
             reg.update_canary_metrics(10, 1.0, 0.01, 10.0)
-            reg.promote_canary_to_champion()
+            reg.promote_canary_to_champion(force=True)
 
             result = reg.get_active_model(symbol="XAUUSDm", prefer_canary=False)
             assert result == global_champ
@@ -377,11 +377,11 @@ class TestChampionHistory:
             reg = ModelRegistry(root=str(root), registry_config={})
             reg.set_canary("/eur/canary_v1", symbol="EURUSDm")
             reg.update_canary_metrics(10, 1.0, 0.01, 10.0, symbol="EURUSDm")
-            reg.promote_canary_to_champion(symbol="EURUSDm")
+            reg.promote_canary_to_champion(symbol="EURUSDm", force=True)
 
             reg.set_canary("/eur/canary_v2", symbol="EURUSDm")
             reg.update_canary_metrics(15, 2.0, 0.02, 15.0, symbol="EURUSDm")
-            reg.promote_canary_to_champion(symbol="EURUSDm")
+            reg.promote_canary_to_champion(symbol="EURUSDm", force=True)
 
             history = reg.get_recent_champions(symbol="EURUSDm")
             assert len(history) == 1  # One old champion replaced

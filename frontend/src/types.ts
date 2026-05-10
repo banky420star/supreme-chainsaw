@@ -1,6 +1,8 @@
 export interface PatternRecord {
   symbol?: string
   pattern_name?: string
+  pattern?: string
+  type?: string
   regime?: string
   discovered_at?: string
   count?: number
@@ -17,8 +19,17 @@ export interface AccountInfo {
   balance?: number
   equity?: number
   free_margin?: number
+  profit?: number
   open_positions?: number
   positions?: any[]
+  realized_today?: number
+  drawdown_pct?: number
+  connected?: boolean
+  login?: number | string
+  server?: string
+  name?: string
+  currency?: string
+  leverage?: number
 }
 
 export interface TrainingVisual {
@@ -27,6 +38,16 @@ export interface TrainingVisual {
   progress_pct?: number
   queue?: any[]
   fail_reason?: string
+  /* ── Progress-panel extensions ── */
+  current_epoch?: number
+  total_epochs?: number
+  loss?: number
+  val_loss?: number
+  current_timestep?: number
+  target_timesteps?: number
+  current_step?: number
+  target_steps?: number
+  eta_seconds?: number | null
 }
 
 export interface TrainingPipelineSummary {
@@ -88,4 +109,23 @@ export interface StatusPayload {
   registry_summary?: any
   telegram?: any
   repo_root?: string
+  risk?: {
+    halt?: boolean
+    haltReason?: string
+    drawdownPct?: number
+    canTrade?: boolean
+    maxPositionsPerSymbol?: number
+    riskPerTradePct?: number
+  }
+  models?: any
+}
+
+export interface AgentStatus {
+  id: string
+  name: string
+  role: string
+  status: 'Online' | 'Training' | 'Idle' | 'Error'
+  lastActivity: string
+  metric: string
+  logs: string
 }

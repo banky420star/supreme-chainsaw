@@ -1,5 +1,5 @@
 import React from 'react'
-import { Trade, TradesResponse, TradeSummary, fetchTrades, fetchTradesSummary } from '../services/api'
+import { Trade, TradesResponse, TradeSummary, EconomicEvent, fetchTrades, fetchTradesSummary } from '../services/api'
 
 const colors = {
   bg: '#0d1726',
@@ -106,7 +106,106 @@ function pnlColor(v: number): string {
 
 const PAGE_SIZE = 50
 
-const TradeHistoryPanel: React.FC = () => {
+const IMPORTANCE_COLOR: Record<string, string> = {
+  high:   colors.red,
+  medium: colors.amber,
+  low:    colors.muted,
+}
+
+const IMPORTANCE_DOT: Record<string, string> = {
+  high:   '⬛',  // replaced by colored dot in JSX
+  medium: '⬛',
+  low:    '⬛',
+}
+
+function fmtCalTime(iso: string): string {
+  try {
+    const d = new Date(iso)
+    return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+  } catch {
+    return iso
+  }
+}
+
+function CalendarPanel({ events }: { events: EconomicEvent[] }) {
+  const [showAll, setShowAll] = React.useState(false)
+  const highOnly = events.filter(e => e.importance >= 1)
+  const visible = showAll ? events : highOnly.slice(0, 20)
+
+  return (
+    <div style={{ ...panelStyle, minWidth: 260, maxWidth: 320, flexShrink: 0 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+        <h3 style={{ margin: 0, fontSize: 14, fontWeight: 700, color: colors.cyan }}>
+          Economic Calendar
+        </h3>
+        <span style={{ fontSize: 11, color: colors.muted }}>MT5 · 7d</span>
+      </div>
+      <div style={{ display: 'flex', gap: 6, marginBottom: 10 }}>
+        <button
+          onClick={() => setShowAll(false)}
+          style={{ ...btnStyle, fontSize: 11, padding: '3px 10px', background: !showAll ? 'rgba(90,215,255,0.12)' : colors.bg, color: !showAll ? colors.cyan : colors.muted, border: `1px solid ${!showAll ? colors.cyan : colors.border}` }}
+        >
+          High/Med
+        </button>
+        <button
+          onClick={() => setShowAll(true)}
+          style={{ ...btnStyle, fontSize: 11, padding: '3px 10px', background: showAll ? 'rgba(90,215,255,0.12)' : colors.bg, color: showAll ? colors.cyan : colors.muted, border: `1px solid ${showAll ? colors.cyan : colors.border}` }}
+        >
+          All
+        </button>
+      </div>
+      {visible.length === 0 ? (
+        <div style={{ color: colors.muted, fontSize: 12, padding: '12px 0' }}>
+          No upcoming events
+        </div>
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 520, overflowY: 'auto' }}>
+          {visible.map((ev, i) => {
+            const dotColor = IMPORTANCE_COLOR[ev.importance_label] ?? colors.muted
+            return (
+              <div key={ev.event_id || i} style={{
+                padding: '8px 10px',
+                borderRadius: 6,
+                background: 'rgba(10,17,26,0.6)',
+                border: `1px solid ${ev.importance === 2 ? 'rgba(255,123,143,0.25)' : colors.border}`,
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 }}>
+                  <span style={{
+                    width: 7, height: 7, borderRadius: '50%', flexShrink: 0,
+                    background: dotColor,
+                    boxShadow: ev.importance === 2 ? `0 0 6px ${dotColor}` : 'none',
+                    display: 'inline-block',
+                  }} />
+                  <span style={{ fontSize: 12, fontWeight: 600, color: colors.text, lineHeight: 1.3 }}>
+                    {ev.name}
+                  </span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: colors.muted }}>
+                  <span style={{ fontFamily: 'monospace', color: dotColor === colors.muted ? colors.muted : dotColor }}>
+                    {ev.currency || ev.country}
+                  </span>
+                  <span>{fmtCalTime(ev.time)}</span>
+                </div>
+                {(ev.forecast != null || ev.previous != null) && (
+                  <div style={{ fontSize: 10, color: colors.muted, marginTop: 3, fontFamily: 'monospace' }}>
+                    {ev.forecast != null && <span>Fcst: {ev.forecast}  </span>}
+                    {ev.previous != null && <span>Prev: {ev.previous}</span>}
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
+
+interface TradeHistoryPanelProps {
+  calendar?: EconomicEvent[]
+}
+
+const TradeHistoryPanel: React.FC<TradeHistoryPanelProps> = ({ calendar = [] }) => {
   const [trades, setTrades] = React.useState<Trade[]>([])
   const [total, setTotal] = React.useState(0)
   const [offset, setOffset] = React.useState(0)
@@ -185,8 +284,10 @@ const TradeHistoryPanel: React.FC = () => {
   return (
     <div style={{ background: colors.bg, color: colors.text, padding: 20 }}>
       <h2 style={{ margin: '0 0 16px', fontSize: 18, color: colors.cyan, fontWeight: 700 }}>
-        Trade History
+        Trade History — MT5
       </h2>
+      <div style={{ display: 'flex', gap: 16, alignItems: 'flex-start' }}>
+      <div style={{ flex: 1, minWidth: 0 }}>
 
       {/* Filters */}
       <div style={{ ...panelStyle, display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'center' }}>
@@ -382,6 +483,9 @@ const TradeHistoryPanel: React.FC = () => {
           </div>
         )}
       </div>
+      </div>{/* flex left col */}
+      <CalendarPanel events={calendar} />
+      </div>{/* flex row */}
     </div>
   )
 }

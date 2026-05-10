@@ -1,6 +1,6 @@
 import React from 'react'
 import { StatusPayload } from '../types'
-import { Trade, TradeSummary, fetchTrades, fetchTradesSummary } from '../services/api'
+import { Trade, TradeSummary, fetchTrades, fetchTradesSummary, fetchLanes, LaneStatus } from '../services/api'
 
 interface Props {
   status: StatusPayload
@@ -93,23 +93,51 @@ function outcomeColor(outcome: string): string {
   return colors.amber
 }
 
-const MAGIC_RANGES = [
-  { label: 'Standard BTC', range: '51000 - 51999', color: colors.cyan },
-  { label: 'Standard XAU', range: '52000 - 52999', color: colors.amber },
-  { label: 'HFT BTC', range: '61000 - 61999', color: colors.green },
-  { label: 'HFT XAU', range: '62000 - 62999', color: colors.red },
-]
-
-const HFT_CONFIG = [
-  { label: 'Timeframe', value: 'M1' },
-  { label: 'Risk Limits', value: 'Separate per-lane' },
-  { label: 'Bot Lane', value: 'hft' },
-  { label: 'Execution', value: 'Low-latency path' },
-]
-
 const HFTHealthPanel: React.FC<Props> = ({ status }) => {
   const [hftSummary, setHftSummary] = React.useState<TradeSummary | null>(null)
   const [recentTrades, setRecentTrades] = React.useState<Trade[]>([])
+  const [lanes, setLanes] = React.useState<LaneStatus[]>([])
+
+  React.useEffect(() => {
+    const loadLanes = async () => {
+      try {
+        const data = await fetchLanes()
+        setLanes(data.lanes || [])
+      } catch { /* ignore */ }
+    }
+    loadLanes()
+    const iv = setInterval(loadLanes, 30_000)
+    return () => clearInterval(iv)
+  }, [])
+
+  const magicRanges = React.useMemo(() => {
+    const laneSymbols = lanes.map(l => l.symbol)
+    const configured = status?.training?.configured_symbols
+    const symbols = laneSymbols.length > 0 ? laneSymbols : (configured || [])
+    if (symbols.length > 0) {
+      return symbols.map((sym: string, i: number) => ({
+        label: `HFT ${sym}`,
+        range: `${61000 + i * 1000} - ${61999 + i * 1000}`,
+        color: [colors.green, colors.red, colors.cyan, colors.amber][i % 4],
+      }))
+    }
+    return [
+      { label: 'Standard BTC', range: '51000 - 51999', color: colors.cyan },
+      { label: 'Standard XAU', range: '52000 - 52999', color: colors.amber },
+      { label: 'HFT BTC', range: '61000 - 61999', color: colors.green },
+      { label: 'HFT XAU', range: '62000 - 62999', color: colors.red },
+    ]
+  }, [lanes, status])
+
+  const hftConfig = React.useMemo(() => {
+    const risk = status?.risk
+    return [
+      { label: 'Timeframe', value: 'M1' },
+      { label: 'Risk Limits', value: risk?.riskPerTradePct != null ? `${risk.riskPerTradePct}% / trade` : 'Separate per-lane' },
+      { label: 'Bot Lane', value: 'hft' },
+      { label: 'Execution', value: risk?.halt ? 'HALTED' : 'Low-latency path' },
+    ]
+  }, [status])
 
   const loadHFTData = React.useCallback(async () => {
     const [summaryRes, tradesRes] = await Promise.all([
@@ -146,7 +174,7 @@ const HFTHealthPanel: React.FC<Props> = ({ status }) => {
             gap: 12,
           }}
         >
-          {MAGIC_RANGES.map(mr => (
+          {magicRanges.map(mr => (
             <div key={mr.label} style={cardStyle}>
               <div style={{ ...labelStyle, color: mr.color }}>{mr.label}</div>
               <div style={{ fontSize: 18, fontWeight: 700, fontFamily: 'monospace', color: colors.text }}>
@@ -281,7 +309,7 @@ const HFTHealthPanel: React.FC<Props> = ({ status }) => {
             gap: 12,
           }}
         >
-          {HFT_CONFIG.map(cfg => (
+          {hftConfig.map(cfg => (
             <div key={cfg.label} style={cardStyle}>
               <div style={labelStyle}>{cfg.label}</div>
               <div style={{ fontSize: 14, fontWeight: 600, color: colors.text }}>

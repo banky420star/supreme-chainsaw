@@ -1,6 +1,7 @@
 import React from 'react'
 import { StatusPayload } from '../types'
-import { Trade, TradeSummary, fetchTrades, fetchTradesSummary } from '../services/api'
+import { Trade, TradeSummary, fetchTrades, fetchTradesSummary, fetchEquityCurve, EquityCurveResponse } from '../services/api'
+import EquityChart from './EquityChart'
 
 interface Props {
   status: StatusPayload
@@ -71,6 +72,8 @@ function statusBadge(
 const DashboardPanel: React.FC<Props> = ({ status }) => {
   const [tradeSummary, setTradeSummary] = React.useState<TradeSummary | null>(null)
   const [recentTrades, setRecentTrades] = React.useState<Trade[]>([])
+  const [equityCurve, setEquityCurve] = React.useState<EquityCurveResponse | null>(null)
+  const [equityWindow, setEquityWindow] = React.useState<'30d' | '90d' | 'all'>('all')
 
   React.useEffect(() => {
     const loadTradeData = async () => {
@@ -85,6 +88,10 @@ const DashboardPanel: React.FC<Props> = ({ status }) => {
     const interval = setInterval(loadTradeData, 15_000)
     return () => clearInterval(interval)
   }, [])
+
+  React.useEffect(() => {
+    fetchEquityCurve(equityWindow).then(setEquityCurve).catch(() => {})
+  }, [equityWindow])
 
   const account = status.account
   const server = status.server
@@ -145,6 +152,16 @@ const DashboardPanel: React.FC<Props> = ({ status }) => {
             {canaryBadge.label}
           </span>
         </div>
+      </div>
+
+      {/* Equity Curve */}
+      <div style={{ ...panelStyle, marginBottom: 24 }}>
+        <EquityChart
+          data={equityCurve?.points ?? []}
+          height={200}
+          window={equityWindow}
+          onWindowChange={setEquityWindow}
+        />
       </div>
 
       <div style={{ ...panelStyle, marginBottom: 24 }}>

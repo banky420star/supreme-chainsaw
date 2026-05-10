@@ -56,10 +56,12 @@ $serverEnv = @{
 
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = $pythonExe
-$psi.Arguments = "-m Python.Server_AGI --live"
+$psi.Arguments = "-m Python.Server_AGI"
 $psi.WorkingDirectory = $repoRoot
 $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $false
+$serverEnv["CHAIN_GAMBLER_EXECUTION_MODE"] = "paper"
+$serverEnv["CHAIN_GAMBLER_ALLOW_LIVE"] = "0"
 foreach ($entry in $serverEnv.GetEnumerator()) {
   $psi.EnvironmentVariables[[string]$entry.Key] = [string]$entry.Value
 }

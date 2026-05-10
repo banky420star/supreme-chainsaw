@@ -72,7 +72,7 @@ class NewsSentimentEngine:
         # Cache MT5 calendar API availability (resolved once at init)
         self._mt5_has_calendar = False
         try:
-            import MetaTrader5 as _mt5
+            from Python.mt5_compat import mt5 as _mt5
             self._mt5_has_calendar = hasattr(_mt5, "calendar_country")
         except ImportError:
             pass
@@ -234,7 +234,7 @@ class NewsSentimentEngine:
         default = {"impact_score": 0.0, "minutes_to_event": 999, "event_name": "", "currency": ""}
 
         try:
-            import MetaTrader5 as mt5
+            from Python.mt5_compat import mt5
             if not mt5.initialize():
                 return default
 

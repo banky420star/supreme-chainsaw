@@ -11,13 +11,9 @@ Overlap windows:
 
 Hours 21:00-24:00 are not covered by any session and default to allowed.
 
-IMPORTANT IMPLEMENTATION NOTE:
-  _check_session_filter builds `matching_sessions` as a list of sessions that are
-  BOTH in-range AND enabled.  When all applicable sessions are disabled,
-  `matching_sessions` is empty and the method returns (True, "ok") — the same
-  outcome as "no session covers this hour."  This means disabling all sessions
-  for an hour does NOT block trading; it allows it.  This is documented as a
-  potential bug in the Coverage Gaps section below.
+When all applicable sessions are disabled for the current hour, the method
+returns (False, "outside_trading_session") to block trading. Hours with no
+session coverage at all (21-23) still default to allowed.
 """
 import builtins
 import io
@@ -169,10 +165,9 @@ class TestNoConfigAllows:
 class TestAsianBlocked:
     """EURUSDm config has asian: false, london: true, new_york: true.
 
-    Hours 0-6 fall ONLY in the Asian session.  With asian disabled, no
-    *enabled* session covers these hours, so matching_sessions is empty and
-    the method returns (True, "ok") — the same as "no session coverage."
-    This is the current implementation behavior (see module docstring).
+    Hours 0-6 fall ONLY in the Asian session.  With asian disabled, all
+    covering sessions are disabled, so the method returns
+    (False, "outside_trading_session").
     """
 
     @pytest.fixture(autouse=True)
@@ -189,18 +184,16 @@ class TestAsianBlocked:
     ):
         """Hours 0-6 are Asian-only with asian=false.
 
-        Current behavior: no enabled session matches, matching_sessions is
-        empty, and the method returns (True, "ok").  This is documented as
-        a potential bug in the module docstring.
+        The only covering session is disabled, so trading is blocked.
         """
         executor = _make_executor()
         fake_now = datetime(2026, 1, 1, utc_hour, 30, tzinfo=timezone.utc)
         with patch("Python.mt5_executor.datetime") as mock_dt:
             mock_dt.now.return_value = fake_now
             ok, reason = executor._check_session_filter("EURUSDm")
-        assert ok is True, (
-            f"Hour {utc_hour}: with asian=false, matching_sessions is empty, "
-            f"so method returns (True, 'ok')"
+        assert ok is False, (
+            f"Hour {utc_hour}: with asian=false, the only covering session is disabled, "
+            f"so method should return (False, ...)"
         )
 
     def test_asian_london_overlap_hour_7(self, config_store, redirect_fs):
@@ -241,16 +234,15 @@ class TestOverlapAsianLondon:
     """During 07-08 UTC, both Asian and London overlap.
 
     If either is enabled, trading is allowed.  If BOTH are disabled,
-    matching_sessions is empty and the method returns (True, "ok") per
-    current implementation behavior.
+    the method returns (False, "outside_trading_session").
     """
 
     @pytest.mark.parametrize("asian,london,expected", [
         (False, True, True),   # London alone allows
         (True, False, True),   # Asian alone allows
         (True, True, True),    # Both enabled => allowed
-        # Both disabled: matching_sessions empty => returns (True, "ok")
-        (False, False, True),
+        # Both disabled => blocked
+        (False, False, False),
     ])
     def test_hour_7_overlap_combinations(self, config_store, redirect_fs,
                                           asian, london, expected):
@@ -277,16 +269,15 @@ class TestOverlapLondonNY:
     """During 12-16 UTC, both London and NY overlap.
 
     If either is enabled, trading is allowed.  If BOTH are disabled,
-    matching_sessions is empty and the method returns (True, "ok") per
-    current implementation behavior.
+    the method returns (False, "outside_trading_session").
     """
 
     @pytest.mark.parametrize("london,ny,expected", [
         (False, True, True),   # NY alone allows
         (True, False, True),   # London alone allows
         (True, True, True),    # Both enabled => allowed
-        # Both disabled: matching_sessions empty => returns (True, "ok")
-        (False, False, True),
+        # Both disabled => blocked
+        (False, False, False),
     ])
     @pytest.mark.parametrize("utc_hour", [12, 13, 14, 15])
     def test_london_ny_overlap_combinations(self, config_store, redirect_fs,
@@ -360,14 +351,12 @@ class TestEdgeCases:
             ok, reason = executor._check_session_filter("BOUND2")
         assert ok is True, "Hour 16 is NY-only, ny=True => allowed"
 
-    def test_all_sessions_false_hours_0_to_6_still_allowed(
+    def test_all_sessions_false_hours_0_to_6_blocked(
         self, config_store, redirect_fs
     ):
-        """With all sessions false, hours 0-6 have no *enabled* session.
+        """With all sessions false, hours 0-6 are covered only by Asian.
 
-        Current behavior: matching_sessions is empty, so the method returns
-        (True, "ok").  This means disabling all sessions does NOT block
-        trading — it is treated identically to "no session covers this hour."
+        All covering sessions are disabled, so the method blocks trading.
         """
         _register_config(config_store, "ALLFALSE", {
             "asian": False,
@@ -380,11 +369,9 @@ class TestEdgeCases:
             with patch("Python.mt5_executor.datetime") as mock_dt:
                 mock_dt.now.return_value = fake_now
                 ok, reason = executor._check_session_filter("ALLFALSE")
-            assert ok is True, (
-                f"Hour {hour}: all sessions disabled => matching_sessions empty "
-                f"=> method returns (True, 'ok')"
+            assert ok is False, (
+                f"Hour {hour}: all covering sessions disabled => method should block"
             )
-            assert reason == "ok"
 
     def test_missing_session_key_defaults_to_true(self, config_store, redirect_fs):
         """If the YAML omits a session key entirely, .get(key, True) defaults
@@ -413,24 +400,11 @@ class TestEdgeCases:
         assert ok is True, "Exception during config load should not block trading"
         assert reason == "ok"
 
-    def test_session_filter_blocks_when_at_least_one_matches_but_none_enabled(
+    def test_all_sessions_false_blocks_covered_hours_allows_gap_hours(
         self, config_store, redirect_fs
     ):
-        """Demonstrates the boundary case that DOES produce a block.
-
-        If at least one enabled session matches the current hour, allowed=True.
-        If no enabled session matches BUT the hour falls in a session range,
-        the method still returns (True, "ok") because matching_sessions is
-        empty — same as "no coverage."
-
-        The ONLY way to get a block is: at least one session covers the hour
-        AND is enabled, BUT that should already make allowed=True.  So under
-        the current implementation, _check_session_filter can NEVER return
-        (False, ...) because matching_sessions being non-empty implies
-        allowed=True was set.
-
-        This test confirms that the method always returns (True, ...) for
-        every hour when all sessions are explicitly disabled.
+        """With all sessions disabled, hours covered by any session are blocked.
+        Hours 21-23 have no session coverage and default to allowed.
         """
         _register_config(config_store, "NEVERBLOCK", {
             "asian": False,
@@ -443,10 +417,15 @@ class TestEdgeCases:
             with patch("Python.mt5_executor.datetime") as mock_dt:
                 mock_dt.now.return_value = fake_now
                 ok, reason = executor._check_session_filter("NEVERBLOCK")
-            assert ok is True, (
-                f"Hour {hour}: all sessions disabled but method returned "
-                f"ok=False, reason={reason}"
-            )
+            if hour <= 20:
+                assert ok is False, (
+                    f"Hour {hour}: all sessions disabled but method returned "
+                    f"ok=True, reason={reason}"
+                )
+            else:
+                assert ok is True, (
+                    f"Hour {hour}: no session coverage should default to allowed"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -466,11 +445,10 @@ class TestPositiveSessionEnforcement:
     that the method SHOULD have.
     """
 
-    def test_asian_disabled_blocks_pure_asian_hours_DESIRED(self, config_store, redirect_fs):
-        """DESIRED behavior: hour 3 with only Asian coverage and asian=False
-        should block trading.  Current implementation returns (True, "ok").
+    def test_asian_disabled_blocks_pure_asian_hours(self, config_store, redirect_fs):
+        """Hour 3 with only Asian coverage and asian=False should block trading.
 
-        This test documents the gap between current and desired behavior.
+        The implementation now correctly returns (False, "outside_trading_session").
         """
         _register_config(config_store, "DESIRED_BEHAV", {
             "asian": False,
@@ -482,11 +460,7 @@ class TestPositiveSessionEnforcement:
         with patch("Python.mt5_executor.datetime") as mock_dt:
             mock_dt.now.return_value = fake_now
             ok, reason = executor._check_session_filter("DESIRED_BEHAV")
-        # Current behavior: returns (True, "ok") because matching_sessions
-        # is empty (asian disabled, london/NY don't cover hour 3).
-        # Desired behavior: should return (False, "outside_trading_session")
-        # This test asserts CURRENT behavior; update assertion when bug is fixed.
-        assert ok is True, (
-            "Current behavior: hour 3 with asian=False returns (True, 'ok') "
-            "because matching_sessions is empty.  This SHOULD return False."
+        assert ok is False, (
+            "Hour 3 with asian=False should return False because the only "
+            "covering session is disabled."
         )

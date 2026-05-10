@@ -169,20 +169,5 @@
   ],
   "seq_len": 60,
   "epochs": 20,
-  "samples": 24939,
-  "class_distribution": {
-    "0": 9976,
-    "1": 7413,
-    "2": 7550
-  },
-  "class_pct": {
-    "0": 40.0,
-    "1": 29.7,
-    "2": 30.3
-  },
-  "class_weights": {
-    "HOLD": 0.8181,
-    "BUY": 1.1009,
-    "SELL": 1.081
-  }
+  "samples": 99939
 }

@@ -46,9 +46,11 @@ set AGI_PNL_POLL=true
 set CANARY_LOT_MULT=0.25
 
 echo ============================================================
-echo  Chain Gambler - LIVE Mode (5min interval, no hedging)
+echo  Chain Gambler - PAPER Mode (5min interval, no hedging)
 echo  Symbols: EURUSDm, GBPUSDm, BTCUSDm
 echo  Trade interval: 5min | Review: 2min | No hedging
 echo ============================================================
 
-python -m Python.Server_AGI --live
+set CHAIN_GAMBLER_EXECUTION_MODE=paper
+set CHAIN_GAMBLER_ALLOW_LIVE=0
+python -m Python.Server_AGI

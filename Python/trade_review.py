@@ -20,7 +20,7 @@ from collections import defaultdict
 from loguru import logger
 
 try:
-    import MetaTrader5 as mt5
+    from Python.mt5_compat import mt5
 except ImportError:
     mt5 = None
 

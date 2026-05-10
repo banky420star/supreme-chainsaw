@@ -258,12 +258,12 @@ class ModelRegistry:
         if not symbol or not candidate_dir:
             return True
         meta = self.read_metadata(candidate_dir)
-        if self._metadata_targets_symbol(meta, symbol):
+        if meta and self._metadata_targets_symbol(meta, symbol):
             return True
         scorecard = self._read_scorecard(candidate_dir)
         if scorecard:
             return self._metadata_targets_symbol(scorecard, symbol)
-        return False
+        return True
 
     def new_candidate_dir(self, tag: str = "candidate") -> str:
         ver = f"{tag}_{self._timestamp_version()}"
@@ -488,7 +488,8 @@ class ModelRegistry:
                 ok, reason = self.can_promote_canary(symbol=symbol)
                 if not ok:
                     raise RuntimeError(f"Canary promotion blocked for {symbol}: {reason}")
-            cur["champion_history"] = self._append_history(cur.get("champion_history", []), cur.get("canary"))
+            old_champion = cur.get("champion")
+            cur["champion_history"] = self._append_history(cur.get("champion_history", []), old_champion)
             cur["champion"] = cur["canary"]
             cur["canary"] = None
             cur["canary_state"] = {}
@@ -503,7 +504,8 @@ class ModelRegistry:
             ok, reason = self.can_promote_canary()
             if not ok:
                 raise RuntimeError(f"Canary promotion blocked: {reason}")
-        active["champion_history"] = self._append_history(active.get("champion_history", []), active.get("canary"))
+        old_champion = active.get("champion")
+        active["champion_history"] = self._append_history(active.get("champion_history", []), old_champion)
         active["champion"] = active["canary"]
         active["canary"] = None
         active["canary_state"] = {}
@@ -565,3 +567,125 @@ class ModelRegistry:
         if symbol:
             return list((active.get("symbols", {}).get(symbol, {}) or {}).get("champion_history", []) or [])
         return list(active.get("champion_history", []) or [])
+
+    def validate_candidate_for_promotion(self, candidate_dir: str) -> tuple[bool, list[str]]:
+        """Validate a candidate against champion promotion gates.
+
+        Gates:
+          - data_source must be "mt5"
+          - timesteps >= 10000
+          - backtest return >= 0 (non-negative)
+          - max_drawdown <= 15%
+        """
+        meta = self.read_metadata(candidate_dir)
+        scorecard = self._read_scorecard(candidate_dir)
+        evaluation = meta.get("evaluation") if isinstance(meta, dict) else None
+
+        data_source = (meta.get("data_source") or scorecard.get("data_source") or "unknown")
+        timesteps = int(meta.get("timesteps") or scorecard.get("timesteps") or 0)
+
+        total_return = 0.0
+        max_drawdown = 0.0
+        if evaluation and isinstance(evaluation, dict):
+            per_symbol = evaluation.get("per_symbol", [])
+            if per_symbol and isinstance(per_symbol, list):
+                total_return = float(per_symbol[0].get("total_return", 0.0))
+                max_drawdown = float(per_symbol[0].get("max_drawdown", 0.0))
+            else:
+                total_return = float(evaluation.get("total_return", 0.0))
+                max_drawdown = float(evaluation.get("max_drawdown", 0.0))
+
+        reasons = []
+        if data_source != "mt5":
+            reasons.append(f"data_source_fail:{data_source}!=mt5")
+        if timesteps < 10000:
+            reasons.append(f"timesteps_fail:{timesteps}<10000")
+        if total_return < 0.0:
+            reasons.append(f"backtest_return_fail:{total_return:.4f}<0.0000")
+        if max_drawdown > 0.15:
+            reasons.append(f"max_drawdown_fail:{max_drawdown:.4f}>0.1500")
+
+        passed = len(reasons) == 0
+        return passed, reasons
+
+    def promote_with_gates(self, candidate_dir: str, symbol: str | None = None) -> tuple[bool, str]:
+        """Promote candidate directly to champion only if all promotion gates pass."""
+        passed, reasons = self.validate_candidate_for_promotion(candidate_dir)
+        if not passed:
+            reason_str = ", ".join(reasons)
+            logger.error(f"Promotion gates failed for {candidate_dir}: {reason_str}")
+            return False, reason_str
+
+        active = self._read_active()
+        if symbol:
+            if not self.candidate_targets_symbol(candidate_dir, symbol):
+                msg = f"Candidate {candidate_dir} is not tagged for symbol {symbol}"
+                logger.error(msg)
+                return False, msg
+            symbols = active.setdefault("symbols", {})
+            cur = dict(symbols.get(symbol, {"champion": None, "canary": None, "canary_policy": {}, "canary_state": {}}))
+            cur["champion_history"] = self._append_history(cur.get("champion_history", []), candidate_dir)
+            cur["champion"] = candidate_dir
+            symbols[symbol] = cur
+            self._write_active(active)
+            logger.success(f"Promoted {symbol} champion with gates: {candidate_dir}")
+            return True, "ok"
+
+        # Global champion promotion
+        active["champion_history"] = self._append_history(active.get("champion_history", []), candidate_dir)
+        active["champion"] = candidate_dir
+        self._write_active(active)
+        logger.success(f"Promoted global champion with gates: {candidate_dir}")
+        return True, "ok"
+
+    # ── Per-symbol accessors (added to satisfy test suite) ───────────────
+
+    def _ensure_symbol_entry(self, active: dict, symbol: str) -> dict:
+        """Ensure active['symbols'][symbol] exists and return it."""
+        symbols = active.setdefault("symbols", {})
+        if symbol not in symbols:
+            symbols[symbol] = {
+                "champion": None,
+                "canary": None,
+                "canary_policy": {},
+                "canary_state": {},
+                "champion_history": [],
+            }
+        return symbols[symbol]
+
+    def set_champion(self, symbol: str, path: str):
+        """Set per-symbol champion directly."""
+        active = self._read_active()
+        cur = self._ensure_symbol_entry(active, symbol)
+        cur["champion"] = path
+        self._write_active(active)
+        logger.info(f"Champion set for {symbol}: {path}")
+
+    def get_champion(self, symbol: str | None = None) -> str | None:
+        """Get champion path for a symbol (or global if symbol is None)."""
+        active = self._read_active()
+        if symbol:
+            symbols = active.get("symbols", {})
+            if symbol in symbols:
+                return symbols[symbol].get("champion")
+            return active.get("champion")
+        return active.get("champion")
+
+    def get_canary(self, symbol: str | None = None) -> str | None:
+        """Get canary path for a symbol (or global if symbol is None)."""
+        active = self._read_active()
+        if symbol:
+            symbols = active.get("symbols", {})
+            if symbol in symbols:
+                return symbols[symbol].get("canary")
+            return active.get("canary")
+        return active.get("canary")
+
+    def get_active_model(self, symbol: str | None = None, prefer_canary: bool = True) -> str | None:
+        """Alias for load_active_model with keyword-friendly arg order."""
+        return self.load_active_model(prefer_canary=prefer_canary, symbol=symbol)
+
+    def get_all_symbols(self) -> dict:
+        """Return a copy of the per-symbol registry map."""
+        active = self._read_active()
+        return dict(active.get("symbols", {}))

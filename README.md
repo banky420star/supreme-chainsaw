@@ -1,114 +1,234 @@
-# Cautious Giggle
+# CHAIN GAMBLER — Autonomous Trading Stack
 
-MT5-first autonomous trading stack with symbol-scoped LSTM context models, PPO policies, optional Dreamer overlays, a champion/canary registry, and a live operator console.
+> MT5-native AI ensemble (LSTM + PPO + Dreamer) with a self-evolving champion/canary model pipeline, live risk supervision, and a 13-tab React operator console.
 
-## What is in the repo
+## Table of Contents
 
-- `Python/Server_AGI.py` runs the live trading loop, risk supervision, MT5 execution, audit logging, and Telegram notifications.
-- `training/train_lstm.py` trains per-symbol LSTM context models.
-- `training/train_drl.py` trains PPO candidates against `drl/trading_env.py`.
-- `training/train_dreamer.py` trains per-symbol Dreamer policies for optional live blending.
-- `tools/champion_cycle.py` runs the full retrain/evaluate/stage flow across the configured symbol set.
-- `tools/project_status_ui.py` serves the dashboard and control API on `127.0.0.1:8088`.
-- `Python/model_registry.py` tracks champion/canary state, history, integrity metadata, and promotion policy.
+- [Quick Start (Development)](#quick-start-development)
+- [Quick Start (Production)](#quick-start-production)
+- [Architecture Overview](#architecture-overview)
+- [Configuration](#configuration)
+- [Dashboard Tabs](#dashboard-tabs)
+- [Risk Controls](#risk-controls)
+- [Model Pipeline](#model-pipeline)
+- [Troubleshooting](#troubleshooting)
 
-## Current architecture
+---
 
-1. MT5 candles are loaded through `Python/data_feed.py`.
-2. Feature generation is centralized in `Python/feature_pipeline.py`.
-3. LSTM training writes symbol-scoped model bundles into `models/per_symbol/`.
-4. PPO training stages candidates into `models/registry/candidates/`.
-5. Optional Dreamer artifacts are written into `models/dreamer/`.
-6. `Python/autonomy_loop.py` and `tools/champion_cycle.py` evaluate and stage canaries.
-7. `Python/Server_AGI.py` blends SmartAGI, PPO, and optional Dreamer outputs under the risk engine and supervisor.
-8. The dashboard and Telegram read the same runtime/log/registry state.
+## Quick Start (Development)
 
-## Feature and model defaults
-
-- New LSTM and PPO training defaults use `ultimate_150`.
-- Legacy promoted champions keep their recorded feature metadata until replaced.
-- Dreamer can be enabled per symbol through `drl.dreamer`.
-- Registry canary policy supports global defaults and per-symbol overrides.
-- Live exposure is synthesized in `Python/hybrid_brain.py` from SmartAGI, registry-loaded PPO, optional PPO history/ensemble voting, and optional Dreamer policies from `models/dreamer/`.
-- The blend is controlled by `drl.ppo_blend`, `drl.dreamer.blend`, and the configured Dreamer symbol set.
-
-## Repo layout
-
-- `Python/` runtime, registry, risk, MT5, and evaluation code
-- `training/` LSTM, PPO, Dreamer, and trade-memory builders
-- `drl/` trading environment and policy feature extractors
-- `tools/` operator tools, cycle orchestration, drift analysis, and release helpers
-- `alerts/` Telegram alert transport
-- `docs/` architecture, sync flow, metrics, and release evidence
-- `tests/` regression coverage for runtime, registry, env, status API, and training helpers
-
-## Prerequisites
-
-- Windows host with MetaTrader 5 access
-- Python 3.12-compatible environment (`.venv312` is the repo convention)
-- Telegram bot token/chat if you want alert delivery
-
-## Install
+**Prerequisites:** Windows with MetaTrader 5 installed, Python 3.12
 
 ```powershell
+# 1. Create and activate the virtual environment
 python -m venv .venv312
 .venv312\Scripts\activate
+
+# 2. Install dependencies
 pip install -r requirements.txt
-```
 
-## Configure
+# 3. Copy and configure secrets
+Copy-Item config.yaml.example config.yaml
+# Edit config.yaml: set mt5.login, mt5.password, mt5.server, telegram.token, telegram.chat_id
 
-Copy `config.yaml.example` to `config.yaml` and set:
+# 4. Start the live server (dry-run by default)
+python -m Python.Server_AGI
 
-- `mt5.login`, `mt5.password`, `mt5.server`
-- `telegram.token`, `telegram.chat_id`
-- `trading.symbols`
-- `risk.*` and `risk.supervisor.*`
-- `training.feature_version`
-- `drl.feature_version`
-- `drl.dreamer.*`
-- `registry.canary_policy.*`
-
-`config.yaml` is gitignored and is expected to be machine-local.
-
-Key runtime safety knobs live under `risk`:
-
-- daily loss cap
-- max open positions
-- max total and per-symbol exposure
-- spread/slippage tolerances
-- symbol-specific execution profiles
-
-`risk.supervisor` adds the hard pre-trade gate used by the live server:
-
-- cooldown enforcement
-- max drawdown halt
-- spread cap
-- position count cap
-- exposure cap
-- risk-reduction allowed even while halted
-
-## Run
-
-Live server:
-
-```powershell
-python -m Python.Server_AGI --live
-```
-
-Dashboard:
-
-```powershell
+# 5. Start the dashboard (separate terminal)
 python tools/project_status_ui.py
+# Open: http://127.0.0.1:8088
 ```
 
-Full training cycle:
+Run the test suite to verify the installation:
+
+```powershell
+.venv312\Scripts\python.exe -m pytest
+```
+
+---
+
+## Quick Start (Production)
+
+See [PRODUCTION.md](PRODUCTION.md) for the full step-by-step deployment guide, including:
+
+- MT5 bridge setup (Windows-native vs. Wine/Mac)
+- Docker stack configuration
+- Process supervision
+- Health validation
+- Backup and recovery
+
+---
+
+## Architecture Overview
+
+```
+                      ┌─────────────────────────────────────────┐
+                      │         MetaTrader 5 Broker              │
+                      │    (MT5 candles + order execution)       │
+                      └──────────────────┬──────────────────────┘
+                                         │
+                      ┌──────────────────▼──────────────────────┐
+                      │  data_feed.py → feature_pipeline.py      │
+                      │  (150-feature ultimate_150 vector)        │
+                      └──────────────────┬──────────────────────┘
+                                         │
+                      ┌──────────────────▼──────────────────────┐
+                      │             HybridBrain                   │
+                      │  (blends model signals into exposure)     │
+                      └──┬──────────┬───────────┬───────────────┘
+                         │          │           │
+              ┌──────────▼─┐  ┌────▼────┐  ┌──▼────────┐
+              │    LSTM     │  │   PPO   │  │  Dreamer  │
+              │  (regime &  │  │ (policy │  │ (optional │
+              │  context)   │  │ agent)  │  │  blend)   │
+              └─────────────┘  └─────────┘  └───────────┘
+                                         │
+                      ┌──────────────────▼──────────────────────┐
+                      │          Risk Engine + Supervisor         │
+                      │  (halt gates, drawdown cap, spread cap)  │
+                      └──────────────────┬──────────────────────┘
+                                         │
+                      ┌──────────────────▼──────────────────────┐
+                      │             MT5 Executor                  │
+                      │    (symbol-scoped orders + SL/TP)        │
+                      └─────────────────────────────────────────┘
+
+  Champion/Canary Pipeline:
+  training/ → models/registry/candidates/ → model_evaluator.py
+            → canary (shadow) → promote to champion → hot-swap in server
+
+  Operator Surface:
+  React Dashboard (port 8088) ←→ API Server (port 5000)
+  Telegram Alerts ← audit_events.jsonl + trade_events.jsonl
+```
+
+**Key modules:**
+
+| Module | Role |
+|---|---|
+| `Python/Server_AGI.py` | Main trading loop, risk supervision, MT5 execution |
+| `Python/hybrid_brain.py` | Signal blending from LSTM + PPO + Dreamer |
+| `Python/model_registry.py` | Champion/canary state, promotion policy, integrity |
+| `Python/feature_pipeline.py` | Centralized 150-feature vector construction |
+| `Python/data_feed.py` | MT5 candle acquisition and caching |
+| `tools/champion_cycle.py` | Full retrain → evaluate → stage automation |
+| `Python/autonomy_loop.py` | Scheduled canary evaluation and promotion |
+| `tools/project_status_ui.py` | Dashboard + control API (port 8088) |
+
+---
+
+## Configuration
+
+Copy `config.yaml.example` to `config.yaml`. The file is gitignored and is machine-local.
+
+**Required fields:**
+
+```yaml
+mt5:
+  login: 123456789
+  password: "your_password"
+  server: "Exness-MT5Trial9"
+
+telegram:
+  token: "YOUR_BOT_TOKEN"
+  chat_id: "YOUR_CHAT_ID"
+
+trading:
+  symbols:
+    - BTCUSDm
+    - XAUUSDm
+```
+
+**Key configuration sections:**
+
+| Section | Purpose |
+|---|---|
+| `trading` | Symbols, timeframe, confidence threshold, magic number |
+| `risk` | Daily loss cap, max lots, per-symbol limits |
+| `risk.supervisor` | Hard pre-trade gate: drawdown halt, spread cap, cooldown |
+| `drl` | PPO training: timesteps, feature version, Dreamer settings |
+| `training` | LSTM: epochs, period, candles, feature version |
+| `evaluation` | Candidate pass criteria: Sharpe, drawdown, return margins |
+| `registry.canary_policy` | Canary promotion thresholds per symbol |
+| `event_intel` | News/economic calendar hold-out windows |
+
+See `config.yaml.example` for all defaults and inline comments.
+
+---
+
+## Dashboard Tabs
+
+The React dashboard runs at `http://127.0.0.1:8088` and exposes 13 tabs:
+
+| Tab | What it shows |
+|---|---|
+| **Dashboard** | System health, account balance/equity, risk gauge, open positions, incident feed |
+| **Trading** | Per-symbol lane status — live action, exposure, confidence, champion/canary indicator |
+| **History** | Closed trade log with symbol filter, bot-lane filter, PnL, and hold time |
+| **Training** | Active training progress for LSTM, PPO, and Dreamer with per-symbol timestep bars |
+| **Models** | Registry state — champion path, canary path, candidate list with scorecards |
+| **PPO Brain** | PPO model diagnostics: obs shape, device, loaded state, bias correction, last actions |
+| **HFT Health** | Latency, spread, and execution quality metrics per symbol |
+| **Scenarios** | Scenario memory — best/worst scenario clusters, avoid-list, session review |
+| **Perpetual** | Continuous learning stats from the trade-memory feedback loop |
+| **LR Timeline** | Learning rate and loss curve timeline across training runs |
+| **Patterns** | Candlestick pattern log and regime-aware pattern library |
+| **Agents** | Agent team status (n8n workflow integration and autonomy sub-agents) |
+| **Settings** | Control panel: start/stop bot, emergency stop, unblock, canary promotion/rollback |
+
+---
+
+## Risk Controls
+
+The system has two layers of protection:
+
+**Risk Engine** (`Python/risk_engine.py`) — soft limits:
+- `max_daily_loss`: halt when realized PnL crosses this threshold (default $1000)
+- `max_daily_trades`: trade count ceiling per day
+- `max_lots`: single-order size cap
+- `max_drawdown`: portfolio drawdown ceiling
+
+**Supervisor** (`risk.supervisor` in config) — hard pre-trade gate:
+- `max_drawdown_pct`: halt entire trading if equity drawdown exceeds this (default 8%)
+- `max_spread_bps`: skip order if spread too wide (default 25 bps)
+- `min_trade_interval_sec`: per-symbol cooldown between trades (default 45s)
+- `max_open_positions`: hard cap on concurrent open positions (default 6)
+- `max_positions_per_symbol`: per-symbol position cap (default 3)
+- `max_symbol_exposure`: fraction of equity for one symbol (default 35%)
+- `max_total_exposure`: total portfolio exposure cap (default 1.2x)
+
+When halted, the bot will still close positions (risk reduction allowed while halted). Use the **Settings** tab or `POST /api/control` with `{"action": "unblock"}` to resume.
+
+---
+
+## Model Pipeline
+
+```
+1. TRAIN       training/train_lstm.py  → models/per_symbol/<sym>/
+               training/train_drl.py   → models/registry/candidates/<timestamp>/
+               training/train_dreamer.py → models/dreamer/<sym>/
+
+2. EVALUATE    Python/model_evaluator.py
+               Criteria: Sharpe ≥ threshold, return ≥ threshold, drawdown ≤ cap
+               Forward windows: 60d, 90d, 120d (must win ≥ 1/3)
+
+3. STAGE       Passing candidates become canaries in models/registry/active.json
+               Canary runs shadow alongside champion, accumulates live stats
+
+4. PROMOTE     registry.canary_policy criteria: min_trades, min_realized_pnl,
+               max_drawdown, min_runtime_minutes (per-symbol overrides supported)
+
+5. HOT-SWAP    Server_AGI detects champion change in active.json and reloads
+               the model bundle without restarting the process
+```
+
+Run a full automated cycle:
 
 ```powershell
 python tools/champion_cycle.py
 ```
 
-Individual training:
+Run individual training steps:
 
 ```powershell
 python training/train_lstm.py
@@ -116,49 +236,35 @@ python training/train_drl.py
 python training/train_dreamer.py
 ```
 
-## Operator surface
-
-- UI: `http://127.0.0.1:8088`
-- Status API: `http://127.0.0.1:8088/api/status`
-- WebSocket: `ws://127.0.0.1:8088/ws`
-
-The dashboard exposes runtime health, registry state, incident feed, Telegram parity, training status, logs, and operator controls.
-
-The runtime also maintains:
-
-- `logs/event_intel_state.json` for news/calendar regime context
-- `logs/audit_events.jsonl` for runtime/trade/risk audit events
-- `logs/trade_events.jsonl` for trade history
-- `logs/learning/trade_learning_latest.json` for rolling trade-memory metrics
-- Telegram daily profitability summaries sourced from the trade-learning pass
-
-## Validation
-
-Run the full regression suite with the repo venv:
+Check for feature drift between backtest and live:
 
 ```powershell
-.venv312\Scripts\python.exe -m pytest
-```
-
-Useful spot checks:
-
-```powershell
-.venv312\Scripts\python.exe -m compileall Python training tools drl
 python tools/backtest_vs_live_drift.py
-python tools/release_summary.py
 ```
 
-## Evidence and reporting
+---
 
-- `tools/release_summary.py` writes `docs/results/release_summary.md`
-- `tools/build_evidence_pack.py` rebuilds the public evidence bundle in `docs/results/`
-- `tools/profit_sweep.py` records profitability sweep output in `logs/`
-- `python tools/create_migration_backup.py` writes a GitHub-safe VPS migration snapshot into `backups/`
-- `docs/metrics.md` documents the current trading/profitability story
+## Troubleshooting
 
-## Notes
+**Bot stays flat after startup**
+The code can be healthy while the bot stays flat if no champion model is promoted. Run `tools/champion_cycle.py` to train and promote a champion, then check the Models tab.
 
-- The runtime is designed for one active owner per role; Windows venv redirector child processes are expected.
-- Raw runtime logs and model artifacts are normally not tracked; use `tools/create_migration_backup.py` when you need a point-in-time backup committed for VPS migration.
-- Machine-local secrets from `config.yaml` should stay out of git; the migration backup writes a redacted reference copy instead.
-- The promoted model set, not the code alone, determines whether the live bot actually trades.
+**MT5 connection fails**
+Verify credentials in `config.yaml`. On non-Windows systems, MT5 is unavailable — the server falls back to dry-run mode automatically.
+
+**Risk engine halted**
+Check the halt reason in the Dashboard tab or via `GET /api/emergency_status`. Use the Settings tab "Unblock" button or `POST /api/control {"action": "unblock"}` after resolving the cause.
+
+**Training stuck**
+Check `logs/ppo_progress.json` and `logs/lstm_progress.json` for the last update timestamp. If stale, kill the training process and restart `tools/champion_cycle.py`.
+
+**Dashboard not loading**
+Confirm `tools/project_status_ui.py` is running and check `http://127.0.0.1:8088/api/health` for component status.
+
+---
+
+For the full production deployment guide, see [PRODUCTION.md](PRODUCTION.md).
+
+For the API reference, see [docs/API.md](docs/API.md).
+
+For the system architecture, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).

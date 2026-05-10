@@ -23,12 +23,20 @@ _MIN_LOTS = float(os.environ.get("AGI_MIN_LOTS", "0.01"))
 
 # Conditional MT5 import
 _mt5 = None
-if os.name == "nt":
-    try:
-        import MetaTrader5 as mt5
-        _mt5 = mt5
-    except ImportError:
-        pass
+_MT5_AVAILABLE = False
+try:
+    from Python.mt5_compat import mt5 as _mt5, MT5_AVAILABLE as _MT5_AVAILABLE
+except Exception:
+    pass
+
+try:
+    from Python import paper_trading as _om_paper
+except Exception:
+    _om_paper = None
+
+
+def _is_paper_mode() -> bool:
+    return _om_paper is not None and _om_paper.get_mode() == "paper"
 
 
 # ── Per-symbol config loader ──────────────────────────────────────────
@@ -318,11 +326,6 @@ class OrderManager:
         # Breakeven trigger = risk_mult * initial_risk
         trigger_dollars = breakeven_risk_mult * max(initial_risk, 0.01)
 
-        # Calculate dollar profit using tick value
-        pip_value = OrderManager._pip_value_per_lot(symbol)
-        if pip_value <= 0:
-            return None
-
         # Dollar profit = price_distance / pip_size * pip_value_per_lot * volume
         # Simpler: use tick_size and tick_value from symbol info
         dollar_profit = OrderManager._calc_dollar_profit(symbol, position.volume, position.open_price, current_price, is_buy)
@@ -597,7 +600,7 @@ class OrderManager:
     @staticmethod
     def _pip_value_per_lot(symbol: str) -> float:
         """Get pip value per lot for a symbol using MT5 symbol info."""
-        if _mt5 is None:
+        if _mt5 is None or not _MT5_AVAILABLE:
             return 0.0
         try:
             if not _mt5.initialize():
@@ -619,7 +622,7 @@ class OrderManager:
     def _calc_dollar_profit(symbol: str, volume: float, open_price: float,
                              current_price: float, is_buy: bool) -> float:
         """Calculate dollar profit for a position using MT5 tick values."""
-        if _mt5 is None:
+        if _mt5 is None or not _MT5_AVAILABLE:
             # Fallback: rough estimate
             if "XAU" in symbol.upper():
                 return (current_price - open_price) * volume * 100 if is_buy else (open_price - current_price) * volume * 100
@@ -662,12 +665,22 @@ class OrderManager:
         Returns:
             List of OrderResult for actions taken.
         """
-        if not self.executor or not _mt5:
+        if not self.executor or (not _mt5 and not _is_paper_mode()):
             return []
 
         results = []
 
         try:
+            if _is_paper_mode():
+                positions = _om_paper.paper_positions_get()
+                if not positions:
+                    return results
+                for p in positions:
+                    result = self._manage_single_position(p)
+                    if result:
+                        results.append(result)
+                return results
+
             if not _mt5.initialize():
                 logger.debug("OrderManager: MT5 init failed")
                 return results
@@ -690,8 +703,10 @@ class OrderManager:
 
     def _manage_single_position(self, mt5_position) -> Optional[OrderResult]:
         """Apply breakeven, trailing stop, and partial close to a single position."""
-        symbol = mt5_position.symbol
-        is_buy = mt5_position.type == 0  # 0 = BUY, 1 = SELL
+        is_dict = isinstance(mt5_position, dict)
+        symbol = mt5_position.get("symbol") if is_dict else mt5_position.symbol
+        pos_type = mt5_position.get("type") if is_dict else mt5_position.type
+        is_buy = str(pos_type).upper() == "BUY" or int(pos_type) == 0
 
         # Get current price
         tick = _mt5.symbol_info_tick(symbol)
@@ -705,16 +720,28 @@ class OrderManager:
             return None
 
         # Build or update ManagedPosition from MT5 position
-        pos = ManagedPosition(
-            ticket=mt5_position.ticket,
-            symbol=symbol,
-            side="BUY" if is_buy else "SELL",
-            volume=float(mt5_position.volume),
-            open_price=float(mt5_position.price_open),
-            current_sl=float(mt5_position.sl) if mt5_position.sl > 0 else 0.0,
-            current_tp=float(mt5_position.tp) if mt5_position.tp > 0 else 0.0,
-            open_time=float(mt5_position.time),
-        )
+        if is_dict:
+            pos = ManagedPosition(
+                ticket=int(mt5_position.get("ticket", 0)),
+                symbol=symbol,
+                side="BUY" if is_buy else "SELL",
+                volume=float(mt5_position.get("volume", 0)),
+                open_price=float(mt5_position.get("open_price", 0)),
+                current_sl=float(mt5_position.get("sl", 0) or 0),
+                current_tp=float(mt5_position.get("tp", 0) or 0),
+                open_time=float(mt5_position.get("open_time", 0)),
+            )
+        else:
+            pos = ManagedPosition(
+                ticket=mt5_position.ticket,
+                symbol=symbol,
+                side="BUY" if is_buy else "SELL",
+                volume=float(mt5_position.volume),
+                open_price=float(mt5_position.price_open),
+                current_sl=float(mt5_position.sl) if mt5_position.sl > 0 else 0.0,
+                current_tp=float(mt5_position.tp) if mt5_position.tp > 0 else 0.0,
+                open_time=float(mt5_position.time),
+            )
 
         # Restore state from our tracking dict
         tracked = self._positions.get(pos.ticket)
@@ -761,7 +788,7 @@ class OrderManager:
             # For small accounts, -$0.05 on a 0.01 lot position is noise
             # Use MT5 equity for threshold calculation
             try:
-                import MetaTrader5 as _mt5_local
+                from Python.mt5_compat import mt5 as _mt5_local
                 if _mt5_local.initialize():
                     _acc = _mt5_local.account_info()
                     _eq = float(_acc.equity) if _acc else 100.0

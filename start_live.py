@@ -1,4 +1,4 @@
-"""Start the AGI trading server with live mode and all env vars."""
+"""Start the AGI trading server with paper mode and all env vars."""
 import os
 import sys
 
@@ -10,8 +10,8 @@ os.environ["AGI_HIGH_VOL_MIN_ACTION"] = "0.0001"
 os.environ["AGI_ACTION_THRESHOLD"] = "0.0001"
 os.environ["AGI_TRADE_INTERVAL_SEC"] = "30"
 os.environ["CANARY_MAX_LOSS_PCT"] = "10"
-os.environ["AGI_LIVE_ENABLED"] = "true"
-os.environ["AGI_REQUIRE_EXPLICIT_LIVE_ARM"] = "false"
+os.environ["AGI_LIVE_ENABLED"] = "false"
+os.environ["AGI_REQUIRE_EXPLICIT_LIVE_ARM"] = "true"
 os.environ["AGI_TRAIL_INTERVAL_SEC"] = "15"
 os.environ["AGI_HEDGING_ENABLED"] = "true"
 os.environ["AGI_TREND_FLIP_ENABLED"] = "true"
@@ -20,12 +20,12 @@ os.environ["AGI_RISK_PERCENT"] = "1.0"
 os.environ["AGI_MIN_LOTS"] = "0.02"
 os.environ["AGI_MAX_POS_PER_SYMBOL"] = "5"
 
+# Default to paper mode; live requires explicit opt-in
+os.environ.setdefault("CHAIN_GAMBLER_EXECUTION_MODE", "paper")
+os.environ.setdefault("CHAIN_GAMBLER_ALLOW_LIVE", "0")
+
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# Force --live in sys.argv
-if "--live" not in sys.argv:
-    sys.argv.append("--live")
-
 from Python.Server_AGI import main
-main(live=True)
+main(live=False)

@@ -5,5 +5,5 @@
   "obs_dim": 10497,
   "steps": 5000,
   "period": "90d",
-  "interval": "M30"
+  "interval": "M5"
 }

@@ -76,8 +76,20 @@ def _get_economic_calendar_cached():
     return _calendar_cache.get("events", [])
 from typing import Any
 
-from bottle import Bottle, request, response, run as bottle_run
+from bottle import Bottle, request, response, abort, run as bottle_run
 from loguru import logger
+
+# ── Optional geventwebsocket support ────────────────────────────────────────
+try:
+    from geventwebsocket import WebSocketError
+    from geventwebsocket.handler import WebSocketHandler
+    from gevent.pywsgi import WSGIServer as GeventWSGIServer
+    from gevent import sleep as gevent_sleep
+    WS_AVAILABLE = True
+except ImportError:
+    WS_AVAILABLE = False
+    WebSocketError = Exception  # type: ignore
+    gevent_sleep = time.sleep
 
 # ---------------------------------------------------------------------------
 # Project root (one level above Python/)
@@ -97,6 +109,28 @@ _bot_process: subprocess.Popen | None = None  # tracked bot subprocess
 _bot_process_lock = threading.Lock()
 _decision_cache: dict[str, deque] = {}  # symbol -> deque of recent decisions
 _CACHE_MAX = 50                  # decisions per symbol
+
+# ---------------------------------------------------------------------------
+# Rainforest detector — lazy-loaded; populated by train_rainforest() or from
+# Server_AGI via set_rainforest_predictions().
+# ---------------------------------------------------------------------------
+rf_detector = None          # RainforestDetector instance (or None if unavailable)
+rainforest_predictions: dict[str, dict] = {}   # symbol -> latest predict_regime() output
+_rainforest_trained_at: float = 0.0
+
+try:
+    from Python.rainforest_detector import RainforestDetector as _RainforestDetector
+    rf_detector = _RainforestDetector()
+except Exception as _rf_import_err:
+    logger.debug(f"RainforestDetector not available: {_rf_import_err}")
+    _RainforestDetector = None  # type: ignore
+
+
+def set_rainforest_predictions(symbol: str, prediction: dict):
+    """Called by Server_AGI / agi_brain to push live predictions into the cache."""
+    global rainforest_predictions, _rainforest_trained_at
+    rainforest_predictions[symbol] = dict(prediction)
+    _rainforest_trained_at = time.time()
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +182,24 @@ def api_mini_app():
             _MINI_APP_HTML = "<html><body><h1>Mini App not found</h1></body></html>"
     response.content_type = "text/html; charset=utf-8"
     return _MINI_APP_HTML
+
+
+# ---------------------------------------------------------------------------
+# Parallel lane manager helper
+# ---------------------------------------------------------------------------
+def _parallel_lane_status(srv) -> dict:
+    """Return parallel_lanes keys to merge into the training dict."""
+    try:
+        if srv and hasattr(srv, "lane_mgr") and srv.lane_mgr:
+            lane_status = srv.lane_mgr.get_status()
+            return {
+                "parallel_lanes": lane_status["parallel_lanes"],
+                "max_parallel": lane_status["max_parallel"],
+                "lane_active_count": lane_status["active_count"],
+            }
+    except Exception:
+        pass
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -219,13 +271,45 @@ def _safe_brain(attr: str, default=None):
     return default
 
 
+def _get_trading_mode() -> str:
+    try:
+        from Python import paper_trading
+        return paper_trading.get_mode()
+    except Exception:
+        return "paper"
+
+
 def _get_mt5_account_and_positions() -> dict:
     """Fetch live MT5 account info and open positions.
 
     Returns a dict with keys: balance, equity, free_margin, profit,
     open_positions, positions.  Falls back to risk-engine equity and
     empty positions when MT5 is unavailable (dry-run or non-Windows).
+    In paper mode, returns simulated account data.
     """
+    # Check paper mode first
+    try:
+        from Python import paper_trading
+        if paper_trading.get_mode() == "paper":
+            pacc = paper_trading.get_paper_account()
+            positions = paper_trading.paper_positions_get()
+            return {
+                "balance": pacc["balance"],
+                "equity": pacc["equity"],
+                "free_margin": pacc["free_margin"],
+                "profit": pacc.get("profit", 0.0),
+                "open_positions": len(positions),
+                "positions": positions,
+                "login": 999999,
+                "server": "PAPER-CHAIN",
+                "name": "Paper Trader",
+                "currency": "USD",
+                "leverage": 100,
+                "mode": "paper",
+            }
+    except Exception as e:
+        logger.debug(f"Paper trading check failed: {e}")
+
     # Fallback defaults from risk engine (populated by equity poll)
     result = {
         "balance": _safe_risk("_mt5_balance", None) or _safe_risk("_current_equity", 0.0),
@@ -234,13 +318,16 @@ def _get_mt5_account_and_positions() -> dict:
         "profit": _safe_risk("_mt5_profit", 0.0),
         "open_positions": 0,
         "positions": [],
+        "login": None,
+        "server": None,
+        "name": None,
+        "currency": None,
+        "leverage": None,
+        "mode": "live",
     }
 
-    if sys.platform != "win32":
-        return result
-
     try:
-        import MetaTrader5 as mt5
+        from Python.mt5_compat import mt5
 
         if not mt5.initialize():
             logger.debug("MT5 init failed in API status handler")
@@ -249,10 +336,25 @@ def _get_mt5_account_and_positions() -> dict:
         try:
             info = mt5.account_info()
             if info is not None:
-                result["balance"] = float(info.balance)
-                result["equity"] = float(info.equity)
-                result["free_margin"] = float(info.margin_free)
-                result["profit"] = float(info.profit)
+                # Always capture metadata even if numeric telemetry is invalid
+                result["login"] = getattr(info, "login", None)
+                result["server"] = getattr(info, "server", None)
+                result["name"] = getattr(info, "name", None)
+                result["currency"] = getattr(info, "currency", None)
+                result["leverage"] = getattr(info, "leverage", None)
+
+                if getattr(info, "_valid", True):
+                    result["balance"] = float(info.balance)
+                    result["equity"] = float(info.equity)
+                    result["free_margin"] = float(info.margin_free)
+                    result["profit"] = float(info.profit)
+                else:
+                    logger.warning(
+                        "API status: MT5 account telemetry invalid — "
+                        "balance=%s, equity=%s, server=%s, login=%s. "
+                        "Keeping risk-engine fallbacks.",
+                        info.balance, info.equity, info.server, info.login,
+                    )
 
             raw_positions = mt5.positions_get()
             if raw_positions:
@@ -275,8 +377,6 @@ def _get_mt5_account_and_positions() -> dict:
                     for p in raw_positions
                 ]
         finally:
-            # Never shutdown MT5 here — the server process owns the connection.
-            # Calling shutdown() would kill the server's MT5 session.
             pass
     except Exception as e:
         logger.debug(f"MT5 account/positions fetch failed: {e}")
@@ -490,6 +590,12 @@ def api_status():
             "realized_today": realized_pnl,
             "drawdown_pct": current_dd,
             "connected": mode == "LIVE" or mt5_account["equity"] > 0,
+            "login": mt5_account["login"],
+            "server": mt5_account["server"],
+            "name": mt5_account["name"],
+            "currency": mt5_account["currency"],
+            "leverage": mt5_account["leverage"],
+            "mode": mt5_account.get("mode", "live"),
         },
         "training": {
             "cycle_running": False,
@@ -536,6 +642,7 @@ def api_status():
             "pipeline_summary": pipeline_summary,
             "lane_summary": lane_summary,
             "ppo_per_symbol": progress.get("ppo_per_symbol", {}),
+            **(_parallel_lane_status(srv)),
         },
         "canary_gate": {
             "ready": bool(canary_id),
@@ -578,7 +685,107 @@ def api_status():
         },
         "trade_review": _get_trade_review_summary(),
         "economic_calendar": _get_economic_calendar_cached(),
+        "rainforest": {
+            "loaded": rf_detector.is_trained() if rf_detector is not None else False,
+            "trained_at": _rainforest_trained_at or None,
+            "per_symbol": {
+                sym: {
+                    "regime": rainforest_predictions[sym].get("regime", "ranging"),
+                    "confidence": rainforest_predictions[sym].get("confidence", 0.0),
+                }
+                for sym in rainforest_predictions
+            },
+        },
     })
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 1b. POST /api/mode — Toggle paper / live trading mode
+# ═══════════════════════════════════════════════════════════════════════════
+@app.post("/api/mode")
+def api_set_mode():
+    try:
+        from Python import paper_trading
+        body = request.json
+        new_mode = (body.get("mode") if body else "").strip().lower()
+        if new_mode not in ("paper", "live"):
+            return _json({"error": "mode must be 'paper' or 'live'"}, status=400)
+        result = paper_trading.set_mode(new_mode)
+        return _json({"success": True, **result})
+    except Exception as exc:
+        logger.warning(f"set_mode failed: {exc}")
+        return _json({"error": str(exc)}, status=500)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 1b2. GET /api/live_gate — Live trading safety gate status
+# ═══════════════════════════════════════════════════════════════════════════
+@app.get("/api/live_gate")
+def api_live_gate():
+    try:
+        from Python import live_safety
+        gate = live_safety.live_trading_allowed()
+        return _json({
+            "allowed": gate["allowed"],
+            "mode": gate["mode"],
+            "gates": gate["gates"],
+        })
+    except Exception as exc:
+        logger.warning(f"live_gate failed: {exc}")
+        return _json({"error": str(exc)}, status=500)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 1c. POST /api/mt5_login — Attempt MT5 login with credentials
+# ═══════════════════════════════════════════════════════════════════════════
+@app.post("/api/mt5_login")
+def api_mt5_login():
+    try:
+        from Python.mt5_compat import mt5
+        body = request.json or {}
+        login = int(body.get("login", 0))
+        password = body.get("password", "")
+        server = body.get("server", "")
+
+        if not login or not password or not server:
+            return _json({"error": "login, password, and server are required"}, status=400)
+
+        if not mt5.initialize():
+            return _json({"error": "MT5 initialize failed"}, status=503)
+
+        result = mt5.login(login, password, server)
+        if result:
+            info = mt5.account_info()
+            valid = getattr(info, "_valid", True) if info else False
+            return _json({
+                "success": True,
+                "login": getattr(info, "login", login),
+                "server": getattr(info, "server", server),
+                "name": getattr(info, "name", None),
+                "balance": float(info.balance) if info and valid else None,
+                "equity": float(info.equity) if info and valid else None,
+            })
+        else:
+            return _json({"success": False, "error": "MT5 login rejected"}, status=401)
+    except Exception as exc:
+        logger.warning(f"mt5_login failed: {exc}")
+        return _json({"success": False, "error": str(exc)}, status=500)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 1d. POST /api/paper_reset — Reset paper trading account balance
+# ═══════════════════════════════════════════════════════════════════════════
+@app.post("/api/paper_reset")
+def api_paper_reset():
+    try:
+        from Python import paper_trading
+        body = request.json or {}
+        balance = float(body.get("balance", paper_trading.PAPER_DEFAULT_BALANCE))
+        paper_trading.reset_paper_account(balance)
+        return _json({"success": True, "balance": balance})
+    except Exception as exc:
+        logger.warning(f"paper_reset failed: {exc}")
+        return _json({"error": str(exc)}, status=500)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -589,8 +796,9 @@ def api_trades():
     limit = int(request.params.get("limit", 50))
     offset = int(request.params.get("offset", 0))
     symbol_filter = request.params.get("symbol", "")
+    bot_lane_filter = request.params.get("bot_lane", "")
 
-    trades = _fetch_trade_history(symbol_filter)
+    trades = _fetch_trade_history(symbol_filter, bot_lane_filter)
     total = len(trades)
     page = trades[offset:offset + limit]
 
@@ -605,7 +813,8 @@ def api_trades():
 @app.get("/api/trades/summary")
 def api_trades_summary():
     symbol_filter = request.params.get("symbol", "")
-    trades = _fetch_trade_history(symbol_filter)
+    bot_lane_filter = request.params.get("bot_lane", "")
+    trades = _fetch_trade_history(symbol_filter, bot_lane_filter)
 
     wins = [t for t in trades if t.get("profit", 0) > 0]
     losses = [t for t in trades if t.get("profit", 0) < 0]
@@ -649,53 +858,101 @@ def api_trades_summary():
     })
 
 
-def _fetch_trade_history(symbol_filter: str = "") -> list[dict]:
+def _extract_bot_lane(comment: str, magic: int | None) -> str:
+    """Infer bot lane from MT5 order comment (preferred) or magic number fallback."""
+    # Comment format: AGI|SYM|LANE_TAG|REQ_TAG|...
+    if comment and comment.startswith("AGI|"):
+        parts = comment.split("|")
+        if len(parts) >= 3:
+            tag = parts[2].upper()
+            tag_map = {"CH": "champion", "CA": "canary", "HI": "history", "UN": "unknown"}
+            lane = tag_map.get(tag)
+            if lane:
+                return lane
+    # Fallback: coarse magic-number heuristic (ranges overlap across symbols,
+    # so this is best-effort only).  Magic formula in mt5_executor:
+    #   base = 505000 + symbol_offset*100 + lane_offset + kind_offset
+    if magic is not None:
+        base_mod = magic % 1000
+        kind_mod = base_mod % 100
+        hundreds = (base_mod // 100) % 10
+        # champion: kind_mod in (0,10,20) AND hundreds even-ish (0,2,4...)
+        # canary:   kind_mod in (0,10,20) AND hundreds odd-ish (1,3,5...)
+        # This is imperfect because symbol base and lane offset are both
+        # multiples of 100. We simply trust the comment first; this fallback
+        # treats anything with hundreds==0 as champion, 1 as canary, 2 as history.
+        if hundreds == 0:
+            return "champion"
+        if hundreds == 1:
+            return "canary"
+        if hundreds == 2:
+            return "history"
+    return "unknown"
+
+
+def _fetch_trade_history(symbol_filter: str = "", bot_lane_filter: str = "") -> list[dict]:
     """
     Pull trade history from MT5 (Windows live) or from the decision cache (dry-run).
     Returns a list of Trade dicts matching the frontend Trade interface.
     """
     trades: list[dict] = []
 
-    # Try MT5 deal history on Windows
-    if sys.platform == "win32":
-        try:
-            import MetaTrader5 as mt5
-            import pytz
+    # Try MT5 deal history
+    try:
+        from Python.mt5_compat import mt5
+        import pytz
 
-            if mt5.initialize():
-                tz = pytz.timezone("Etc/UTC")
-                now_utc = datetime.now(tz)
-                from datetime import timedelta
-                lookback = now_utc - timedelta(days=30)
-                deals = mt5.history_deals_get(lookback, now_utc)
-                if deals:
-                    for d in deals:
-                        if d.entry != mt5.DEAL_ENTRY_OUT:
-                            continue
-                        if symbol_filter and d.symbol != symbol_filter:
-                            continue
-                        trades.append({
-                            "ticket": d.ticket,
-                            "symbol": d.symbol,
-                            "side": "BUY" if d.type == mt5.DEAL_TYPE_BUY else "SELL",
-                            "volume": d.volume,
-                            "open_time": None,
-                            "close_time": datetime.fromtimestamp(d.time, tz=tz).isoformat(),
-                            "open_price": d.price,
-                            "close_price": d.price,
-                            "profit": round(d.profit, 2),
-                            "comment": d.comment or "",
-                            "hold_minutes": None,
-                            "magic": d.magic,
-                            "bot_lane": "ppo",
-                            "model": "champion",
-                            "action_type": "close",
-                            "outcome": "win" if d.profit > 0 else ("loss" if d.profit < 0 else "breakeven"),
-                        })
-                    trades.sort(key=lambda t: t.get("close_time", "") or "", reverse=True)
-                    return trades
-        except Exception as e:
-            logger.debug(f"MT5 trade history fetch failed: {e}")
+        if mt5.initialize():
+            tz = pytz.timezone("Etc/UTC")
+            now_utc = datetime.now(tz)
+            from datetime import timedelta
+            lookback = now_utc - timedelta(days=30)
+            deals = mt5.history_deals_get(lookback, now_utc)
+            if deals:
+                # Build index of entry deals keyed by position_id so we can
+                # match open_price / open_time to each closing deal.
+                entry_by_position: dict = {}
+                for d in deals:
+                    if d.entry == mt5.DEAL_ENTRY_IN:
+                        entry_by_position[d.position_id] = d
+
+                for d in deals:
+                    if d.entry != mt5.DEAL_ENTRY_OUT:
+                        continue
+                    if symbol_filter and d.symbol != symbol_filter:
+                        continue
+                    lane = _extract_bot_lane(d.comment or "", d.magic)
+                    if bot_lane_filter and lane != bot_lane_filter:
+                        continue
+
+                    entry = entry_by_position.get(d.position_id)
+                    open_price = entry.price if entry else None
+                    open_ts = datetime.fromtimestamp(entry.time, tz=tz) if entry else None
+                    close_ts = datetime.fromtimestamp(d.time, tz=tz)
+                    hold_minutes = int((close_ts - open_ts).total_seconds() / 60) if open_ts else None
+
+                    trades.append({
+                        "ticket": d.ticket,
+                        "symbol": d.symbol,
+                        "side": "BUY" if (entry.type if entry else d.type) == mt5.DEAL_TYPE_BUY else "SELL",
+                        "volume": d.volume,
+                        "open_time": open_ts.isoformat() if open_ts else None,
+                        "close_time": close_ts.isoformat(),
+                        "open_price": open_price,
+                        "close_price": d.price,
+                        "profit": round(d.profit, 2),
+                        "comment": d.comment or "",
+                        "hold_minutes": hold_minutes,
+                        "magic": d.magic,
+                        "bot_lane": lane,
+                        "model": "champion" if lane == "champion" else ("canary" if lane == "canary" else "unknown"),
+                        "action_type": "close",
+                        "outcome": "win" if d.profit > 0 else ("loss" if d.profit < 0 else "breakeven"),
+                    })
+                trades.sort(key=lambda t: t.get("close_time", "") or "", reverse=True)
+                return trades
+    except Exception as e:
+        logger.debug(f"MT5 trade history fetch failed: {e}")
 
     # Fallback: derive from decision cache
     for sym, dq in _decision_cache.items():
@@ -703,6 +960,9 @@ def _fetch_trade_history(symbol_filter: str = "") -> list[dict]:
             continue
         for i, d in enumerate(dq):
             if d.get("action") in ("BUY", "SELL"):
+                lane = "ppo"
+                if bot_lane_filter and lane != bot_lane_filter:
+                    continue
                 trades.append({
                     "ticket": int(d.get("_cached_at", time.time()) * 1000) + i,
                     "symbol": sym,
@@ -716,7 +976,7 @@ def _fetch_trade_history(symbol_filter: str = "") -> list[dict]:
                     "comment": d.get("reason", ""),
                     "hold_minutes": None,
                     "magic": None,
-                    "bot_lane": "ppo",
+                    "bot_lane": lane,
                     "model": "canary" if d.get("reason", "").startswith("canary") else "champion",
                     "action_type": "signal",
                     "outcome": "breakeven",
@@ -736,6 +996,88 @@ def _max_loss_streak(trades: list[dict]) -> int:
         else:
             streak = 0
     return max_streak
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 2b. GET /api/equity_curve — Time-series equity curve from closed trade history
+# ═══════════════════════════════════════════════════════════════════════════
+@app.route("/api/equity_curve", method=["GET", "OPTIONS"])
+def get_equity_curve():
+    """Return time-series equity curve from closed trade history."""
+    limit = int(request.query.get("limit", 500))
+    window = request.query.get("window", "all")  # '30d', '90d', 'all'
+
+    try:
+        import sqlite3 as _sqlite3
+
+        db_path = os.path.join(os.path.dirname(__file__), "..", "data", "bets.db")
+        db_path = os.path.normpath(db_path)
+        if not os.path.exists(db_path):
+            return _json({"points": [], "error": "No trade database found"})
+
+        conn = _sqlite3.connect(db_path)
+        conn.row_factory = _sqlite3.Row
+
+        # Filter by time window
+        where = ""
+        if window == "30d":
+            where = "WHERE close_time >= datetime('now', '-30 days')"
+        elif window == "90d":
+            where = "WHERE close_time >= datetime('now', '-90 days')"
+
+        rows = conn.execute(
+            f"SELECT close_time, profit FROM bets {where} ORDER BY close_time ASC"
+        ).fetchall()
+        conn.close()
+
+        if not rows:
+            return _json({"points": [], "summary": {}})
+
+        # Build equity curve
+        starting_balance = 1000.0  # fallback
+        try:
+            srv = _server_ref
+            state = srv.get_account_info() if srv and hasattr(srv, "get_account_info") else {}
+            bal = state.get("balance", starting_balance) if state else starting_balance
+            total_profit = sum(float(r["profit"]) for r in rows)
+            starting_balance = max(100.0, bal - total_profit)
+        except Exception:
+            pass
+
+        equity = starting_balance
+        peak = starting_balance
+        points = []
+
+        for row in rows:
+            equity += float(row["profit"])
+            peak = max(peak, equity)
+            dd_pct = ((peak - equity) / peak * 100) if peak > 0 else 0
+            points.append({
+                "ts": row["close_time"],
+                "equity": round(equity, 2),
+                "balance": round(equity, 2),
+                "drawdown_pct": round(dd_pct, 2),
+            })
+
+        # Downsample to limit points
+        if len(points) > limit:
+            step = len(points) // limit
+            points = points[::step]
+
+        max_dd = max((p["drawdown_pct"] for p in points), default=0)
+
+        return _json({
+            "points": points[-limit:],
+            "summary": {
+                "start_equity": round(starting_balance, 2),
+                "current_equity": round(equity, 2),
+                "peak_equity": round(peak, 2),
+                "max_drawdown_pct": round(max_dd, 2),
+                "total_trades": len(rows),
+            },
+        })
+    except Exception as e:
+        return _json({"points": [], "error": str(e)})
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -914,10 +1256,10 @@ def api_learning():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 6. GET /api/scenarios — Regime performance data
+# 6. GET /api/regimes — Regime performance data
 # ═══════════════════════════════════════════════════════════════════════════
-@app.get("/api/scenarios")
-def api_scenarios():
+@app.get("/api/regimes")
+def api_regimes():
     """Return performance breakdown by volatility regime from the decision cache."""
     regime_stats: dict[str, dict] = {}
 
@@ -1041,16 +1383,120 @@ def api_per_symbol_models():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Rainforest pattern detection endpoint
+# ═══════════════════════════════════════════════════════════════════════════
+@app.route("/api/patterns/rainforest", method=["GET", "OPTIONS"])
+def get_rainforest_patterns():
+    """Return Rainforest Random-Forest regime predictions per symbol."""
+    if request.method == "OPTIONS":
+        return {}
+
+    cfg = _read_config()
+    symbols = cfg.get("trading", {}).get("symbols", [])
+
+    # If we have no live predictions yet, try to compute them now from
+    # synthetic / cached models for each configured symbol.
+    per_symbol: dict[str, dict] = {}
+    for sym in symbols:
+        if sym in rainforest_predictions:
+            pred = rainforest_predictions[sym]
+        else:
+            pred = {
+                "regime": "ranging",
+                "confidence": 0.0,
+                "probabilities": {},
+                "feature_importances": {},
+                "top_patterns": [],
+                "note": "no_prediction_yet",
+            }
+        per_symbol[sym] = {
+            "regime": pred.get("regime", "ranging"),
+            "confidence": pred.get("confidence", 0.0),
+            "probabilities": pred.get("probabilities", {}),
+            "feature_importances": pred.get("feature_importances", {}),
+            "top_patterns": pred.get("top_patterns", []),
+        }
+
+    return _json({
+        "trained_at": _rainforest_trained_at or None,
+        "n_trees": rf_detector.n_estimators if rf_detector is not None else 200,
+        "model_loaded": rf_detector.is_trained() if rf_detector is not None else False,
+        "per_symbol": per_symbol,
+    })
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Existing endpoints (compat with current frontend api.ts)
 # ═══════════════════════════════════════════════════════════════════════════
 @app.get("/api/patterns")
 def api_patterns():
-    """Pattern library — extracted from live_state or incidents."""
+    """Pattern library — extracted from logs/patterns.jsonl, MT5 candles, or incidents."""
     patterns = []
+
+    # 1. Try dedicated pattern log
+    patterns_log = os.path.join(ROOT, "logs", "patterns.jsonl")
+    if os.path.exists(patterns_log):
+        try:
+            with open(patterns_log, "r", encoding="utf-8") as f:
+                lines = f.readlines()[-50:]
+            for line in lines:
+                try:
+                    p = json.loads(line.strip())
+                    if isinstance(p, dict):
+                        patterns.append(p)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            if patterns:
+                return _json(patterns)
+        except Exception:
+            pass
+
+    # 2. Try basic candlestick detection from MT5
+    try:
+        from Python.mt5_compat import mt5
+        import pytz
+
+        if mt5.initialize():
+            tz = pytz.timezone("Etc/UTC")
+            symbols = ["EURUSD", "GBPUSD", "XAUUSD", "BTCUSD"]
+            for sym in symbols:
+                rates = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_M5, 0, 20)
+                if rates and len(rates) >= 2:
+                    # Simple pattern detection on the last 3 candles
+                    for i in range(-3, 0):
+                        c = rates[i]
+                        body = abs(c["close"] - c["open"])
+                        lower = c["open"] - c["low"] if c["close"] >= c["open"] else c["close"] - c["low"]
+                        upper = c["high"] - c["close"] if c["close"] >= c["open"] else c["high"] - c["open"]
+                        pattern_name = None
+                        if body < 1e-9 and upper > 0 and lower > 0:
+                            pattern_name = "doji"
+                        elif lower > 2 * body and upper < body:
+                            pattern_name = "hammer"
+                        if pattern_name:
+                            patterns.append({
+                                "type": "pattern",
+                                "pattern": pattern_name,
+                                "symbol": sym,
+                                "timestamp": datetime.fromtimestamp(c["time"], tz=tz).isoformat(),
+                                "open": float(c["open"]),
+                                "high": float(c["high"]),
+                                "low": float(c["low"]),
+                                "close": float(c["close"]),
+                            })
+            if patterns:
+                return _json(patterns[-10:])
+    except Exception:
+        pass
+
+    # 3. Fallback: return last 10 incidents of any type so the tab isn't empty
     incidents = _read_incidents()
-    for inc in incidents:
-        if inc.get("type") == "pattern":
-            patterns.append(inc)
+    for inc in incidents[-10:]:
+        p = dict(inc)
+        if "type" not in p:
+            p["type"] = "pattern"
+        patterns.append(p)
+
     return _json(patterns)
 
 
@@ -1100,11 +1546,24 @@ def api_perf():
     if not confidence_curve:
         confidence_curve = hist.get("confidence", [])
 
+    # Read adaptation history from live_state (training section)
+    adaptation_history = []
+    try:
+        live_state = _read_live_state()
+        training_data = live_state.get("training", {})
+        if isinstance(training_data, dict):
+            adaptation_history = training_data.get("adaptation_history", [])
+            if not isinstance(adaptation_history, list):
+                adaptation_history = []
+    except Exception:
+        pass
+
     return _json({
         "equity_curve": equity_curve,
         "pnl_curve": pnl_curve,
         "confidence_curve": confidence_curve,
         "lstm_loss_curve": hist.get("lstmLoss", []),
+        "adaptation_history": adaptation_history,
     })
 
 
@@ -1262,12 +1721,13 @@ def api_control():
             stdout_log = open(os.path.join(log_dir, "bot_stdout.log"), "a", encoding="utf-8")
             stderr_log = open(os.path.join(log_dir, "bot_stderr.log"), "a", encoding="utf-8")
 
-            cmd = [venv_python, "-m", "Python.Server_AGI", "--live"]
+            cmd = [venv_python, "-m", "Python.Server_AGI"]
 
-            # Set optimized environment for live trading
+            # Default to paper mode; live requires explicit env opt-in
             env = os.environ.copy()
-            env["AGI_LIVE_ENABLED"] = "true"
-            env["AGI_REQUIRE_EXPLICIT_LIVE_ARM"] = "false"
+            env.setdefault("CHAIN_GAMBLER_EXECUTION_MODE", "paper")
+            env.setdefault("CHAIN_GAMBLER_ALLOW_LIVE", "0")
+            env["AGI_LIVE_ENABLED"] = "false"
             env["AGI_TRADE_INTERVAL_SEC"] = "300"
             env["AGI_REVIEW_INTERVAL_SEC"] = "120"
             env["AGI_TRAIL_INTERVAL_SEC"] = "30"
@@ -1393,6 +1853,12 @@ def api_control():
     if action == "force_ingest":
         return _json({"ok": True, "action": action, "message": "Data ingest triggered."})
 
+    if action == "start_parallel_training":
+        if srv and hasattr(srv, "lane_mgr") and srv.lane_mgr:
+            srv.lane_mgr.start_cycle()
+            return _json({"ok": True, "action": action, "message": "Parallel training started"})
+        return _json({"ok": True, "action": action, "message": "lane_mgr not initialized on server."})
+
     if action in ("rollback_canary", "rollback_champion"):
         symbol = payload.get("symbol")
         if srv and hasattr(srv, "autonomy") and srv.autonomy:
@@ -1427,16 +1893,21 @@ def api_control():
 # ═══════════════════════════════════════════════════════════════════════════
 @app.get("/api/status/stream")
 def api_status_stream():
-    """Server-Sent Events stream of status updates."""
+    """Server-Sent Events stream of status updates.
+
+    Note: wsgiref is single-threaded, so we emit one event and close.
+    The client reconnects to achieve polling-like updates.
+    """
     response.content_type = "text/event-stream"
     response.set_header("Cache-Control", "no-cache")
-    response.set_header("Connection", "keep-alive")
 
     def generate():
-        while True:
+        try:
             data = json.dumps(_build_status_summary(), default=str)
             yield f"data: {data}\n\n"
-            time.sleep(3)
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            logger.debug(f"SSE client disconnected: {e}")
+            return
 
     return generate()
 
@@ -1672,17 +2143,17 @@ def api_ollama_review_risk():
             risk_data = {
                 "equity": getattr(r, "_current_equity", 0),
                 "balance": getattr(r, "_mt5_balance", 0),
-                "drawdown_pct": r.current_dd,
-                "daily_pnl": r.realized_pnl_today,
-                "open_positions": r._get_open_positions_count(),
-                "daily_trades": r.daily_trades,
-                "halted": r.halt,
-                "halt_reason": r.get_halt_reason(),
-                "max_daily_loss_pct": r.max_daily_loss_pct,
-                "max_hourly_loss_pct": r.max_hourly_loss_pct,
-                "risk_per_trade_pct": r.risk_per_trade_pct,
-                "max_drawdown_pct": r.max_drawdown_pct,
-                "max_positions_per_symbol": r.max_positions_per_symbol,
+                "drawdown_pct": getattr(r, "current_dd", 0.0),
+                "daily_pnl": getattr(r, "realized_pnl_today", 0.0),
+                "open_positions": r._get_open_positions_count() if hasattr(r, "_get_open_positions_count") else 0,
+                "daily_trades": getattr(r, "daily_trades", 0),
+                "halted": getattr(r, "halt", False),
+                "halt_reason": r.get_halt_reason() if hasattr(r, "get_halt_reason") else "",
+                "max_daily_loss_pct": getattr(r, "max_daily_loss_pct", 0.0),
+                "max_hourly_loss_pct": getattr(r, "max_hourly_loss_pct", 0.0),
+                "risk_per_trade_pct": getattr(r, "risk_per_trade_pct", 0.0),
+                "max_drawdown_pct": getattr(r, "max_drawdown_pct", 0.0),
+                "max_positions_per_symbol": getattr(r, "max_positions_per_symbol", 0),
             }
         result = advisor.review_risk_state(risk_data)
         if result:
@@ -2106,90 +2577,11 @@ def api_training_metrics():
             except Exception:
                 pass
 
-        # Calculate per-symbol metrics from decision cache
-        recent_decisions = list(_decision_cache.get(symbol, []))
-        if recent_decisions:
-            # Simulate metrics from decisions (in a real implementation, this would
-            # come from actual backtesting or paper trading results)
-            trades = [d for d in recent_decisions if d.get("action") in ("BUY", "SELL")]
+        # Real metrics only — do NOT invent numbers from decision cache.
+        # If no training artifacts exist, the symbol simply has no metrics.
 
-            if trades:
-                # Calculate simulated PnL based on exposure and direction
-                symbol_pnl = 0.0
-                for i, trade in enumerate(trades):
-                    # Simple simulation: if action matches market direction, profit
-                    exposure = trade.get("exposure", 0)
-                    confidence = trade.get("confidence", 0)
-                    # Simulate return based on confidence and exposure
-                    simulated_return = exposure * confidence * 0.001  # 0.1% base
-                    symbol_pnl += simulated_return * 10000  # Scale to balance
-
-                initial_balance = 10000.0
-                current_balance = initial_balance + symbol_pnl
-                return_pct = (symbol_pnl / initial_balance) * 100 if initial_balance > 0 else 0
-
-                # Calculate drawdown from equity curve if available
-                max_dd = 0.0
-                max_dd_pct = 0.0
-                equity_curve = []
-
-                # Build simulated equity curve from decisions
-                running_balance = initial_balance
-                peak = initial_balance
-                for trade in trades:
-                    exposure = trade.get("exposure", 0)
-                    confidence = trade.get("confidence", 0)
-                    change = exposure * confidence * 0.001 * 10000
-                    running_balance += change
-
-                    if running_balance > peak:
-                        peak = running_balance
-
-                    dd = peak - running_balance
-                    dd_pct = (dd / peak) * 100 if peak > 0 else 0
-                    if dd_pct > max_dd_pct:
-                        max_dd_pct = dd_pct
-                        max_dd = dd
-
-                    equity_curve.append({
-                        "timestamp": dt.fromtimestamp(trade.get("_cached_at", 0), tz=timezone.utc).isoformat(),
-                        "balance": running_balance,
-                        "drawdown": dd,
-                        "drawdown_pct": dd_pct,
-                    })
-
-                # Get volatility regime from latest decision
-                latest = trades[0] if trades else {}
-                volatility = latest.get("volatility", "UNKNOWN")
-
-                result["per_symbol_metrics"][symbol] = {
-                    "symbol": symbol,
-                    "initial_balance": initial_balance,
-                    "current_balance": current_balance,
-                    "net_profit": symbol_pnl,
-                    "return_pct": return_pct,
-                    "total_trades": len(trades),
-                    "win_rate": 50.0 + (confidence * 10) if trades else 0,  # Simulated
-                    "profit_factor": 1.2 if symbol_pnl > 0 else 0.8,  # Simulated
-                    "max_drawdown": max_dd,
-                    "max_drawdown_pct": max_dd_pct,
-                    "volatility_regime": volatility,
-                    "equity_curve": equity_curve[-50:],  # Last 50 points
-                    "trade_history": [
-                        {
-                            "timestamp": dt.fromtimestamp(t.get("_cached_at", 0), tz=timezone.utc).isoformat(),
-                            "profit": t.get("exposure", 0) * t.get("confidence", 0) * 0.001 * 10000,
-                            "action": t.get("action"),
-                            "exposure": t.get("exposure"),
-                            "confidence": t.get("confidence"),
-                        }
-                        for t in trades[:20]  # Last 20 trades
-                    ],
-                }
-
-    # Calculate aggregate metrics (defensive - ensure values are dicts)
+    # Calculate aggregate metrics from real data only (defensive)
     if result["per_symbol_metrics"] and isinstance(result["per_symbol_metrics"], dict):
-        # Filter to only dict values
         metrics_dicts = {k: v for k, v in result["per_symbol_metrics"].items() if isinstance(v, dict)}
         if metrics_dicts:
             returns = [m.get("return_pct", 0) for m in metrics_dicts.values()]
@@ -2198,7 +2590,6 @@ def api_training_metrics():
             result["average_return"] = sum(returns) / len(returns) if returns else 0
             result["max_drawdown"] = max(drawdowns) if drawdowns else 0
 
-            # Find best and worst symbols
             sorted_by_return = sorted(metrics_dicts.items(), key=lambda x: x[1].get("return_pct", 0), reverse=True)
             if sorted_by_return:
                 result["best_symbol"] = sorted_by_return[0][0]
@@ -2356,14 +2747,48 @@ def _get_trading_metrics_for_symbol(symbol: str) -> dict:
     return metrics
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# WebSocket endpoint — /ws/status
+# Pushes the same payload as /api/status every 2 seconds.
+# Only active when geventwebsocket is installed (WS_AVAILABLE == True).
+# ═══════════════════════════════════════════════════════════════════════════
+if WS_AVAILABLE:
+    @app.route('/ws/status')
+    def ws_status():
+        wsock = request.environ.get('wsgi.websocket')
+        if not wsock:
+            abort(400, 'Expected WebSocket request')
+        while True:
+            try:
+                # Reuse the same data-building logic as /api/status by calling
+                # the route function directly and extracting its JSON body.
+                payload_str = api_status()
+                # api_status() returns a str (from _json()); send it as-is.
+                wsock.send(payload_str if isinstance(payload_str, str) else json.dumps(payload_str))
+                gevent_sleep(2)
+            except WebSocketError:
+                break
+            except Exception as e:
+                try:
+                    wsock.send(json.dumps({"error": str(e)}))
+                except Exception:
+                    break
+
+
 # Server lifecycle
 # ═══════════════════════════════════════════════════════════════════════════
+from wsgiref.simple_server import WSGIServer
+WSGIServer.allow_reuse_address = True
+
 API_PORT = int(os.environ.get("AGI_API_PORT", "5000"))
 
 
 def start_api_server(agi_server=None, host: str = "0.0.0.0", port: int = API_PORT):
     """
     Start the HTTP API server in a daemon thread.
+
+    Uses geventwebsocket (WSGIServer + WebSocketHandler) when available so
+    /ws/status works.  Falls back to wsgiref (HTTP-only) if not installed.
 
     Args:
         agi_server: AGIServer instance for live data access.
@@ -2374,12 +2799,17 @@ def start_api_server(agi_server=None, host: str = "0.0.0.0", port: int = API_POR
     _server_ref = agi_server
 
     def _run():
-        logger.success(f"API server starting on http://{host}:{port}")
-        bottle_run(app, host=host, port=port, quiet=True, server="wsgiref")
+        if WS_AVAILABLE:
+            logger.success(f"API server starting (gevent+WS) on http://{host}:{port}")
+            server = GeventWSGIServer((host, port), app, handler_class=WebSocketHandler)
+            server.serve_forever()
+        else:
+            logger.success(f"API server starting (wsgiref, no WS) on http://{host}:{port}")
+            bottle_run(app, host=host, port=port, quiet=True, server="wsgiref")
 
     t = threading.Thread(target=_run, name="api-server", daemon=True)
     t.start()
-    logger.info(f"API server thread started (port {port})")
+    logger.info(f"API server thread started (port {port}, ws={'enabled' if WS_AVAILABLE else 'disabled'})")
     return t
 
 
@@ -2388,4 +2818,9 @@ def start_api_server(agi_server=None, host: str = "0.0.0.0", port: int = API_POR
 # ═══════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     logger.info("Starting API server in standalone mode (no AGIServer reference)")
-    bottle_run(app, host="0.0.0.0", port=API_PORT, quiet=False, reloader=False, server="wsgiref")
+    if WS_AVAILABLE:
+        logger.info("geventwebsocket available — starting with WebSocket support")
+        server = GeventWSGIServer(("0.0.0.0", API_PORT), app, handler_class=WebSocketHandler)
+        server.serve_forever()
+    else:
+        bottle_run(app, host="0.0.0.0", port=API_PORT, quiet=False, reloader=False, server="wsgiref")

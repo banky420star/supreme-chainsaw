@@ -1,8 +1,10 @@
 import React from 'react'
 import { StatusPayload } from '../types'
+import { PPODiagnostics } from '../services/api'
 
 interface Props {
   status: StatusPayload
+  ppoDiag?: PPODiagnostics | null
 }
 
 const colors = {
@@ -134,15 +136,39 @@ function formatValue(v: any): string {
   return String(v)
 }
 
-const PPODiagPanel: React.FC<Props> = ({ status }) => {
+const PPODiagPanel: React.FC<Props> = ({ status, ppoDiag }) => {
   const diags = extractPPODiags(status)
   const modelEntries = extractActiveModels(status)
 
   return (
     <div style={{ background: colors.bg, color: colors.text, padding: 20 }}>
-      <h2 style={{ margin: '0 0 16px', fontSize: 18, color: colors.cyan, fontWeight: 700 }}>
+      <h2 style={{ margin: '0 0 8px', fontSize: 18, color: colors.cyan, fontWeight: 700 }}>
         PPO Brain Diagnostics
       </h2>
+
+      {/* Live PPO status from /api/ppo_diagnostics */}
+      {ppoDiag && (
+        <div style={{ ...panelStyle, display: 'flex', flexWrap: 'wrap', gap: 12, marginBottom: 16 }}>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <span style={{ width: 8, height: 8, borderRadius: '50%', background: ppoDiag.ppo_loaded ? colors.green : colors.red, display: 'inline-block' }} />
+            <span style={{ fontSize: 12, color: colors.muted }}>{ppoDiag.ppo_loaded ? 'Loaded' : 'Not loaded'}</span>
+          </div>
+          {ppoDiag.device && (
+            <div style={{ fontSize: 12, color: colors.muted }}>Device: <span style={{ color: colors.cyan }}>{ppoDiag.device}</span></div>
+          )}
+          {ppoDiag.obs_shape && (
+            <div style={{ fontSize: 12, color: colors.muted }}>Obs: <span style={{ color: colors.text, fontFamily: 'monospace' }}>{JSON.stringify(ppoDiag.obs_shape)}</span></div>
+          )}
+          {ppoDiag.model_version && (
+            <div style={{ fontSize: 12, color: colors.muted }}>Version: <span style={{ color: colors.amber }}>{ppoDiag.model_version}</span></div>
+          )}
+          {ppoDiag.is_canary != null && (
+            <div style={{ fontSize: 12, color: colors.muted }}>
+              Mode: <span style={{ color: ppoDiag.is_canary ? colors.amber : colors.green }}>{ppoDiag.is_canary ? 'CANARY' : 'CHAMPION'}</span>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* PPO Symbol Diagnostics */}
       <div style={panelStyle}>

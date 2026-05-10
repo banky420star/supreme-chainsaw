@@ -3,10 +3,11 @@ import datetime
 import json
 import os
 import subprocess
+import threading
 import time
 
 try:
-    import MetaTrader5 as mt5
+    from Python.mt5_compat import mt5
 except Exception as exc:
     _MT5_IMPORT_ERROR = exc
 
@@ -21,7 +22,20 @@ except Exception as exc:
 import pandas as pd
 from loguru import logger
 
+try:
+    from Python import paper_trading as _srv_paper
+except Exception:
+    _srv_paper = None
+
 from Python.config_utils import DEFAULT_TRADING_SYMBOLS, load_project_config, resolve_trading_symbols
+try:
+    from Python import live_safety
+except Exception:
+    live_safety = None
+
+
+def _is_paper_mode() -> bool:
+    return _srv_paper is not None and _srv_paper.get_mode() == "paper"
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOCK_DIR = os.path.join(BASE_DIR, ".tmp")
@@ -141,6 +155,50 @@ def _read_active_models():
         return {"champion": d.get("champion"), "canary": d.get("canary")}
     except Exception:
         return {"champion": None, "canary": None}
+
+
+def _write_live_state(risk, symbols, last_symbol_state, models, training_state=None):
+    """Persist lightweight runtime snapshot for the standalone API server."""
+    snap = {
+        "timestamp": time.time(),
+        "registry": models,
+        "symbols": {},
+        "trading": {
+            "account": {
+                "balance": float(getattr(risk, "_mt5_balance", 0.0) or 0.0),
+                "equity": float(getattr(risk, "_current_equity", 0.0) or 0.0),
+                "floatingPnl": float(getattr(risk, "_mt5_profit", 0.0) or 0.0),
+                "realizedToday": float(getattr(risk, "realized_pnl_today", 0.0) or 0.0),
+            },
+            "risk": {
+                "drawdownPct": float(getattr(risk, "current_dd", 0.0) or 0.0),
+                "canTrade": bool(getattr(risk, "halt", False)) is False,
+                "haltReason": str(getattr(risk, "_halt_reason", "")) or "",
+            },
+        },
+        "training": training_state
+        if isinstance(training_state, dict)
+        else {"active_canary": False, "cycles_completed": 0},
+    }
+    for sym in symbols:
+        sstate = last_symbol_state.get(str(sym), {})
+        snap["symbols"][str(sym)] = {
+            "champion": models.get("champion"),
+            "canary": models.get("canary"),
+            "canary_pnl": 0.0,
+            "canary_set_time": None,
+            "canary_trades": 0,
+            "signal": sstate.get("signal", "UNKNOWN"),
+            "confidence": sstate.get("confidence", 0.0),
+            "floating_pnl": sstate.get("floating_pnl", 0.0),
+            "open_positions": sstate.get("open_positions", 0),
+        }
+    path = os.path.join(BASE_DIR, "live_state.json")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(snap, f, default=_json_default)
+    except Exception:
+        pass
 
 
 def _training_state():
@@ -494,6 +552,19 @@ def _fetch_symbol_df(symbol: str, timeframe, bars=220):
 
 
 def _account_snapshot():
+    if _is_paper_mode():
+        pacc = _srv_paper.get_paper_account()
+        positions = _srv_paper.paper_positions_get()
+        floating = sum(float(p.get("profit", 0.0)) for p in positions)
+        return {
+            "balance": float(pacc["balance"]),
+            "equity": float(pacc["equity"]),
+            "free_margin": float(pacc["free_margin"]),
+            "pnl_today": float(pacc.get("realized_today", 0.0)),
+            "floating": float(floating),
+            "open_positions": len(positions),
+        }
+
     info = mt5.account_info()
     positions = mt5.positions_get() or []
     floating = sum(float(getattr(p, "profit", 0.0)) for p in positions)
@@ -509,10 +580,24 @@ def _account_snapshot():
     except Exception:
         pass
 
+    balance = None
+    equity = None
+    free_margin = None
+    if info is not None:
+        if getattr(info, "_valid", True):
+            balance = float(info.balance)
+            equity = float(info.equity)
+            free_margin = float(info.margin_free)
+        else:
+            logger.warning(
+                "[MT5 TELEMETRY] Invalid account snapshot: balance=%s, equity=%s, server=%s, login=%s",
+                info.balance, info.equity, info.server, info.login,
+            )
+
     return {
-        "balance": None if info is None else float(info.balance),
-        "equity": None if info is None else float(info.equity),
-        "free_margin": None if info is None else float(info.margin_free),
+        "balance": balance,
+        "equity": equity,
+        "free_margin": free_margin,
         "pnl_today": float(pnl_today),
         "floating": float(floating),
         "open_positions": len(positions),
@@ -554,16 +639,19 @@ def _tick_spread_bps(symbol: str) -> float | None:
 
 
 def _position_exposure_state(symbol: str, max_lots: float) -> tuple[float, float, int, int]:
-    positions = mt5.positions_get() or []
-    symbol_positions = [p for p in positions if str(getattr(p, "symbol", "")) == str(symbol)]
+    if _is_paper_mode():
+        positions = _srv_paper.paper_positions_get()
+    else:
+        positions = mt5.positions_get() or []
+    symbol_positions = [p for p in positions if str(getattr(p, "symbol", "") if not isinstance(p, dict) else p.get("symbol", "")) == str(symbol)]
     current_symbol_exposure = 0.0
     total_exposure = 0.0
     for pos in positions:
-        volume = float(getattr(pos, "volume", 0.0) or 0.0)
-        side = -1.0 if int(getattr(pos, "type", 0)) == int(mt5.ORDER_TYPE_SELL) else 1.0
+        volume = float(getattr(pos, "volume", 0.0) or 0.0) if not isinstance(pos, dict) else float(pos.get("volume", 0.0))
+        side = -1.0 if int(getattr(pos, "type", 0) if not isinstance(pos, dict) else (0 if pos.get("type") == "BUY" else 1)) == int(mt5.ORDER_TYPE_SELL) else 1.0
         exp = side * (volume / max(max_lots, 1e-8))
         total_exposure += abs(exp)
-        if str(getattr(pos, "symbol", "")) == str(symbol):
+        if str(getattr(pos, "symbol", "") if not isinstance(pos, dict) else pos.get("symbol", "")) == str(symbol):
             current_symbol_exposure += exp
     return float(current_symbol_exposure), float(total_exposure), len(symbol_positions), len(positions)
 
@@ -572,22 +660,28 @@ def _scan_trade_events(alerter, risk, known_open_tickets, seen_closed_deals, las
     now_utc = _utc_now()
     closed_events = []
 
-    positions = mt5.positions_get() or []
-    current_open = {int(p.ticket): p for p in positions}
+    if _is_paper_mode():
+        positions = _srv_paper.paper_positions_get()
+        current_open = {int(p.get("ticket")): p for p in positions}
+    else:
+        positions = mt5.positions_get() or []
+        current_open = {int(p.ticket): p for p in positions}
     current_tickets = set(current_open.keys())
 
     new_tickets = sorted(current_tickets - known_open_tickets)
     for ticket in new_tickets:
         p = current_open[ticket]
-        side = "BUY" if int(getattr(p, "type", 0)) == int(mt5.ORDER_TYPE_BUY) else "SELL"
+        is_dict = isinstance(p, dict)
+        pos_type = p.get("type") if is_dict else getattr(p, "type", 0)
+        side = "BUY" if str(pos_type).upper() == "BUY" or int(pos_type) == int(mt5.ORDER_TYPE_BUY) else "SELL"
         payload = {
             "ticket": ticket,
-            "symbol": str(getattr(p, "symbol", "?")),
+            "symbol": str(p.get("symbol", "?") if is_dict else getattr(p, "symbol", "?")),
             "side": side,
-            "volume": float(getattr(p, "volume", 0.0)),
-            "open_price": float(getattr(p, "price_open", 0.0)),
-            "sl": float(getattr(p, "sl", 0.0) or 0.0),
-            "tp": float(getattr(p, "tp", 0.0) or 0.0),
+            "volume": float(p.get("volume", 0.0) if is_dict else getattr(p, "volume", 0.0)),
+            "open_price": float(p.get("open_price", 0.0) if is_dict else getattr(p, "price_open", 0.0)),
+            "sl": float((p.get("sl", 0.0) or 0.0) if is_dict else (getattr(p, "sl", 0.0) or 0.0)),
+            "tp": float((p.get("tp", 0.0) or 0.0) if is_dict else (getattr(p, "tp", 0.0) or 0.0)),
         }
         _append_trade_event("trade_open", payload)
 
@@ -658,8 +752,32 @@ def main(live=False):
     if not _acquire_single_instance_lock():
         raise RuntimeError("Server_AGI is already running (lock file exists)")
 
-    if live:
-        os.environ["AGI_IS_LIVE"] = "1"
+    # Determine execution mode: env var is primary, --live flag is secondary
+    env_mode = live_safety.get_execution_mode() if live_safety else "paper"
+    requested_live = (env_mode == "live")
+    if live and env_mode == "paper":
+        logger.warning("--live flag ignored because CHAIN_GAMBLER_EXECUTION_MODE=paper")
+
+    # Gate live mode with comprehensive safety checks
+    if requested_live:
+        if live_safety is not None:
+            gate = live_safety.live_trading_allowed()
+            if not gate["allowed"]:
+                logger.warning(f"Live trading requested but safety gates failed: {gate['gates']}")
+                logger.warning("Forcing PAPER mode. Set CHAIN_GAMBLER_ALLOW_LIVE=1 and ensure all gates pass for live.")
+                os.environ["CHAIN_GAMBLER_EXECUTION_MODE"] = "paper"
+                live = False
+            else:
+                live = True
+                os.environ["AGI_IS_LIVE"] = "1"
+        else:
+            logger.warning("live_safety module unavailable — forcing PAPER mode")
+            live = False
+    else:
+        live = False
+
+    if not live:
+        os.environ.setdefault("CHAIN_GAMBLER_EXECUTION_MODE", "paper")
 
     cfg = _load_cfg(live=live)
     ok = _init_mt5(cfg)
@@ -670,8 +788,17 @@ def main(live=False):
     risk = runtime["RiskEngine"]()
     supervisor = runtime["RiskSupervisor"](cfg)
     executor = runtime["MT5Executor"](risk)
+
+    # Prevent HybridBrain from starting its own AutonomyLoop thread;
+    # Server_AGI orchestrates training cycles directly in the main loop.
+    os.environ["AGI_AUTONOMY_ENABLED"] = "false"
     brain = runtime["HybridBrain"](risk, executor)
     agi = runtime["SmartAGI"]()
+
+    from Python.autonomy_loop import AutonomyLoop
+
+    autonomy = AutonomyLoop(brain)
+    autonomy._last_train_ts = time.time()
 
     trading_cfg = cfg.get("trading", {})
     symbols = resolve_trading_symbols(cfg, env_keys=("AGI_RUNTIME_SYMBOLS",), fallback=DEFAULT_TRADING_SYMBOLS)
@@ -717,14 +844,42 @@ def main(live=False):
     last_closed_by_symbol = {}
     trade_learning_by_symbol = {}
 
+    _loop_counter = 0
+    _last_training_cycle = 0.0
+    _training_cycle_interval = max(60, int(os.environ.get("AGI_TRAINING_CYCLE_SEC", "1800")))
+    _training_cycle_every_n = max(1, int(os.environ.get("AGI_TRAINING_CYCLE_EVERY_N", "50")))
+    _training_thread = None
+
     while True:
         now = time.time()
+        _loop_counter += 1
+
+        # Trigger autonomous training cycle every N loops or every 30 minutes.
+        if (
+            autonomy.enable_train
+            and (_loop_counter % _training_cycle_every_n == 0 or now - _last_training_cycle >= _training_cycle_interval)
+            and (_training_thread is None or not _training_thread.is_alive())
+        ):
+            _last_training_cycle = now
+            _training_thread = threading.Thread(
+                target=autonomy.training_cycle,
+                args=(symbols,),
+                name="training-cycle",
+                daemon=True,
+            )
+            _training_thread.start()
+            logger.info(f"Training cycle thread started (loop={_loop_counter})")
 
         if now - last_heartbeat >= max(15, heartbeat_sec):
             uptime = int(now - start_time)
             acc = mt5.account_info()
-            if acc:
+            if acc and getattr(acc, "_valid", True):
                 risk.update_equity(float(acc.equity))
+            elif acc and not getattr(acc, "_valid", True):
+                logger.warning(
+                    "[MT5 TELEMETRY] Invalid heartbeat telemetry: balance=%s, equity=%s",
+                    acc.balance, acc.equity,
+                )
 
             snap = _account_snapshot()
             tr_state = _training_state()
@@ -971,8 +1126,13 @@ def main(live=False):
                     alerter.trade_action(symbol, order_meta)
 
                 acc = mt5.account_info()
-                if acc:
+                if acc and getattr(acc, "_valid", True):
                     risk.update_equity(float(acc.equity))
+                elif acc and not getattr(acc, "_valid", True):
+                    logger.warning(
+                        "[MT5 TELEMETRY] Invalid execution-loop telemetry: balance=%s, equity=%s",
+                        acc.balance, acc.equity,
+                    )
             except Exception as exc:
                 risk.record_error()
                 alerter.alert(f"Execution loop error on {symbol}: {exc}")
@@ -1024,6 +1184,18 @@ def main(live=False):
                 sstate["last_closed"] = last_closed_by_symbol.get(sym)
                 alerter.symbol_status(sym, sstate)
             last_symbol_cards = now
+
+        # Write live_state.json for the standalone API server / dashboard
+        try:
+            _write_live_state(
+                risk=risk,
+                symbols=symbols,
+                last_symbol_state=last_symbol_state,
+                models=_read_active_models(),
+                training_state=getattr(autonomy, "training_state", None),
+            )
+        except Exception:
+            pass
 
         time.sleep(max(5, loop_sleep_sec))
 

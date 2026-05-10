@@ -294,7 +294,9 @@ Remove-StalePythonDuplicates -Token "training/train_lstm.py" | Out-Null
 Remove-StaleServerLock
 
 if (-not (Test-ProcessToken -Token "python.server_agi")) {
-  $serverPid = Start-DetachedProcess -FilePath $pythonExe -Arguments @("-m", "Python.Server_AGI", "--live")
+  $env:CHAIN_GAMBLER_EXECUTION_MODE = "paper"
+  $env:CHAIN_GAMBLER_ALLOW_LIVE = "0"
+  $serverPid = Start-DetachedProcess -FilePath $pythonExe -Arguments @("-m", "Python.Server_AGI")
   Write-Host "Started AGI Server pid=$serverPid"
   Start-Sleep -Seconds 2
 } else {

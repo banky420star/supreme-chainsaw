@@ -30,6 +30,7 @@ def test_registry_tracks_global_champion_history(tmp_path):
     registry.promote_canary_to_champion()
 
     history = registry.get_recent_champions()
-    assert len(history) == 2
-    assert history[0]["path"] == cand2
-    assert history[1]["path"] == cand1
+    # First promotion (None -> cand1) records no history because there was no old champion.
+    # Second promotion (cand1 -> cand2) records cand1 as the replaced champion.
+    assert len(history) == 1
+    assert history[0]["path"] == cand1

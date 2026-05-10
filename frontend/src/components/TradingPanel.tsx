@@ -1,8 +1,12 @@
 import React from 'react'
 import { StatusPayload } from '../types'
+import { LaneStatus, LSTMExplanation, setTradingMode, mt5Login, resetPaperAccount } from '../services/api'
 
 interface Props {
   status: StatusPayload
+  lanes?: LaneStatus[]
+  lstmExpl?: Record<string, LSTMExplanation>
+  onModeChange?: () => void
 }
 
 const panelBg = 'rgba(13,23,38,0.92)'
@@ -58,7 +62,37 @@ const blendColors: Record<string, string> = {
   agi_bias: '#ec4899',
 }
 
-const TradingPanel: React.FC<Props> = ({ status }) => {
+const inputStyle: React.CSSProperties = {
+  background: innerBg,
+  border: `1px solid ${borderColor}`,
+  borderRadius: 4,
+  padding: '6px 10px',
+  color: textColor,
+  fontFamily: 'monospace',
+  fontSize: 13,
+  outline: 'none',
+  width: '100%',
+}
+
+const btnStyle: React.CSSProperties = {
+  background: 'rgba(79,214,255,0.15)',
+  border: '1px solid rgba(79,214,255,0.3)',
+  borderRadius: 4,
+  padding: '6px 14px',
+  color: accentBlue,
+  fontSize: 12,
+  fontWeight: 600,
+  cursor: 'pointer',
+}
+
+const dangerBtnStyle: React.CSSProperties = {
+  ...btnStyle,
+  background: 'rgba(245,71,91,0.15)',
+  border: '1px solid rgba(245,71,91,0.3)',
+  color: profitRed,
+}
+
+const TradingPanel: React.FC<Props> = ({ status, lanes: _propLanes, lstmExpl: _lstmExpl, onModeChange }) => {
   const positions = status?.account?.positions ?? []
   const laneRows = status?.training?.symbol_lane_rows ?? []
   const account = status?.account
@@ -67,9 +101,207 @@ const TradingPanel: React.FC<Props> = ({ status }) => {
   const equity = account?.equity ?? 0
   const freeMargin = account?.free_margin ?? 0
   const floatingPnl = equity - balance
+  const login = account?.login
+  const server = account?.server
+  const accName = account?.name
+  const currency = account?.currency
+  const mode = account?.mode ?? 'live'
+  const isPaper = mode === 'paper'
+  const isReal = !isPaper && server?.toLowerCase().includes('real')
+
+  const [loginForm, setLoginForm] = React.useState({ login: '', password: '', server: '' })
+  const [loginMsg, setLoginMsg] = React.useState('')
+  const [modeLoading, setModeLoading] = React.useState(false)
+
+  const handleSetMode = async (newMode: 'paper' | 'live') => {
+    setModeLoading(true)
+    const res = await setTradingMode(newMode)
+    setModeLoading(false)
+    if (res.success) {
+      setLoginMsg(`Switched to ${newMode.toUpperCase()} mode`)
+      onModeChange?.()
+      setTimeout(() => setLoginMsg(''), 2000)
+    } else {
+      setLoginMsg(res.error || 'Mode switch failed')
+    }
+  }
+
+  const handleMT5Login = async () => {
+    setLoginMsg('Logging in...')
+    const res = await mt5Login(Number(loginForm.login), loginForm.password, loginForm.server)
+    if (res.success) {
+      setLoginMsg(`Logged in: ${res.name || res.login} @ ${res.server}`)
+      onModeChange?.()
+      setLoginForm({ login: '', password: '', server: '' })
+    } else {
+      setLoginMsg(res.error || 'Login failed')
+    }
+  }
+
+  const handlePaperReset = async () => {
+    const res = await resetPaperAccount(100_000)
+    if (res.success) {
+      setLoginMsg('Paper account reset to $100,000')
+      onModeChange?.()
+    } else {
+      setLoginMsg(res.error || 'Reset failed')
+    }
+  }
 
   return (
     <section style={{ color: textColor }}>
+      {/* Paper Banner */}
+      {isPaper && (
+        <div style={{
+          ...cardOuter,
+          border: '1px solid rgba(245,158,11,0.4)',
+          background: 'rgba(245,158,11,0.08)',
+        }}>
+          <div style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 10,
+            fontSize: 14,
+            fontWeight: 700,
+            color: '#f59e0b',
+            letterSpacing: 2,
+            textTransform: 'uppercase',
+          }}>
+            <span style={{
+              width: 10, height: 10, borderRadius: '50%',
+              background: '#f59e0b',
+              boxShadow: '0 0 10px #f59e0b',
+              animation: 'markPulse 2s ease-in-out infinite',
+            }} />
+            PAPER TRADING — NO REAL MONEY AT RISK
+          </div>
+        </div>
+      )}
+
+      {/* Mode & Account Controls */}
+      <div style={cardOuter}>
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          flexWrap: 'wrap',
+          gap: 12,
+          marginBottom: 12,
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <span style={{ fontWeight: 700, fontSize: 14 }}>Trading Mode</span>
+            <div style={{
+              display: 'flex',
+              borderRadius: 4,
+              overflow: 'hidden',
+              border: `1px solid ${borderColor}`,
+            }}>
+              {(['paper', 'live'] as const).map((m) => (
+                <button
+                  key={m}
+                  disabled={modeLoading}
+                  onClick={() => handleSetMode(m)}
+                  style={{
+                    border: 'none',
+                    padding: '4px 12px',
+                    fontSize: 11,
+                    fontWeight: 700,
+                    textTransform: 'uppercase',
+                    cursor: modeLoading ? 'not-allowed' : 'pointer',
+                    background: mode === m
+                      ? (m === 'paper' ? 'rgba(245,158,11,0.25)' : 'rgba(34,214,138,0.25)')
+                      : innerBg,
+                    color: mode === m
+                      ? (m === 'paper' ? '#f59e0b' : profitGreen)
+                      : mutedColor,
+                  }}
+                >
+                  {m}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {isPaper && (
+            <button onClick={handlePaperReset} style={dangerBtnStyle}>
+              Reset $100k
+            </button>
+          )}
+        </div>
+
+        {/* Account Identity */}
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          flexWrap: 'wrap',
+          gap: 8,
+          fontSize: 12,
+          fontFamily: 'monospace',
+          marginBottom: 12,
+        }}>
+          <span style={{
+            padding: '2px 8px',
+            borderRadius: 4,
+            background: isPaper ? 'rgba(245,158,11,0.15)' : isReal ? 'rgba(245,71,91,0.15)' : 'rgba(34,214,138,0.15)',
+            color: isPaper ? '#f59e0b' : isReal ? profitRed : profitGreen,
+            fontWeight: 700,
+            textTransform: 'uppercase',
+            fontSize: 11,
+          }}>
+            {isPaper ? 'PAPER' : isReal ? 'LIVE' : 'DEMO'}
+          </span>
+          {login && <span style={{ color: mutedColor }}>Login: <span style={{ color: textColor }}>{login}</span></span>}
+          {server && <span style={{ color: mutedColor }}>Server: <span style={{ color: textColor }}>{server}</span></span>}
+          {currency && <span style={{ color: mutedColor }}>Currency: <span style={{ color: textColor }}>{currency}</span></span>}
+          {accName && <span style={{ color: mutedColor, fontSize: 11 }}>{accName}</span>}
+        </div>
+
+        {/* MT5 Login Form */}
+        {!isPaper && (
+          <div style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))',
+            gap: 8,
+            alignItems: 'end',
+          }}>
+            <input
+              type="number"
+              placeholder="Login ID"
+              value={loginForm.login}
+              onChange={(e) => setLoginForm((f) => ({ ...f, login: e.target.value }))}
+              style={inputStyle}
+            />
+            <input
+              type="password"
+              placeholder="Password"
+              value={loginForm.password}
+              onChange={(e) => setLoginForm((f) => ({ ...f, password: e.target.value }))}
+              style={inputStyle}
+            />
+            <input
+              type="text"
+              placeholder="Server (e.g. Exness-MT5Trial9)"
+              value={loginForm.server}
+              onChange={(e) => setLoginForm((f) => ({ ...f, server: e.target.value }))}
+              style={inputStyle}
+            />
+            <button onClick={handleMT5Login} style={btnStyle}>Connect MT5</button>
+          </div>
+        )}
+
+        {loginMsg && (
+          <div style={{
+            marginTop: 10,
+            fontSize: 12,
+            color: loginMsg.includes('failed') || loginMsg.includes('error') ? profitRed : profitGreen,
+            fontFamily: 'monospace',
+          }}>
+            {loginMsg}
+          </div>
+        )}
+      </div>
+
       {/* Account Summary */}
       <div style={cardOuter}>
         <h3 style={sectionHeading}>Account Summary</h3>
@@ -106,10 +338,10 @@ const TradingPanel: React.FC<Props> = ({ status }) => {
               </div>
             </div>
           ))}
+        </div>
       </div>
-    </div>
 
-    {/* Lane Summary */}
+      {/* Lane Summary */}
     <div style={cardOuter}>
       <h3 style={sectionHeading}>Lane Summary</h3>
       <div

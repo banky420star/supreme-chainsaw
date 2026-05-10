@@ -19,9 +19,13 @@ export AGI_DZ_EURUSD="0.18"
 export AGI_DZ_GBPUSD="0.20"
 export AGI_DZ_XAUUSD="0.22"
 
-echo "🚀 Starting Grok AGI Server on Port $AGI_PORT with Token '$AGI_TOKEN' in LIVE mode..."
+# Default to paper mode; live requires explicit opt-in
+export CHAIN_GAMBLER_EXECUTION_MODE="paper"
+export CHAIN_GAMBLER_ALLOW_LIVE="0"
+
+echo "🚀 Starting Grok AGI Server on Port $AGI_PORT with Token '$AGI_TOKEN' in PAPER mode..."
 
 # If you prefer to use your python venv, uncomment the next line:
 # source venv/bin/activate
 
-python -m Python.Server_AGI --live
+python -m Python.Server_AGI

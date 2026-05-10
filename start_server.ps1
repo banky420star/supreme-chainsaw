@@ -21,4 +21,6 @@ if (-not (Test-Path $py)) {
 if (-not (Test-Path $py)) {
     throw "No venv python found (.venv312/.venv). Refusing global python fallback."
 }
-& $py -m Python.Server_AGI --live
+$env:CHAIN_GAMBLER_EXECUTION_MODE = "paper"
+$env:CHAIN_GAMBLER_ALLOW_LIVE = "0"
+& $py -m Python.Server_AGI

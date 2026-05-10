@@ -1,6 +1,7 @@
 import React from 'react'
 import { StatusPayload, TrainingVisual } from '../types'
 import { controlAction } from '../services/api'
+import TrainingLaneCard from './TrainingLaneCard'
 
 interface Props {
   status: StatusPayload
@@ -189,6 +190,8 @@ const TrainingPanel: React.FC<Props> = ({ status }) => {
   const [toast, setToast] = React.useState<{ msg: string; ok: boolean } | null>(null)
 
   const training = status.training
+  const parallelLanes = (status.training as any)?.parallel_lanes ?? []
+  const laneActiveCount = (status.training as any)?.lane_active_count ?? 0
 
   const handleAction = async (action: string) => {
     setLoading(action)
@@ -225,6 +228,25 @@ const TrainingPanel: React.FC<Props> = ({ status }) => {
       <h2 style={{ margin: '0 0 16px', fontSize: 18, color: colors.cyan, fontWeight: 700 }}>
         Training Pipeline
       </h2>
+
+      {/* Parallel Training Lanes */}
+      {parallelLanes.length > 0 && (
+        <div style={panelStyle}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
+            <h3 style={{ margin: 0, fontSize: 14, color: colors.cyan, fontWeight: 600 }}>
+              Parallel Training Lanes
+            </h3>
+            <span style={{ fontSize: 12, color: colors.muted }}>
+              {laneActiveCount} active / {parallelLanes.length} total
+            </span>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))', gap: 12 }}>
+            {parallelLanes.map((lane: any, i: number) => (
+              <TrainingLaneCard key={lane.symbol} lane={lane} index={i} />
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Pipeline Overview — 3 cards */}
       <div style={{ ...panelStyle }}>
@@ -334,6 +356,13 @@ const TrainingPanel: React.FC<Props> = ({ status }) => {
             onClick={() => handleAction('force_ingest')}
           >
             {loading === 'force_ingest' ? 'Ingesting...' : 'Force Ingest'}
+          </button>
+          <button
+            style={{ ...btnBase, background: '#5ad7ff', opacity: loading === 'start_parallel_training' ? 0.6 : 1 }}
+            disabled={loading !== null}
+            onClick={() => handleAction('start_parallel_training')}
+          >
+            {loading === 'start_parallel_training' ? 'Starting...' : 'Start Parallel Lanes'}
           </button>
         </div>
         {toast && (
