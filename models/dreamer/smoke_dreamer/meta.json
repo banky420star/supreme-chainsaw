@@ -1,0 +1,32 @@
+{
+  "training_run_id": "1bf97204-b8a9-4baa-8de1-3b7834edf438",
+  "model_id": "smoke_dreamer",
+  "dataset_id": "default",
+  "feature_set_id": "dreamer_v1",
+  "window_size": 32,
+  "batch_size": 16,
+  "seed": 42,
+  "status": "trained",
+  "stub_disabled": false,
+  "obs_dim": 128,
+  "history": [
+    {
+      "val_loss": 0.4787164419249166,
+      "latent_prediction_loss": 0.253775,
+      "reward_prediction_error": 0.000137,
+      "drawdown_prediction_error": 0.224805,
+      "rollout_stability": 0.043785,
+      "step": 0,
+      "train_loss": 1.1490235328674316
+    },
+    {
+      "val_loss": 0.25154469612311914,
+      "latent_prediction_loss": 0.250316,
+      "reward_prediction_error": 2e-06,
+      "drawdown_prediction_error": 0.001227,
+      "rollout_stability": 0.179426,
+      "step": 50,
+      "train_loss": 0.25441816449165344
+    }
+  ]
+}

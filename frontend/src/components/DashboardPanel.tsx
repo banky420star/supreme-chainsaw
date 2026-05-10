@@ -69,6 +69,23 @@ function statusBadge(
     : { label: offLabel, color: colors.red }
 }
 
+function truthColor(value?: string): string {
+  if (!value) return colors.muted
+  const v = value.toLowerCase()
+  const good = new Set([
+    'clean', 'audited', 'valid', 'trained', 'validated', 'champion',
+    'active', 'running', 'passing', 'unlocked',
+  ])
+  const warn = new Set([
+    'stale', 'unaudited', 'leakage-risk', 'validating', 'informational-only',
+    'training', 'candidate', 'demo_canary', 'degraded', 'locked', 'failed',
+    'failing', 'invalid', 'undertrained', 'rejected',
+  ])
+  if (good.has(v)) return colors.green
+  if (warn.has(v)) return colors.amber
+  return colors.red
+}
+
 const DashboardPanel: React.FC<Props> = ({ status }) => {
   const [tradeSummary, setTradeSummary] = React.useState<TradeSummary | null>(null)
   const [recentTrades, setRecentTrades] = React.useState<Trade[]>([])
@@ -151,6 +168,89 @@ const DashboardPanel: React.FC<Props> = ({ status }) => {
           <span style={{ ...valueStyle, color: canaryBadge.color }}>
             {canaryBadge.label}
           </span>
+        </div>
+      </div>
+
+      {/* System Truth */}
+      <div style={{ ...panelStyle, marginBottom: 24 }}>
+        <h3 style={{ margin: '0 0 14px 0', fontSize: 14, color: colors.cyan, fontWeight: 600 }}>
+          System Truth
+        </h3>
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))',
+            gap: 10,
+          }}
+        >
+          {[
+            { label: 'Mode', value: status.system?.system_mode ?? 'unknown' },
+            { label: 'Data', value: status.data?.status ?? 'unknown' },
+            { label: 'Features', value: 'unaudited' },
+            { label: 'Labels', value: 'unknown' },
+            { label: 'LSTM', value: status.models?.lstm_status ?? 'unknown' },
+            { label: 'Rainforest', value: status.models?.rainforest_status ?? 'unknown' },
+            { label: 'Dreamer', value: status.models?.dreamer_status ?? 'unknown' },
+            { label: 'PPO', value: status.models?.ppo_status ?? 'unknown' },
+            { label: 'Ensemble', value: status.models?.ensemble_status ?? 'unknown' },
+            { label: 'Paper', value: status.system?.system_mode === 'paper_sim' ? 'running' : 'idle' },
+            { label: 'Demo-live', value: status.system?.system_mode === 'demo_live' ? 'active' : 'idle' },
+            { label: 'Real-live', value: status.system?.real_money_locked ? 'locked' : 'unlocked' },
+            { label: 'Tests', value: status.tests?.status ?? 'unknown' },
+            { label: 'Telemetry', value: status.account?.telemetry_valid ? 'valid' : 'invalid' },
+          ].map((item) => (
+            <div
+              key={item.label}
+              style={{
+                ...panelStyle,
+                padding: '8px 10px',
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+              }}
+            >
+              <span style={{ fontSize: 11, color: colors.muted, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                {item.label}
+              </span>
+              <span
+                style={{
+                  fontSize: 12,
+                  fontWeight: 700,
+                  color: truthColor(item.value),
+                  textTransform: 'uppercase',
+                }}
+              >
+                {item.value}
+              </span>
+            </div>
+          ))}
+        </div>
+        {/* Conditional truth messages */}
+        <div style={{ marginTop: 12, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+          {(!status.data?.status || status.data?.status === 'unknown') && (
+            <span style={{ fontSize: 11, color: colors.amber }}>No verified data yet</span>
+          )}
+          {(!training?.cycle_running && !training?.lstm_running && !training?.drl_running && !training?.dreamer_running) && (
+            <span style={{ fontSize: 11, color: colors.amber }}>Training not running</span>
+          )}
+          {status.models?.dreamer_status === 'stub_disabled' && (
+            <span style={{ fontSize: 11, color: colors.amber }}>Dreamer disabled/stub</span>
+          )}
+          {(status.models?.ppo_status === 'undertrained' || status.models?.lstm_status === 'disabled') && (
+            <span style={{ fontSize: 11, color: colors.amber }}>Model not validated</span>
+          )}
+          {status.system?.system_mode === 'demo_live' && tradeOverall?.total_trades == null && (
+            <span style={{ fontSize: 11, color: colors.amber }}>Waiting for demo trades</span>
+          )}
+          {status.tests?.status === 'failing' && (
+            <span style={{ fontSize: 11, color: colors.red }}>Tests failing</span>
+          )}
+          {status.account?.telemetry_valid === false && (
+            <span style={{ fontSize: 11, color: colors.red }}>Telemetry invalid</span>
+          )}
+          {status.system?.real_money_locked && (
+            <span style={{ fontSize: 11, color: colors.red }}>Real money locked</span>
+          )}
         </div>
       </div>
 

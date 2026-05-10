@@ -1,0 +1,49 @@
+{
+  "feature_names": [
+    "ret",
+    "ret1",
+    "vol",
+    "spread",
+    "volume"
+  ],
+  "top_features": [
+    {
+      "feature": "volume",
+      "importance": 0.310774
+    },
+    {
+      "feature": "vol",
+      "importance": 0.286464
+    },
+    {
+      "feature": "ret",
+      "importance": 0.222466
+    },
+    {
+      "feature": "ret1",
+      "importance": 0.172927
+    },
+    {
+      "feature": "spread",
+      "importance": 0.007369
+    }
+  ],
+  "trained_at": 1778405449.193181,
+  "n_estimators": 10,
+  "max_depth": 4,
+  "seed": 42,
+  "training_run_id": "4eac8711-2fb7-4664-bb26-c362f1f0ec8f",
+  "model_id": "smoke_rf",
+  "dataset_id": "default",
+  "feature_set_id": "rainforest_v1",
+  "classes": [
+    "breakout_expansion",
+    "chaos_spike",
+    "liquidity_thin",
+    "mean_reversion_zone",
+    "range_low_vol",
+    "trend_down",
+    "trend_up",
+    "unknown"
+  ]
+}

@@ -1,0 +1,104 @@
+{
+  "training_run_id": "216a4a24-0e2d-44f3-a2d5-fc5fd5dd8f37",
+  "model_id": "dreamer_216a4a24",
+  "dataset_id": "ds_BTCUSDm_M15_latest",
+  "feature_set_id": "features_BTCUSDm_M15_latest",
+  "window_size": 64,
+  "batch_size": 32,
+  "seed": 42,
+  "status": "trained",
+  "stub_disabled": false,
+  "obs_dim": 1024,
+  "history": [
+    {
+      "val_loss": 0.9019994533446152,
+      "latent_prediction_loss": 0.728221,
+      "reward_prediction_error": 0.000106,
+      "drawdown_prediction_error": 0.173672,
+      "rollout_stability": 0.042906,
+      "step": 0,
+      "train_loss": 1.6392858028411865
+    },
+    {
+      "val_loss": 0.7198473527680562,
+      "latent_prediction_loss": 0.717086,
+      "reward_prediction_error": 1e-06,
+      "drawdown_prediction_error": 0.002761,
+      "rollout_stability": 0.179357,
+      "step": 50,
+      "train_loss": 0.7384732961654663
+    },
+    {
+      "val_loss": 0.7127353675200538,
+      "latent_prediction_loss": 0.711705,
+      "reward_prediction_error": 6e-06,
+      "drawdown_prediction_error": 0.001024,
+      "rollout_stability": 0.179713,
+      "step": 100,
+      "train_loss": 0.7295542359352112
+    },
+    {
+      "val_loss": 0.7229352872871004,
+      "latent_prediction_loss": 0.722113,
+      "reward_prediction_error": 3e-06,
+      "drawdown_prediction_error": 0.000818,
+      "rollout_stability": 0.181214,
+      "step": 150,
+      "train_loss": 0.7224569320678711
+    },
+    {
+      "val_loss": 0.7242121417039016,
+      "latent_prediction_loss": 0.72344,
+      "reward_prediction_error": 8e-06,
+      "drawdown_prediction_error": 0.000765,
+      "rollout_stability": 0.180195,
+      "step": 200,
+      "train_loss": 0.7237916588783264
+    },
+    {
+      "val_loss": 0.7165650228596405,
+      "latent_prediction_loss": 0.71554,
+      "reward_prediction_error": 2e-06,
+      "drawdown_prediction_error": 0.001022,
+      "rollout_stability": 0.181708,
+      "step": 250,
+      "train_loss": 0.7310453057289124
+    },
+    {
+      "val_loss": 0.7276325345865189,
+      "latent_prediction_loss": 0.726957,
+      "reward_prediction_error": 4e-06,
+      "drawdown_prediction_error": 0.000671,
+      "rollout_stability": 0.18008,
+      "step": 300,
+      "train_loss": 0.7238190174102783
+    },
+    {
+      "val_loss": 0.7142922702112173,
+      "latent_prediction_loss": 0.713398,
+      "reward_prediction_error": 1e-06,
+      "drawdown_prediction_error": 0.000893,
+      "rollout_stability": 0.183797,
+      "step": 350,
+      "train_loss": 0.7174033522605896
+    },
+    {
+      "val_loss": 0.7217577487617746,
+      "latent_prediction_loss": 0.721055,
+      "reward_prediction_error": 2e-06,
+      "drawdown_prediction_error": 0.000701,
+      "rollout_stability": 0.183104,
+      "step": 400,
+      "train_loss": 0.973648190498352
+    },
+    {
+      "val_loss": 0.7177491569941594,
+      "latent_prediction_loss": 0.717221,
+      "reward_prediction_error": 1e-06,
+      "drawdown_prediction_error": 0.000527,
+      "rollout_stability": 0.17861,
+      "step": 450,
+      "train_loss": 0.7215249538421631
+    }
+  ]
+}

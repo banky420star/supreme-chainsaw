@@ -1,0 +1,11 @@
+{
+  "decision": "demo_canary",
+  "symbol": "BTCUSDm",
+  "timeframe": "M15",
+  "issues": [],
+  "upstream": {
+    "backtest": true,
+    "walk_forward": true,
+    "baseline": true
+  }
+}

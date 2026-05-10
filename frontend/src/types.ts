@@ -97,6 +97,41 @@ export interface CanaryGate {
   reason?: string
 }
 
+export interface SystemTruth {
+  system_mode?: string
+  execution_transport?: string
+  real_money_locked?: boolean
+  live_lock_reason?: string
+}
+
+export interface DataTruth {
+  source?: string
+  status?: string
+  latest_dataset_id?: string
+}
+
+export interface ModelsTruth {
+  bundle_id?: string
+  lstm_status?: string
+  rainforest_status?: string
+  dreamer_status?: string
+  ppo_status?: string
+  ensemble_status?: string
+}
+
+export interface ValidationTruth {
+  backtest_status?: string
+  walk_forward_status?: string
+  promotion_status?: string
+  champion_status?: string
+}
+
+export interface TestsTruth {
+  status?: string
+  open_failures?: number
+  open_errors?: number
+}
+
 export interface StatusPayload {
   state?: string
   server?: ServerInfo
@@ -118,6 +153,10 @@ export interface StatusPayload {
     riskPerTradePct?: number
   }
   models?: any
+  system?: SystemTruth
+  data?: DataTruth
+  validation?: ValidationTruth
+  tests?: TestsTruth
 }
 
 export interface AgentStatus {

@@ -70,6 +70,10 @@ class ModelRegistry:
             out["champion"] = None
         if "canary" not in out:
             out["canary"] = None
+        if "champion_bundle_id" not in out:
+            out["champion_bundle_id"] = None
+        if "canary_bundle_id" not in out:
+            out["canary_bundle_id"] = None
         if "canary_policy" not in out or not isinstance(out.get("canary_policy"), dict):
             out["canary_policy"] = {}
         if "canary_state" not in out or not isinstance(out.get("canary_state"), dict):
@@ -83,6 +87,8 @@ class ModelRegistry:
                 out["symbols"][sym] = {
                     "champion": None,
                     "canary": None,
+                    "champion_bundle_id": None,
+                    "canary_bundle_id": None,
                     "canary_policy": {},
                     "canary_state": {},
                     "champion_history": [],
@@ -92,6 +98,10 @@ class ModelRegistry:
                 cfg["champion"] = None
             if "canary" not in cfg:
                 cfg["canary"] = None
+            if "champion_bundle_id" not in cfg:
+                cfg["champion_bundle_id"] = None
+            if "canary_bundle_id" not in cfg:
+                cfg["canary_bundle_id"] = None
             if "canary_policy" not in cfg or not isinstance(cfg.get("canary_policy"), dict):
                 cfg["canary_policy"] = {}
             if "canary_state" not in cfg or not isinstance(cfg.get("canary_state"), dict):
@@ -398,7 +408,7 @@ class ModelRegistry:
             self._write_active(active)
         return None
 
-    def set_canary(self, version_dir: str, symbol: str | None = None, policy: dict | None = None):
+    def set_canary(self, version_dir: str, symbol: str | None = None, policy: dict | None = None, bundle_id: str | None = None):
         active = self._read_active()
         merged = self._merge_canary_policy(policy, symbol)
         if symbol:
@@ -407,18 +417,20 @@ class ModelRegistry:
             symbols = active.setdefault("symbols", {})
             cur = dict(symbols.get(symbol, {"champion": None, "canary": None, "canary_policy": {}, "canary_state": {}}))
             cur["canary"] = version_dir
+            cur["canary_bundle_id"] = bundle_id
             cur["canary_policy"] = merged
             cur["canary_state"] = {"passed": False, "reason": "no_metrics"}
             symbols[symbol] = cur
             self._write_active(active)
-            logger.warning(f"Canary set for {symbol}: {version_dir}")
+            logger.warning(f"Canary set for {symbol}: {version_dir} bundle={bundle_id}")
             return
 
         active["canary"] = version_dir
+        active["canary_bundle_id"] = bundle_id
         active["canary_policy"] = merged
         active["canary_state"] = {"passed": False, "reason": "no_metrics"}
         self._write_active(active)
-        logger.warning(f"Canary set: {version_dir}")
+        logger.warning(f"Canary set: {version_dir} bundle={bundle_id}")
 
     def update_canary_metrics(
         self,
@@ -491,11 +503,13 @@ class ModelRegistry:
             old_champion = cur.get("champion")
             cur["champion_history"] = self._append_history(cur.get("champion_history", []), old_champion)
             cur["champion"] = cur["canary"]
+            cur["champion_bundle_id"] = cur.get("canary_bundle_id")
             cur["canary"] = None
+            cur["canary_bundle_id"] = None
             cur["canary_state"] = {}
             symbols[symbol] = cur
             self._write_active(active)
-            logger.success(f"Promoted {symbol} champion: {cur['champion']}")
+            logger.success(f"Promoted {symbol} champion: {cur['champion']} bundle={cur['champion_bundle_id']}")
             return
 
         if not active.get("canary"):
@@ -507,10 +521,12 @@ class ModelRegistry:
         old_champion = active.get("champion")
         active["champion_history"] = self._append_history(active.get("champion_history", []), old_champion)
         active["champion"] = active["canary"]
+        active["champion_bundle_id"] = active.get("canary_bundle_id")
         active["canary"] = None
+        active["canary_bundle_id"] = None
         active["canary_state"] = {}
         self._write_active(active)
-        logger.success(f"Promoted champion: {active['champion']}")
+        logger.success(f"Promoted champion: {active['champion']} bundle={active['champion_bundle_id']}")
 
     def clear_canary(self, symbol: str | None = None):
         active = self._read_active()
@@ -689,3 +705,47 @@ class ModelRegistry:
         """Return a copy of the per-symbol registry map."""
         active = self._read_active()
         return dict(active.get("symbols", {}))
+
+    # ── Bundle ID tracking ───────────────────────────────────────────────
+
+    def set_champion_bundle_id(self, symbol: str | None, bundle_id: str | None):
+        """Attach a bundle_id to the current champion entry."""
+        active = self._read_active()
+        if symbol:
+            cur = self._ensure_symbol_entry(active, symbol)
+            cur["champion_bundle_id"] = bundle_id
+        else:
+            active["champion_bundle_id"] = bundle_id
+        self._write_active(active)
+        logger.info(f"Champion bundle_id set for {symbol or 'global'}: {bundle_id}")
+
+    def set_canary_bundle_id(self, symbol: str | None, bundle_id: str | None):
+        """Attach a bundle_id to the current canary entry."""
+        active = self._read_active()
+        if symbol:
+            cur = self._ensure_symbol_entry(active, symbol)
+            cur["canary_bundle_id"] = bundle_id
+        else:
+            active["canary_bundle_id"] = bundle_id
+        self._write_active(active)
+        logger.info(f"Canary bundle_id set for {symbol or 'global'}: {bundle_id}")
+
+    def get_champion_bundle_id(self, symbol: str | None = None) -> str | None:
+        """Get champion bundle_id for a symbol (or global if symbol is None)."""
+        active = self._read_active()
+        if symbol:
+            symbols = active.get("symbols", {})
+            if symbol in symbols:
+                return symbols[symbol].get("champion_bundle_id")
+            return active.get("champion_bundle_id")
+        return active.get("champion_bundle_id")
+
+    def get_canary_bundle_id(self, symbol: str | None = None) -> str | None:
+        """Get canary bundle_id for a symbol (or global if symbol is None)."""
+        active = self._read_active()
+        if symbol:
+            symbols = active.get("symbols", {})
+            if symbol in symbols:
+                return symbols[symbol].get("canary_bundle_id")
+            return active.get("canary_bundle_id")
+        return active.get("canary_bundle_id")

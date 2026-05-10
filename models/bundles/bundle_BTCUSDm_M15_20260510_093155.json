@@ -1,0 +1,17 @@
+{
+  "bundle_id": "bundle_BTCUSDm_M15_20260510_093155",
+  "symbol": "BTCUSDm",
+  "timeframe": "M15",
+  "dataset_id": "ds_BTCUSDm_M15_latest",
+  "feature_set_id": "features_BTCUSDm_M15_latest",
+  "label_set_id": "labels_BTCUSDm_M15",
+  "lstm_model_id": "",
+  "rainforest_model_id": "",
+  "dreamer_model_id": "",
+  "ppo_model_id": "",
+  "meta_controller_id": "",
+  "status": "candidate",
+  "created_at": "2026-05-10T09:31:55.804294+00:00",
+  "updated_at": "2026-05-10T09:31:55.804315+00:00",
+  "metadata": {}
+}

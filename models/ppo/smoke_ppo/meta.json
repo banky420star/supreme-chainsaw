@@ -1,0 +1,9 @@
+{
+  "training_run_id": "20052c89-ab3c-49f5-9be1-cab1b80cacff",
+  "model_id": "smoke_ppo",
+  "dataset_id": "default",
+  "feature_set_id": "ppo_v1",
+  "configured_timesteps": 512,
+  "actual_timesteps": 512,
+  "seed": 42
+}

@@ -356,6 +356,22 @@ const App: React.FC = () => {
           ) : (
             <span className="agit-pill agit-pill-live">LIVE</span>
           )}
+          {/* Truth pills */}
+          {pipe.status?.system?.real_money_locked && (
+            <span className="agit-pill" style={{ background: 'var(--red)', color: '#fff', marginLeft: 6 }}>
+              LOCKED
+            </span>
+          )}
+          {pipe.status?.tests?.status === 'failing' && (
+            <span className="agit-pill" style={{ background: 'var(--amber)', color: '#000', marginLeft: 6 }}>
+              TESTS FAIL
+            </span>
+          )}
+          {pipe.status?.account?.telemetry_valid === false && (
+            <span className="agit-pill" style={{ background: 'var(--amber)', color: '#000', marginLeft: 6 }}>
+              TELEMETRY INVALID
+            </span>
+          )}
           <span style={{
             display: 'inline-flex', alignItems: 'center', gap: 4,
             fontSize: 11, color: wsConnected ? 'var(--green)' : 'var(--amber)',

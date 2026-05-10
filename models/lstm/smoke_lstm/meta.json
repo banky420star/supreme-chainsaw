@@ -1,0 +1,92 @@
+{
+  "training_run_id": "ef66de0a-1152-4fcc-8df4-aa7122d477a8",
+  "model_id": "smoke_lstm",
+  "dataset_id": "default",
+  "feature_set_id": "engineered_v2",
+  "label_set_id": "directional",
+  "lookback_window": 64,
+  "horizons": [
+    1,
+    5,
+    15
+  ],
+  "epochs": 2,
+  "batch_size": 32,
+  "seed": 42,
+  "feature_count": 5,
+  "device": "mps",
+  "history": [
+    {
+      "val_loss": 0.5242628455162048,
+      "directional_accuracy": 0.743945,
+      "precision_long": 0.0,
+      "precision_short": 0.743945,
+      "recall_long": 0.0,
+      "recall_short": 1.0,
+      "expected_return_error": 35.647209,
+      "volatility_error": 0.049929,
+      "calibration_error": 0.032866,
+      "confidence_vs_accuracy": {
+        "mean_confidence": 0.9082742929458618,
+        "accuracy": 0.7439446366782007,
+        "gap": 0.16432965626766116
+      },
+      "performance_by_regime": {
+        "vol_quartile_0": {
+          "accuracy": 0.7083333333333334,
+          "count": 72
+        },
+        "vol_quartile_1": {
+          "accuracy": 0.6944444444444444,
+          "count": 72
+        },
+        "vol_quartile_2": {
+          "accuracy": 0.9722222222222222,
+          "count": 72
+        },
+        "vol_quartile_3": {
+          "accuracy": 0.6027397260273972,
+          "count": 73
+        }
+      },
+      "epoch": 1,
+      "train_loss": 2700.526751
+    },
+    {
+      "val_loss": 0.5462898015975952,
+      "directional_accuracy": 0.743945,
+      "precision_long": 0.0,
+      "precision_short": 0.743945,
+      "recall_long": 0.0,
+      "recall_short": 1.0,
+      "expected_return_error": 73.022514,
+      "volatility_error": 0.023462,
+      "calibration_error": 0.04123,
+      "confidence_vs_accuracy": {
+        "mean_confidence": 0.950095534324646,
+        "accuracy": 0.7439446366782007,
+        "gap": 0.20615089764644534
+      },
+      "performance_by_regime": {
+        "vol_quartile_0": {
+          "accuracy": 0.7083333333333334,
+          "count": 72
+        },
+        "vol_quartile_1": {
+          "accuracy": 0.6944444444444444,
+          "count": 72
+        },
+        "vol_quartile_2": {
+          "accuracy": 0.9722222222222222,
+          "count": 72
+        },
+        "vol_quartile_3": {
+          "accuracy": 0.6027397260273972,
+          "count": 73
+        }
+      },
+      "epoch": 2,
+      "train_loss": 6.697149
+    }
+  ]
+}

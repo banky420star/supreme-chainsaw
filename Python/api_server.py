@@ -279,6 +279,78 @@ def _get_trading_mode() -> str:
         return "paper"
 
 
+def _build_truth_payload(mt5_account: dict) -> dict:
+    """Compute the canonical truth payload for status/mode endpoints."""
+    try:
+        from Python.execution.mode_resolver import resolve_mode
+        from Python.execution.account_verifier import verify_account
+        from Python.execution.live_gate import live_trading_allowed, demo_trading_allowed
+
+        cfg = _read_config()
+        system_mode = resolve_mode(cfg)
+
+        # Map canonical mode to transport string
+        transport_map = {
+            "paper_sim": "paper",
+            "demo_live": "mt5_demo",
+            "real_live_locked": "mt5_live",
+            "real_live": "mt5_live",
+        }
+        execution_transport = transport_map.get(system_mode, "paper")
+
+        acct = verify_account(mt5_account)
+        account_type = acct["account_type"]
+        account_type_verified = acct["account_type_verified"]
+
+        # Real money is locked unless we are in real_live with all gates open
+        real_money_locked = system_mode in ("paper_sim", "demo_live", "real_live_locked")
+        if system_mode == "real_live":
+            allowed, _ = live_trading_allowed(cfg, {}, acct, {})
+            real_money_locked = not allowed
+
+        # Order send is enabled for everything except real_live_locked
+        order_send_enabled = system_mode != "real_live_locked"
+
+        # Demo canary is enabled when demo mode is active and a canary exists
+        demo_canary_enabled = system_mode == "demo_live"
+        if demo_canary_enabled:
+            try:
+                active = _read_active_registry()
+                canary_id = active.get("canary") or ""
+                demo_canary_enabled = bool(canary_id)
+            except Exception:
+                demo_canary_enabled = False
+
+        # real_live_enabled only when mode==real_live and live gate passes
+        real_live_enabled = False
+        if system_mode == "real_live":
+            allowed, _ = live_trading_allowed(cfg, {}, acct, {})
+            real_live_enabled = allowed
+
+        return {
+            "system_mode": system_mode,
+            "execution_transport": execution_transport,
+            "account_type": account_type,
+            "account_type_verified": account_type_verified,
+            "real_money_locked": real_money_locked,
+            "order_send_enabled": order_send_enabled,
+            "demo_canary_enabled": demo_canary_enabled,
+            "real_live_enabled": real_live_enabled,
+        }
+    except Exception as exc:
+        logger.debug(f"_build_truth_payload failed: {exc}")
+        return {
+            "system_mode": "paper_sim",
+            "execution_transport": "paper",
+            "account_type": "unknown",
+            "account_type_verified": False,
+            "real_money_locked": True,
+            "order_send_enabled": False,
+            "demo_canary_enabled": False,
+            "real_live_enabled": False,
+        }
+
+
 def _get_mt5_account_and_positions() -> dict:
     """Fetch live MT5 account info and open positions.
 
@@ -421,6 +493,180 @@ def _read_training_progress():
         result["ppo_per_symbol"] = ppo_per_symbol
 
     return result
+
+
+def _resolve_system_mode(cfg: dict | None = None) -> dict:
+    """Return honest system mode status."""
+    try:
+        from Python.execution.mode_resolver import resolve_mode
+        mode = resolve_mode(cfg)
+    except Exception:
+        mode = "unknown"
+    execution_transport = "mt5"
+    try:
+        from Python.mt5_compat import mt5
+        execution_transport = "mt5" if mt5 is not None else "none"
+    except Exception:
+        pass
+    real_money_locked = True
+    live_lock_reason = "real_live_disabled"
+    try:
+        import Python.execution.live_gate as live_gate
+        real_money_locked = getattr(live_gate, "real_money_locked", True)
+        live_lock_reason = getattr(live_gate, "lock_reason", "real_live_disabled")
+    except Exception:
+        pass
+    return {
+        "system_mode": mode,
+        "execution_transport": execution_transport,
+        "real_money_locked": real_money_locked,
+        "live_lock_reason": live_lock_reason,
+    }
+
+
+def _get_account_truth(mt5_account_info: dict) -> dict:
+    """Return honest account truth fields."""
+    try:
+        from Python.execution.account_verifier import verify_account
+        return verify_account(mt5_account_info)
+    except Exception:
+        balance = float(mt5_account_info.get("balance", 0.0) or 0.0)
+        equity = float(mt5_account_info.get("equity", 0.0) or 0.0)
+        login_raw = str(mt5_account_info.get("login", "") or "")
+        login_masked = login_raw
+        if len(login_raw) > 4:
+            login_masked = f"{login_raw[:2]}***{login_raw[-2:]}"
+        elif len(login_raw) > 0:
+            login_masked = "***"
+        return {
+            "account_type": "unknown",
+            "account_type_verified": False,
+            "telemetry_valid": balance > 0 and equity > 0,
+            "balance": balance,
+            "equity": equity,
+            "currency": str(mt5_account_info.get("currency", "USD") or "USD"),
+            "server": "masked_demo_server" if not mt5_account_info.get("server") else str(mt5_account_info.get("server")),
+            "login_masked": login_masked,
+        }
+
+
+def _get_data_provenance() -> dict:
+    """Return honest data source status."""
+    try:
+        from Python.data.provenance import get_provenance_status
+        return get_provenance_status()
+    except Exception:
+        pass
+    return {
+        "source": "MT5",
+        "status": "unknown",
+        "latest_dataset_id": "unknown",
+    }
+
+
+def _get_model_registry_status(progress: dict | None = None) -> dict:
+    """Return honest model bundle statuses from the registry."""
+    progress = progress or {}
+    bundle_id = "unknown"
+    lstm_status = "unknown"
+    rainforest_status = "unknown"
+    dreamer_status = "unknown"
+    ppo_status = "unknown"
+    ensemble_status = "unknown"
+    try:
+        from Python.model_registry import ModelRegistry
+        reg = ModelRegistry()
+        active = reg._read_active()
+        champ = active.get("champion")
+        canary = active.get("canary")
+        champ_path = champ or ""
+        canary_path = canary or ""
+        champ_id = os.path.basename(champ_path) if champ_path else "none"
+        canary_id = os.path.basename(canary_path) if canary_path else ""
+        bundle_id = f"bundle_{champ_id}" if champ_id != "none" else "bundle_none"
+        # Rainforest status
+        if rf_detector is not None and rf_detector.is_trained():
+            rainforest_status = "validated"
+        else:
+            rainforest_status = "informational-only"
+        # PPO status
+        if canary_id:
+            ppo_status = "candidate"
+        elif champ_id != "none":
+            ppo_status = "champion"
+        else:
+            ppo_status = "undertrained"
+        # Ensemble status
+        if canary_id and champ_id != "none":
+            ensemble_status = "demo_canary"
+        elif champ_id != "none":
+            ensemble_status = "active"
+        else:
+            ensemble_status = "disabled"
+        # LSTM status — infer from training progress
+        lstm_p = progress.get("lstm", {})
+        if lstm_p.get("running"):
+            lstm_status = "validating"
+        elif lstm_p.get("accuracy", 0) > 0 or lstm_p.get("epoch", 0) > 0:
+            lstm_status = "trained"
+        else:
+            lstm_status = "disabled"
+        # Dreamer status
+        dreamer_p = progress.get("dreamer", {})
+        if dreamer_p.get("running"):
+            dreamer_status = "training"
+        elif os.path.exists(os.path.join(ROOT, "models", "dreamer")):
+            dreamer_status = "stub_disabled"
+        else:
+            dreamer_status = "stub_disabled"
+    except Exception:
+        pass
+    return {
+        "bundle_id": bundle_id,
+        "lstm_status": lstm_status,
+        "rainforest_status": rainforest_status,
+        "dreamer_status": dreamer_status,
+        "ppo_status": ppo_status,
+        "ensemble_status": ensemble_status,
+    }
+
+
+def _get_validation_status() -> dict:
+    """Return honest validation / promotion gate status."""
+    try:
+        from Python.registry.promotion_gates import get_promotion_status
+        return get_promotion_status()
+    except Exception:
+        pass
+    # Safe defaults
+    return {
+        "backtest_status": "unknown",
+        "walk_forward_status": "unknown",
+        "promotion_status": "unknown",
+        "champion_status": "not_real_live_eligible",
+    }
+
+
+def _get_test_status() -> dict:
+    """Return honest pytest status from last run if available."""
+    status = "unknown"
+    failures = 0
+    errors = 0
+    try:
+        path = os.path.join(ROOT, "logs", "pytest_results.json")
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            status = data.get("status", "unknown")
+            failures = data.get("failures", 0)
+            errors = data.get("errors", 0)
+    except Exception:
+        pass
+    return {
+        "status": status,
+        "open_failures": failures,
+        "open_errors": errors,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -572,6 +818,14 @@ def api_status():
         "open_positions": mt5_account["open_positions"],
     }
 
+    # ── Honest truth statuses ──
+    system_truth = _resolve_system_mode(cfg)
+    account_truth = _get_account_truth(mt5_account)
+    data_truth = _get_data_provenance()
+    models_truth = _get_model_registry_status(progress)
+    validation_truth = _get_validation_status()
+    tests_truth = _get_test_status()
+
     return _json({
         "state": "online" if not halt else "halted",
         "status": "online" if not halt else "halted",
@@ -596,6 +850,10 @@ def api_status():
             "currency": mt5_account["currency"],
             "leverage": mt5_account["leverage"],
             "mode": mt5_account.get("mode", "live"),
+            "account_type": account_truth.get("account_type", "unknown"),
+            "account_type_verified": account_truth.get("account_type_verified", False),
+            "telemetry_valid": account_truth.get("telemetry_valid", False),
+            "login_masked": account_truth.get("login_masked", "***"),
         },
         "training": {
             "cycle_running": False,
@@ -665,6 +923,7 @@ def api_status():
         "timestamp": time.time(),
         "uptime_sec": uptime,
         "mode": mode,
+        **_build_truth_payload(mt5_account),
         "reversal": reversal_status,
         "speed": speed_status,
         "risk": {
@@ -683,6 +942,11 @@ def api_status():
             "max_positions_per_symbol": max_positions_per_symbol,
             "can_trade": can_trade,
         },
+        "system": system_truth,
+        "data": data_truth,
+        "models": models_truth,
+        "validation": validation_truth,
+        "tests": tests_truth,
         "trade_review": _get_trade_review_summary(),
         "economic_calendar": _get_economic_calendar_cached(),
         "rainforest": {
@@ -711,7 +975,13 @@ def api_set_mode():
         if new_mode not in ("paper", "live"):
             return _json({"error": "mode must be 'paper' or 'live'"}, status=400)
         result = paper_trading.set_mode(new_mode)
-        return _json({"success": True, **result})
+        # Enrich mode response with truth payload
+        try:
+            mt5_account = _get_mt5_account_and_positions()
+            truth = _build_truth_payload(mt5_account)
+        except Exception:
+            truth = {}
+        return _json({"success": True, **result, **truth})
     except Exception as exc:
         logger.warning(f"set_mode failed: {exc}")
         return _json({"error": str(exc)}, status=500)

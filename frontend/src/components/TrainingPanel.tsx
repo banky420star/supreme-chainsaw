@@ -240,6 +240,37 @@ const TrainingPanel: React.FC<Props> = ({ status }) => {
               {laneActiveCount} active / {parallelLanes.length} total
             </span>
           </div>
+          {/* Lane status badges */}
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 14 }}>
+            {parallelLanes.map((lane: any) => {
+              const laneStatus = (lane.status ?? 'idle').toLowerCase()
+              const badgeColor =
+                laneStatus === 'active' || laneStatus === 'running'
+                  ? colors.green
+                  : laneStatus === 'done' || laneStatus === 'complete'
+                    ? colors.cyan
+                    : laneStatus === 'failed' || laneStatus === 'error'
+                      ? colors.red
+                      : colors.amber
+              return (
+                <span
+                  key={lane.symbol}
+                  style={{
+                    fontSize: 11,
+                    fontWeight: 700,
+                    textTransform: 'uppercase',
+                    padding: '3px 8px',
+                    borderRadius: 4,
+                    background: `${badgeColor}20`,
+                    color: badgeColor,
+                    border: `1px solid ${badgeColor}40`,
+                  }}
+                >
+                  {lane.symbol} · {lane.status ?? 'idle'}
+                </span>
+              )
+            })}
+          </div>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))', gap: 12 }}>
             {parallelLanes.map((lane: any, i: number) => (
               <TrainingLaneCard key={lane.symbol} lane={lane} index={i} />

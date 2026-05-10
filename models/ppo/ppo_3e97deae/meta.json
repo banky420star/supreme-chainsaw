@@ -1,0 +1,9 @@
+{
+  "training_run_id": "3e97deae-dfbe-4bf8-b93b-eefd871e5c66",
+  "model_id": "ppo_3e97deae",
+  "dataset_id": "ds_BTCUSDm_M15_latest",
+  "feature_set_id": "features_BTCUSDm_M15_latest",
+  "configured_timesteps": 1000,
+  "actual_timesteps": 1000,
+  "seed": 42
+}
