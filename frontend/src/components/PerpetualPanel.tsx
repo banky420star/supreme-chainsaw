@@ -1,94 +1,137 @@
 import React from 'react'
-import { PerpetualImprovementSnapshot } from '../types'
-import LRTimeline from './LRTimeline'
+import { PerpetualImprovementState, fetchPerpetualImprovement } from '../services/api'
+import TruthBadge from './TruthBadge'
 
-interface Props { perf: PerpetualImprovementSnapshot | null }
-const PerpetualPanel: React.FC<Props> = ({ perf }) => {
-  if (!perf) {
-    return (
-      <section className="card" style={{ padding: 16 }}>
-        <h2>Perpetual Improvement</h2>
-        <div>No data available</div>
-      </section>
-    )
-  }
+const colors = {
+  bg: '#0d1726',
+  panelBg: 'rgba(13,23,38,0.92)',
+  border: 'rgba(255,255,255,0.08)',
+  text: '#eef5ff',
+  muted: '#97a9c6',
+  cyan: '#5ad7ff',
+  green: '#39d98a',
+  amber: '#f3bb4a',
+  red: '#ff7b8f',
+}
 
-  const lastAction = perf.last_improvement_action || {}
-  const adaptationHistory = perf.adaptation_history || []
-  const learningRates = perf.learning_rates || {}
+const panelStyle: React.CSSProperties = {
+  background: colors.panelBg,
+  border: `1px solid ${colors.border}`,
+  borderRadius: 10,
+  padding: 16,
+}
+
+const PerpetualPanel: React.FC = () => {
+  const [state, setState] = React.useState<PerpetualImprovementState | null>(null)
+  const [loading, setLoading] = React.useState(true)
+
+  React.useEffect(() => {
+    let cancelled = false
+    const load = async () => {
+      setLoading(true)
+      try {
+        const data = await fetchPerpetualImprovement()
+        if (!cancelled) setState(data)
+      } catch {
+        if (!cancelled) setState(null)
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }
+    load()
+    const id = setInterval(load, 15_000)
+    return () => { cancelled = true; clearInterval(id) }
+  }, [])
+
+  const events = state?.learning_events ?? []
+  const candidates = state?.candidate_experiments ?? []
 
   return (
-    <section className="card" style={{ padding: 16 }}>
-      <h2>Perpetual Improvement</h2>
-      
-      {/* Last Improvement Action */}
-      <div style={{ marginBottom: 16 }}>
-        <h3>Last Improvement Action</h3>
-        {Object.keys(lastAction).length === 0 ? (
-          <div>No actions recorded</div>
-        ) : (
-          <div style={{ background: '#0a111a', padding: 12, borderRadius: 6 }}>
-            <div><strong>Model:</strong> {lastAction.model_type ?? 'N/A'} {lastAction.symbol ?? ''}</div>
-            <div><strong>Timestamp:</strong> {new Date(lastAction.timestamp || 0).toLocaleString()}</div>
-            <div><strong>Performance Trend:</strong> {(lastAction.performance_trend ?? 0).toFixed(3)}</div>
-            <div><strong>Pattern Adjustment:</strong> {(lastAction.pattern_adjustment ?? 0).toFixed(3)}</div>
-            <div><strong>Total Adjustment:</strong> {(lastAction.total_adjustment ?? 0).toFixed(3)}</div>
-          </div>
-        )}
-      </div>
+    <div style={{ background: colors.bg, color: colors.text, padding: 20 }}>
+      <h2 style={{ margin: '0 0 16px', fontSize: 18, color: colors.cyan, fontWeight: 700 }}>
+        Perpetual Improvement
+      </h2>
 
-      {/* Learning Rates */}
-      <div style={{ marginBottom: 16 }}>
-        <h3>Current Learning Rates</h3>
-        {Object.keys(learningRates).length === 0 ? (
-          <div>No learning rates configured</div>
-        ) : (
-          <div style={{ background: '#0a111a', padding: 12, borderRadius: 6 }}>
-            {Object.entries(learningRates).map(([model, params], idx) => (
-              <div key={idx} style={{ marginBottom: 8 }}>
-                <div><strong>{model.toUpperCase()}:</strong></div>
-                <div style={{ paddingLeft: 16 }}>
-                  {Object.entries(params).map(([param, value], paramIdx) => (
-                    <div key={paramIdx}>
-                      <span style={{ fontFamily: 'monospace' }}>{param}:</span> 
-                      <span style={{ color: '#4fd6ff', fontWeight: '600' }}>{value.toExponential(3)}</span>
+      {loading && !state && (
+        <div style={{ ...panelStyle, color: colors.muted }}>Loading perpetual improvement...</div>
+      )}
+      {!loading && !state && (
+        <div style={{ ...panelStyle, color: colors.muted }}>
+          No perpetual improvement data available. The endpoint returned empty.
+        </div>
+      )}
+
+      {state && (
+        <>
+          <div style={{ ...panelStyle, display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap', marginBottom: 16 }}>
+            <TruthBadge
+              tone={state.loop_status === 'active' ? 'green' : state.loop_status === 'paused' ? 'yellow' : 'gray'}
+              label={state.loop_status ?? 'unknown'}
+              dot={false}
+            />
+            <span style={{ fontSize: 12, color: colors.muted }}>
+              {events.length} learning event(s) recorded
+            </span>
+          </div>
+
+          <div style={panelStyle}>
+            <h3 style={{ margin: '0 0 12px', fontSize: 14, color: colors.muted, fontWeight: 600 }}>Learning Events</h3>
+            {events.length === 0 ? (
+              <div style={{ color: colors.muted, fontSize: 13 }}>No learning events yet.</div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {events.slice(0, 20).map((ev, idx) => (
+                  <div
+                    key={idx}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      padding: '6px 10px',
+                      background: 'rgba(20,32,52,0.6)',
+                      borderRadius: 6,
+                      fontSize: 12,
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                      <span style={{ color: colors.muted, fontFamily: 'monospace' }}>{ev.ts}</span>
+                      <span style={{ color: colors.cyan, fontWeight: 600 }}>{ev.symbol}</span>
+                      <span style={{ color: colors.text }}>{ev.event}</span>
+                      <span style={{ fontSize: 10, color: colors.amber, border: `1px solid ${colors.amber}30`, padding: '1px 4px', borderRadius: 4 }}>{ev.model}</span>
                     </div>
-                  ))}
-                </div>
+                  </div>
+                ))}
               </div>
-            ))}
+            )}
           </div>
-        )}
-      </div>
 
-      {/* Adaptation History + LR Timeline */}
-      <div>
-        <h3>Adaptation History</h3>
-        {adaptationHistory.length === 0 ? (
-          <div>No history recorded</div>
-        ) : (
-          <div>
-            <div style={{ background: '#0a111a', padding: 12, borderRadius: 6, maxHeight: 200, overflowY: 'auto' }}>
-              {adaptationHistory.slice(-10).map((record, idx) => (
-                <div key={idx} style={{ padding: 8, marginBottom: 4, borderBottom: '1px solid #222', background: idx % 2 === 0 ? '#080e16' : 'transparent' }}>
-                  <div style={{ fontSize: 12, color: '#888' }}>
-                    {new Date(record.timestamp || 0).toLocaleTimeString()}
-                  </div>
-                  <div style={{ fontSize: 12 }}>
-                    {record.action?.model_type ?? 'N/A'} {record.action?.symbol ?? ''}: 
-                    Trend: {(record.action?.performance_trend ?? 0).toFixed(3)}, 
-                    Adjust: {(record.action?.total_adjustment ?? 0).toFixed(3)}
-                  </div>
-                </div>
-              ))}
-            </div>
-            <div style={{ marginTop: 8 }}>
-              <LRTimeline data={adaptationHistory} height={60} />
-            </div>
+          <div style={{ ...panelStyle, marginTop: 16 }}>
+            <h3 style={{ margin: '0 0 12px', fontSize: 14, color: colors.muted, fontWeight: 600 }}>Candidate Experiments</h3>
+            {candidates.length === 0 ? (
+              <div style={{ color: colors.muted, fontSize: 13 }}>No candidate experiments queued.</div>
+            ) : (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                {candidates.map((exp, idx) => (
+                  <span
+                    key={idx}
+                    style={{
+                      fontSize: 11,
+                      padding: '4px 8px',
+                      borderRadius: 4,
+                      background: 'rgba(90,215,255,0.08)',
+                      color: colors.cyan,
+                      border: `1px solid rgba(90,215,255,0.15)`,
+                    }}
+                  >
+                    {exp}
+                  </span>
+                ))}
+              </div>
+            )}
           </div>
-        )}
-      </div>
-    </section>
+        </>
+      )}
+    </div>
   )
 }
 

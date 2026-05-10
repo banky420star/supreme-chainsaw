@@ -168,3 +168,214 @@ export interface AgentStatus {
   metric: string
   logs: string
 }
+
+/* ═══════════════════════════════════════════════════════════════
+   NEW MISSION CONTROL TYPES
+   ═══════════════════════════════════════════════════════════════ */
+
+export interface SystemHeaderState {
+  system_mode: 'paper_sim' | 'demo_live' | 'real_live_locked' | 'real_live' | 'unknown'
+  execution_transport: 'sim' | 'mt5' | 'unknown'
+  real_money_locked: boolean
+  live_lock_reason: string
+  api_status: 'online' | 'degraded' | 'offline'
+  mt5_bridge_status: 'online' | 'degraded' | 'offline'
+  account_type: 'demo' | 'real' | 'unknown'
+  account_type_verified: boolean
+  account_telemetry_valid: boolean
+  tests_status: 'passing' | 'failing' | 'unknown'
+  open_test_failures: number
+  open_test_errors: number
+  active_bundle_id: string | null
+  champion_status: 'champion' | 'candidate' | 'rejected' | 'none'
+}
+
+export interface PipelineStage {
+  id: string
+  name: string
+  status: 'passed' | 'running' | 'warning' | 'failed' | 'blocked' | 'unknown' | 'idle'
+  last_run: string | null
+  artifact_id: string | null
+  blockers: string[]
+  metrics: Record<string, number | string | null>
+}
+
+export interface ModelBrainLSTM {
+  status: string
+  model_id: string | null
+  lookback: number | null
+  feature_set: string | null
+  p_up: number | null
+  p_down: number | null
+  p_flat: number | null
+  expected_return: number | null
+  confidence: number | null
+  calibration_error: number | null
+  influence_enabled: boolean
+}
+
+export interface ModelBrainRainforest {
+  status: string
+  regime: string | null
+  confidence: number | null
+  allowed_modes: string[]
+  blocked_modes: string[]
+  feature_importance: Record<string, number>
+  lift_vs_no_rainforest: number | null
+}
+
+export interface ModelBrainDreamer {
+  status: string
+  stub_disabled: boolean
+  rollouts: number | null
+  horizon: number | null
+  expected_reward: number | null
+  expected_drawdown: number | null
+  ruin_probability: number | null
+  used_for_decisions: boolean
+}
+
+export interface ModelBrainPPO {
+  status: string
+  training_status: string
+  actual_timesteps: number | null
+  configured_timesteps: number | null
+  reward_version: string | null
+  action_bias: number | null
+  promotion_status: string | null
+}
+
+export interface ModelBrains {
+  lstm: ModelBrainLSTM
+  rainforest: ModelBrainRainforest
+  dreamer: ModelBrainDreamer
+  ppo: ModelBrainPPO
+}
+
+export interface TrainingLaneCard {
+  lane_id: string
+  lane_name: string
+  status: string
+  progress_pct: number | null
+  model_id: string | null
+  timesteps: number | null
+  validation_summary: string | null
+  failure_reason: string | null
+}
+
+export interface ModelBundle {
+  bundle_id: string
+  symbol: string
+  timeframe: string
+  status: string
+  data_source: string | null
+  feature_set: string | null
+  lstm: string | null
+  rainforest: string | null
+  dreamer: string | null
+  ppo: string | null
+  backtest_return: number | null
+  walk_forward: number | null
+  canary: number | null
+  promotion_decision: string | null
+  promotion_reason: string | null
+}
+
+export interface PromotionGateItem {
+  gate: string
+  required: number | string | boolean
+  actual: number | string | boolean | null
+  passed: boolean
+  pending: boolean
+}
+
+export interface DemoCanaryMetrics {
+  trades: number
+  days: number
+  pnl: number
+  drawdown: number
+  profit_factor: number | null
+  win_rate: number | null
+}
+
+export interface DemoCanaryTimelineEvent {
+  step: string
+  ts: string
+  status: string
+  detail: string
+}
+
+export interface DemoCanaryState {
+  account_type: 'demo'
+  real_money_locked: true
+  metrics: DemoCanaryMetrics
+  timeline: DemoCanaryTimelineEvent[]
+}
+
+export interface TradeCoronerCluster {
+  cluster_id: string
+  count: number
+  root_cause: string
+  affected_symbols: string[]
+  recommended_experiment: string
+  retraining_eligible: boolean
+}
+
+export interface TradeCoronerState {
+  clusters: TradeCoronerCluster[]
+  total_mistakes: number
+  total_reviewed: number
+}
+
+export interface PatternVerification {
+  pattern_id: string
+  pattern_name: string
+  confidence: number
+  regime: string
+  outcome: string
+  verified: boolean
+  fallback_incidents: number
+}
+
+export interface PerpetualImprovementState {
+  loop_status: string
+  learning_events: Array<{
+    ts: string
+    event: string
+    symbol: string
+    model: string
+  }>
+  candidate_experiments: string[]
+}
+
+export interface AgentOperationalStatus {
+  agent_id: string
+  agent_name: string
+  status: string
+  heartbeat: string | null
+  current_task: string | null
+  last_artifact: string | null
+  error_count: number
+}
+
+export interface SafetyGate {
+  name: string
+  passed: boolean
+  required: boolean | string | number
+  actual: boolean | string | number | null
+  reason: string | null
+}
+
+export interface SafetyState {
+  real_money_locked: boolean
+  lock_reasons: string[]
+  gates: SafetyGate[]
+}
+
+export interface EvidenceArtifact {
+  name: string
+  created_at: string
+  status: string
+  linked_model: string | null
+  path: string
+}

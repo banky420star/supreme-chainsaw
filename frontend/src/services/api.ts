@@ -1,6 +1,23 @@
-import { AgentStatus, PatternRecord, StatusPayload } from '../types'
+import {
+  AgentStatus,
+  AgentOperationalStatus,
+  DemoCanaryState,
+  EvidenceArtifact,
+  ModelBrains,
+  ModelBundle,
+  PatternRecord,
+  PatternVerification,
+  PerpetualImprovementState,
+  PipelineStage,
+  PromotionGateItem,
+  SafetyState,
+  StatusPayload,
+  SystemHeaderState,
+  TradeCoronerState,
+  TrainingLaneCard,
+} from '../types'
 
-const BASE = ''  // relative — Vite proxy or same-origin in production
+const BASE = '' // relative — Vite proxy or same-origin in production
 
 export async function fetchStatus(): Promise<StatusPayload> {
   const r = await fetch(`${BASE}/api/status`, { cache: 'no-store' })
@@ -18,7 +35,11 @@ export function extractAgentStatus(status: StatusPayload): AgentStatus[] {
   const now = new Date()
   const ts = (d?: string | number | null) => {
     if (!d) return now.toISOString()
-    try { return new Date(d).toISOString() } catch { return now.toISOString() }
+    try {
+      return new Date(d).toISOString()
+    } catch {
+      return now.toISOString()
+    }
   }
   const fmtTime = (d?: string | number | null) => {
     const s = ts(d)
@@ -194,7 +215,9 @@ export function createStatusWS(
     ws.onmessage = (e) => {
       try {
         onMessage(JSON.parse(e.data))
-      } catch { /* ignore parse errors */ }
+      } catch {
+        /* ignore parse errors */
+      }
     }
 
     ws.onclose = () => {
@@ -351,7 +374,7 @@ export interface Trade {
   bot_lane: string
   model: string
   action_type: string
-  outcome: string  // "win" | "loss" | "breakeven"
+  outcome: string // "win" | "loss" | "breakeven"
 }
 
 export interface TradesResponse {
@@ -411,7 +434,9 @@ export interface EquityCurveResponse {
 
 export async function fetchEquityCurve(window: '30d' | '90d' | 'all' = 'all'): Promise<EquityCurveResponse> {
   const r = await fetch(`${BASE}/api/equity_curve?window=${window}`, { cache: 'no-store' })
-  return r.ok ? r.json() : { points: [], summary: { start_equity: 0, current_equity: 0, peak_equity: 0, max_drawdown_pct: 0, total_trades: 0 } }
+  return r.ok
+    ? r.json()
+    : { points: [], summary: { start_equity: 0, current_equity: 0, peak_equity: 0, max_drawdown_pct: 0, total_trades: 0 } }
 }
 
 /* ─── Rainforest Pattern Detector API ─── */
@@ -445,8 +470,8 @@ export interface EconomicEvent {
   currency: string
   name: string
   event_id: string
-  time: string           // ISO 8601
-  importance: number     // 0=low, 1=medium, 2=high
+  time: string // ISO 8601
+  importance: number // 0=low, 1=medium, 2=high
   importance_label: string
   actual?: string | null
   forecast?: string | null
@@ -499,4 +524,73 @@ export async function resetPaperAccount(balance = 100_000): Promise<{ success: b
     body: JSON.stringify({ balance }),
   })
   return r.json()
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   NEW MISSION CONTROL API ENDPOINTS
+   ═══════════════════════════════════════════════════════════════ */
+
+export async function fetchSystemHeader(): Promise<SystemHeaderState | null> {
+  const r = await fetch(`${BASE}/api/system_header`, { cache: 'no-store' })
+  return r.ok ? r.json() : null
+}
+
+export async function fetchPipelineStages(): Promise<PipelineStage[]> {
+  const r = await fetch(`${BASE}/api/pipeline/stages`, { cache: 'no-store' })
+  return r.ok ? r.json() : []
+}
+
+export async function fetchModelBrains(): Promise<ModelBrains | null> {
+  const r = await fetch(`${BASE}/api/model_brains`, { cache: 'no-store' })
+  return r.ok ? r.json() : null
+}
+
+export async function fetchTrainingLanes(): Promise<TrainingLaneCard[]> {
+  const r = await fetch(`${BASE}/api/training/lanes`, { cache: 'no-store' })
+  return r.ok ? r.json() : []
+}
+
+export async function fetchRegistry(): Promise<ModelBundle[]> {
+  const r = await fetch(`${BASE}/api/registry`, { cache: 'no-store' })
+  return r.ok ? r.json() : []
+}
+
+export async function fetchPromotionGates(): Promise<PromotionGateItem[]> {
+  const r = await fetch(`${BASE}/api/promotion_gates`, { cache: 'no-store' })
+  return r.ok ? r.json() : []
+}
+
+export async function fetchDemoCanary(): Promise<DemoCanaryState | null> {
+  const r = await fetch(`${BASE}/api/demo_canary`, { cache: 'no-store' })
+  return r.ok ? r.json() : null
+}
+
+export async function fetchTradeCoroner(): Promise<TradeCoronerState | null> {
+  const r = await fetch(`${BASE}/api/trades/coroner`, { cache: 'no-store' })
+  return r.ok ? r.json() : null
+}
+
+export async function fetchPatternsVerified(): Promise<PatternVerification[]> {
+  const r = await fetch(`${BASE}/api/patterns/verified`, { cache: 'no-store' })
+  return r.ok ? r.json() : []
+}
+
+export async function fetchPerpetualImprovement(): Promise<PerpetualImprovementState | null> {
+  const r = await fetch(`${BASE}/api/perpetual_improvement`, { cache: 'no-store' })
+  return r.ok ? r.json() : null
+}
+
+export async function fetchAgentsOperational(): Promise<AgentOperationalStatus[]> {
+  const r = await fetch(`${BASE}/api/agents/status`, { cache: 'no-store' })
+  return r.ok ? r.json() : []
+}
+
+export async function fetchSafety(): Promise<SafetyState | null> {
+  const r = await fetch(`${BASE}/api/safety`, { cache: 'no-store' })
+  return r.ok ? r.json() : null
+}
+
+export async function fetchEvidence(): Promise<EvidenceArtifact[]> {
+  const r = await fetch(`${BASE}/api/evidence`, { cache: 'no-store' })
+  return r.ok ? r.json() : []
 }

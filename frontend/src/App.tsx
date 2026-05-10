@@ -1,5 +1,5 @@
 import React from 'react'
-import { StatusPayload, PatternRecord } from './types'
+import { StatusPayload, PatternRecord, SystemHeaderState } from './types'
 import {
   fetchStatus,
   fetchPatterns,
@@ -9,6 +9,19 @@ import {
   fetchLanes,
   fetchScenarios,
   fetchEconomicCalendar,
+  fetchSystemHeader,
+  fetchPipelineStages,
+  fetchModelBrains,
+  fetchTrainingLanes,
+  fetchRegistry,
+  fetchPromotionGates,
+  fetchDemoCanary,
+  fetchTradeCoroner,
+  fetchPatternsVerified,
+  fetchPerpetualImprovement,
+  fetchAgentsOperational,
+  fetchSafety,
+  fetchEvidence,
   createStatusWS,
   PPODiagnostics,
   LSTMExplanation,
@@ -16,44 +29,49 @@ import {
   RegimesResponse,
   EconomicEvent,
 } from './services/api'
-import DashboardPanel from './components/DashboardPanel'
-import TradingPanel from './components/TradingPanel'
-import TrainingPanel from './components/TrainingPanel'
-import TrainingProgressPanel from './components/TrainingProgressPanel'
-import ModelsPanel from './components/ModelsPanel'
-import PatternLibraryPanel from './components/PatternLibraryPanel'
-import SettingsPanel from './components/SettingsPanel'
-import TradeHistoryPanel from './components/TradeHistoryPanel'
-import PPODiagPanel from './components/PPODiagPanel'
-import HFTHealthPanel from './components/HFTHealthPanel'
-import PerpetualPanel from './components/PerpetualPanel'
-import LRTimeline from './components/LRTimeline'
-import ScenarioMemoryPanel from './components/ScenarioMemoryPanel'
-import PipelinePanel from './components/PipelinePanel'
-import AgentTeamPanel from './components/AgentTeamPanel'
 
+import SystemCommandBar from './components/SystemCommandBar'
+import OverviewPanel from './components/OverviewPanel'
+import PipelinePanel from './components/PipelinePanel'
+import ModelBrainsPanel from './components/ModelBrainsPanel'
+import TrainingPanel from './components/TrainingPanel'
+import RegistryPanel from './components/RegistryPanel'
+import PromotionGatesPanel from './components/PromotionGatesPanel'
+import DemoCanaryPanel from './components/DemoCanaryPanel'
+import TradesPanel from './components/TradesPanel'
+import TradeCoronerPanel from './components/TradeCoronerPanel'
+import PatternsPanel from './components/PatternsPanel'
+import PerpetualPanel from './components/PerpetualPanel'
+import AgentsPanel from './components/AgentsPanel'
+import SafetyPanel from './components/SafetyPanel'
+import EvidenceLockerPanel from './components/EvidenceLockerPanel'
+import SettingsPanel from './components/SettingsPanel'
+import DashboardPanel from './components/DashboardPanel'
+
+/* ─── New navigation tabs ─── */
 type TabId =
-  | 'home' | 'trading' | 'training' | 'progress' | 'models'
-  | 'patterns' | 'settings' | 'trades' | 'ppo'
-  | 'hft' | 'perpetual' | 'lr-timeline' | 'scenarios' | 'agents'
-  | 'pipeline'
+  | 'overview' | 'pipeline' | 'model_brains' | 'training' | 'registry'
+  | 'promotion_gates' | 'demo_canary' | 'trades' | 'trade_coroner'
+  | 'patterns' | 'perpetual' | 'agents' | 'safety' | 'evidence'
+  | 'settings' | 'legacy_dashboard'
 
 const TABS: { id: TabId; label: string }[] = [
-  { id: 'home',        label: 'Dashboard'  },
-  { id: 'pipeline',    label: 'Pipeline'   },
-  { id: 'trading',     label: 'Trading'    },
-  { id: 'trades',      label: 'History'    },
-  { id: 'training',    label: 'Training'   },
-  { id: 'progress',    label: 'Progress'   },
-  { id: 'models',      label: 'Models'     },
-  { id: 'ppo',         label: 'PPO Brain'  },
-  { id: 'hft',         label: 'HFT Health' },
-  { id: 'scenarios',   label: 'Scenarios'  },
-  { id: 'perpetual',   label: 'Perpetual'  },
-  { id: 'lr-timeline', label: 'LR Timeline'},
-  { id: 'patterns',    label: 'Patterns'   },
-  { id: 'agents',      label: 'Agents'     },
-  { id: 'settings',    label: 'Settings'   },
+  { id: 'overview',        label: 'Overview'         },
+  { id: 'pipeline',        label: 'Pipeline'         },
+  { id: 'model_brains',    label: 'Model Brains'     },
+  { id: 'training',        label: 'Training'         },
+  { id: 'registry',        label: 'Registry'         },
+  { id: 'promotion_gates', label: 'Promotion Gates'  },
+  { id: 'demo_canary',     label: 'Demo Canary'      },
+  { id: 'trades',          label: 'Trades'           },
+  { id: 'trade_coroner',   label: 'Trade Coroner'    },
+  { id: 'patterns',        label: 'Patterns'         },
+  { id: 'perpetual',       label: 'Perpetual Improvement' },
+  { id: 'agents',          label: 'Agents'           },
+  { id: 'safety',          label: 'Safety'           },
+  { id: 'evidence',        label: 'Evidence Locker'  },
+  { id: 'settings',        label: 'Settings'         },
+  { id: 'legacy_dashboard', label: 'Legacy Dash'    },
 ]
 
 const LOAD_STEPS = [
@@ -84,7 +102,6 @@ function LoadingScreen() {
 
   return (
     <div className="agit-loading">
-      {/* Sparks */}
       <div className="agit-loading-sparks" aria-hidden="true">
         {Array.from({ length: 12 }).map((_, i) => (
           <span
@@ -98,22 +115,13 @@ function LoadingScreen() {
           />
         ))}
       </div>
-
-      {/* Spinning ring */}
       <div className="agit-loading-core">
         <div className="agit-loading-dot" />
       </div>
-
-      {/* Text content */}
       <div className="agit-loading-content">
         <div className="agit-loading-title">CHAIN GAMBLER</div>
         <div className="agit-loading-sub">AUTONOMOUS TRADING STACK</div>
-
-        {/* Progress bar */}
-        <div
-          className="agit-loading-progress"
-          style={{ position: 'relative' }}
-        >
+        <div className="agit-loading-progress" style={{ position: 'relative' }}>
           <div
             style={{
               position: 'absolute',
@@ -126,8 +134,6 @@ function LoadingScreen() {
             }}
           />
         </div>
-
-        {/* Status sequence */}
         <div className="agit-loading-status">
           <span
             style={{
@@ -176,6 +182,7 @@ interface PipelineState {
   lanes: LaneStatus[]
   scenarios: RegimesResponse
   calendar: EconomicEvent[]
+  systemHeader: SystemHeaderState | null
 }
 
 const EMPTY_PIPELINE: PipelineState = {
@@ -187,58 +194,53 @@ const EMPTY_PIPELINE: PipelineState = {
   lanes: [],
   scenarios: { regimes: {} },
   calendar: [],
+  systemHeader: null,
 }
 
 const App: React.FC = () => {
   const [pipe, setPipe] = React.useState<PipelineState>(EMPTY_PIPELINE)
-  const [activeTab, setActiveTab] = React.useState<TabId>('home')
+  const [activeTab, setActiveTab] = React.useState<TabId>('overview')
   const wsConnectedRef = React.useRef(false)
   const [wsConnected, setWsConnected] = React.useState(false)
 
   /* ─── Full pipeline refresh (non-status endpoints) ─── */
   const refreshSideData = React.useCallback(async () => {
-    const [patterns, perf, ppoDiag, lstmExpl, lanesRes, scenarios, calendar] =
-      await Promise.allSettled([
-        fetchPatterns(),
-        fetchPerf(),
-        fetchPPODiagnostics(),
-        fetchLSTMExplanations(),
-        fetchLanes(),
-        fetchScenarios(),
-        fetchEconomicCalendar(7),
-      ])
+    const [
+      patterns,
+      perf,
+      ppoDiag,
+      lstmExpl,
+      lanesRes,
+      scenarios,
+      calendar,
+      systemHeader,
+    ] = await Promise.allSettled([
+      fetchPatterns(),
+      fetchPerf(),
+      fetchPPODiagnostics(),
+      fetchLSTMExplanations(),
+      fetchLanes(),
+      fetchScenarios(),
+      fetchEconomicCalendar(7),
+      fetchSystemHeader(),
+    ])
 
     setPipe((prev) => {
       const next = { ...prev }
-
-      if (patterns.status === 'fulfilled')
-        next.patterns = patterns.value ?? []
-
-      if (perf.status === 'fulfilled' && perf.value)
-        next.perf = perf.value
-
-      if (ppoDiag.status === 'fulfilled')
-        next.ppoDiag = ppoDiag.value
-
-      if (lstmExpl.status === 'fulfilled')
-        next.lstmExpl = lstmExpl.value ?? {}
-
-      if (lanesRes.status === 'fulfilled')
-        next.lanes = lanesRes.value?.lanes ?? []
-
-      if (scenarios.status === 'fulfilled')
-        next.scenarios = scenarios.value ?? { regimes: {} }
-
-      if (calendar.status === 'fulfilled')
-        next.calendar = calendar.value ?? []
-
+      if (patterns.status === 'fulfilled') next.patterns = patterns.value ?? []
+      if (perf.status === 'fulfilled' && perf.value) next.perf = perf.value
+      if (ppoDiag.status === 'fulfilled') next.ppoDiag = ppoDiag.value
+      if (lstmExpl.status === 'fulfilled') next.lstmExpl = lstmExpl.value ?? {}
+      if (lanesRes.status === 'fulfilled') next.lanes = lanesRes.value?.lanes ?? []
+      if (scenarios.status === 'fulfilled') next.scenarios = scenarios.value ?? { regimes: {} }
+      if (calendar.status === 'fulfilled') next.calendar = calendar.value ?? []
+      if (systemHeader.status === 'fulfilled') next.systemHeader = systemHeader.value ?? null
       return next
     })
   }, [])
 
   /* ─── WebSocket + polling setup ─── */
   React.useEffect(() => {
-    // Full refresh on load (status + side data)
     const initialRefresh = async () => {
       const statusResult = await fetchStatus().catch(() => null)
       if (statusResult) {
@@ -248,7 +250,6 @@ const App: React.FC = () => {
     }
     initialRefresh()
 
-    // WebSocket — receives /api/status payloads every ~2s from backend
     const destroyWS = createStatusWS(
       (data) => {
         setPipe((prev) => ({ ...prev, status: data }))
@@ -259,9 +260,6 @@ const App: React.FC = () => {
       }
     )
 
-    // Polling fallback:
-    //   • When WS is connected — poll side data every 30s (WS handles status)
-    //   • When WS is disconnected — poll status + side data every 10s
     const poll = async () => {
       if (!wsConnectedRef.current) {
         const statusResult = await fetchStatus().catch(() => null)
@@ -278,7 +276,7 @@ const App: React.FC = () => {
       destroyWS()
       clearInterval(interval)
     }
-  }, [refreshSideData]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [refreshSideData])
 
   /* Sync pattern library from live status */
   React.useEffect(() => {
@@ -290,11 +288,6 @@ const App: React.FC = () => {
     setPipe((prev) => ({ ...prev, patterns: records.length > 0 ? records : prev.patterns }))
   }, [pipe.status])
 
-  if (!pipe.status) return <LoadingScreen />
-
-  const { status, patterns, perf, ppoDiag, lstmExpl, lanes, scenarios, calendar } = pipe
-  const halted = status?.risk?.halt
-
   const refreshAll = React.useCallback(async () => {
     const statusResult = await fetchStatus().catch(() => null)
     if (statusResult) {
@@ -303,23 +296,29 @@ const App: React.FC = () => {
     await refreshSideData()
   }, [refreshSideData])
 
+  if (!pipe.status) return <LoadingScreen />
+
+  const { status, patterns, perf, ppoDiag, lstmExpl, lanes, scenarios, calendar, systemHeader } = pipe
+  const halted = status?.risk?.halt
+
   const renderContent = () => {
     switch (activeTab) {
-      case 'home':        return <DashboardPanel status={status!} />
-      case 'pipeline':    return <PipelinePanel status={status!} />
-      case 'trading':     return <TradingPanel status={status!} lanes={lanes} lstmExpl={lstmExpl} onModeChange={refreshAll} />
-      case 'trades':      return <TradeHistoryPanel calendar={calendar} />
-      case 'training':    return <TrainingPanel status={status!} />
-      case 'progress':    return <TrainingProgressPanel status={status!} />
-      case 'models':      return <ModelsPanel status={status!} />
-      case 'ppo':         return <PPODiagPanel status={status!} ppoDiag={ppoDiag} />
-      case 'hft':         return <HFTHealthPanel status={status!} />
-      case 'scenarios':   return <ScenarioMemoryPanel scenarios={scenarios} />
-      case 'perpetual':   return <PerpetualPanel perf={perf} />
-      case 'lr-timeline': return <LRTimeline data={perf?.adaptation_history ?? null} height={200} />
-      case 'patterns':    return <PatternLibraryPanel patterns={patterns} status={status!} lstmExpl={lstmExpl} />
-      case 'agents':      return <AgentTeamPanel status={status!} />
-      case 'settings':    return <SettingsPanel status={status!} />
+      case 'overview':        return <OverviewPanel status={status!} header={systemHeader} />
+      case 'pipeline':        return <PipelinePanel />
+      case 'model_brains':    return <ModelBrainsPanel />
+      case 'training':        return <TrainingPanel status={status!} />
+      case 'registry':        return <RegistryPanel />
+      case 'promotion_gates': return <PromotionGatesPanel />
+      case 'demo_canary':     return <DemoCanaryPanel />
+      case 'trades':          return <TradesPanel calendar={calendar} />
+      case 'trade_coroner':   return <TradeCoronerPanel />
+      case 'patterns':        return <PatternsPanel patterns={patterns} status={status!} lstmExpl={lstmExpl} />
+      case 'perpetual':       return <PerpetualPanel />
+      case 'agents':          return <AgentsPanel />
+      case 'safety':          return <SafetyPanel />
+      case 'evidence':        return <EvidenceLockerPanel />
+      case 'settings':        return <SettingsPanel status={status!} />
+      case 'legacy_dashboard':return <DashboardPanel status={status!} />
       default: return null
     }
   }
@@ -327,6 +326,8 @@ const App: React.FC = () => {
   return (
     <div className="agit-shell">
       <div className="scanlines" />
+
+      <SystemCommandBar header={systemHeader} />
 
       <nav className="agit-nav">
         <div className="agit-nav-brand">
@@ -356,7 +357,6 @@ const App: React.FC = () => {
           ) : (
             <span className="agit-pill agit-pill-live">LIVE</span>
           )}
-          {/* Truth pills */}
           {pipe.status?.system?.real_money_locked && (
             <span className="agit-pill" style={{ background: 'var(--red)', color: '#fff', marginLeft: 6 }}>
               LOCKED

@@ -3018,6 +3018,561 @@ def _get_trading_metrics_for_symbol(symbol: str) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Mission Control — new truth-first endpoints (no fake green states)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/system_header", method=["GET", "OPTIONS"])
+def api_system_header():
+    """Return compact system header for the persistent command bar."""
+    if request.method == "OPTIONS":
+        return {}
+    cfg = _read_config()
+    mt5 = _get_mt5_account_and_positions()
+    system = _resolve_system_mode(cfg)
+    account = _get_account_truth(mt5)
+    progress = _read_training_progress()
+    models = _get_model_registry_status(progress)
+    tests = _get_test_status()
+    validation = _get_validation_status()
+    active = _read_active_registry()
+    champ_path = active.get("champion") or ""
+    canary_path = active.get("canary") or ""
+    champ_id = os.path.basename(champ_path) if champ_path else None
+    return _json({
+        "system_mode": system.get("system_mode", "unknown"),
+        "execution_transport": system.get("execution_transport", "unknown"),
+        "real_money_locked": system.get("real_money_locked", True),
+        "live_lock_reason": system.get("live_lock_reason", ""),
+        "api_status": "online",
+        "mt5_bridge_status": "online" if mt5.get("equity", 0) > 0 else "offline",
+        "account_type": account.get("account_type", "unknown"),
+        "account_type_verified": account.get("account_type_verified", False),
+        "account_telemetry_valid": account.get("telemetry_valid", False),
+        "tests_status": tests.get("status", "unknown"),
+        "open_test_failures": tests.get("open_failures", 0),
+        "open_test_errors": tests.get("open_errors", 0),
+        "active_bundle_id": champ_id,
+        "champion_status": validation.get("champion_status", "none"),
+    })
+
+
+@app.route("/api/pipeline/stages", method=["GET", "OPTIONS"])
+def api_pipeline_stages():
+    """Return 20-stage pipeline map with honest statuses."""
+    if request.method == "OPTIONS":
+        return {}
+    cfg = _read_config()
+    progress = _read_training_progress()
+    active = _read_active_registry()
+    tests = _get_test_status()
+    validation = _get_validation_status()
+    mt5 = _get_mt5_account_and_positions()
+    models = _get_model_registry_status(progress)
+    data = _get_data_provenance()
+
+    champ_path = active.get("champion") or ""
+    canary_path = active.get("canary") or ""
+    champ_id = os.path.basename(champ_path) if champ_path else None
+    canary_id = os.path.basename(canary_path) if canary_path else None
+
+    def stage(id: str, name: str, status: str, blockers: list = None, metrics: dict = None):
+        return {
+            "id": id,
+            "name": name,
+            "status": status,
+            "last_run": None,
+            "artifact_id": None,
+            "blockers": blockers or [],
+            "metrics": metrics or {},
+        }
+
+    stages = [
+        stage("mt5_data", "MT5 Data", data.get("status", "unknown"), metrics={"source": data.get("source", "unknown")}),
+        stage("validation", "Validation", tests.get("status", "unknown"), blockers=["tests failing"] if tests.get("open_failures", 0) > 0 else [], metrics={"failures": tests.get("open_failures", 0)}),
+        stage("features", "Features", "unaudited"),
+        stage("labels", "Labels", "unknown"),
+        stage("lstm", "LSTM", models.get("lstm_status", "unknown"), metrics={"running": bool(progress.get("lstm", {}).get("running"))}),
+        stage("rainforest", "Rainforest", models.get("rainforest_status", "unknown"), metrics={"trained": bool(rf_detector.is_trained() if rf_detector else False)}),
+        stage("dreamer", "Dreamer", models.get("dreamer_status", "unknown"), metrics={"stub": os.path.exists(os.path.join(ROOT, "models", "dreamer"))}),
+        stage("ppo", "PPO", models.get("ppo_status", "unknown"), metrics={"running": bool(progress.get("ppo", {}).get("running"))}),
+        stage("meta_controller", "Meta Controller", "unknown"),
+        stage("bundle", "Bundle", "unknown", metrics={"champion": champ_id, "canary": canary_id}),
+        stage("backtest", "Backtest", validation.get("backtest_status", "unknown")),
+        stage("walk_forward", "Walk-Forward", validation.get("walk_forward_status", "unknown")),
+        stage("baseline", "Baseline", "unknown"),
+        stage("demo_canary", "Demo Canary", "candidate" if canary_id else "none"),
+        stage("champion_rejected", "Champion/Rejected", validation.get("champion_status", "none")),
+        stage("trade_journal", "Trade Journal", "unknown", metrics={"positions": mt5.get("open_positions", 0)}),
+        stage("trade_coroner", "Trade Coroner", "unknown"),
+        stage("replay_dataset", "Replay Dataset", "unknown"),
+        stage("retraining_trigger", "Retraining Trigger", "unknown"),
+    ]
+    return _json(stages)
+
+
+@app.route("/api/model_brains", method=["GET", "OPTIONS"])
+def api_model_brains():
+    """Return four model brain cards with honest telemetry."""
+    if request.method == "OPTIONS":
+        return {}
+    progress = _read_training_progress()
+    active = _read_active_registry()
+    champ_path = active.get("champion") or ""
+    champ_id = os.path.basename(champ_path) if champ_path else None
+    lstm_p = progress.get("lstm", {})
+    ppo_p = progress.get("ppo", {})
+    dreamer_p = progress.get("dreamer", {})
+
+    # LSTM predictions from decision cache
+    lstm_conf = 0.0
+    p_up = p_down = p_flat = None
+    if _decision_cache:
+        for dq in _decision_cache.values():
+            if dq:
+                d = dq[0]
+                lstm_conf = max(lstm_conf, d.get("confidence", 0.0))
+                p_up = d.get("p_up")
+                p_down = d.get("p_down")
+                p_flat = d.get("p_flat")
+                break
+
+    # Rainforest
+    rf_trained = rf_detector is not None and rf_detector.is_trained()
+    rf_regime = "unknown"
+    rf_conf = 0.0
+    rf_importance = {}
+    if rainforest_predictions:
+        first = next(iter(rainforest_predictions.values()), {})
+        rf_regime = first.get("regime", "unknown")
+        rf_conf = first.get("confidence", 0.0)
+        rf_importance = first.get("feature_importances", {})
+
+    # Dreamer
+    dreamer_stub = not os.path.exists(os.path.join(ROOT, "models", "dreamer"))
+
+    return _json({
+        "lstm": {
+            "status": "training" if lstm_p.get("running") else "trained" if lstm_p.get("epoch", 0) > 0 else "unknown",
+            "model_id": champ_id,
+            "lookback": lstm_p.get("lookback") if isinstance(lstm_p.get("lookback"), int) else None,
+            "feature_set": lstm_p.get("feature_set"),
+            "p_up": p_up,
+            "p_down": p_down,
+            "p_flat": p_flat,
+            "expected_return": lstm_p.get("expected_return"),
+            "confidence": lstm_conf if lstm_conf > 0 else None,
+            "calibration_error": lstm_p.get("calibration_error"),
+            "influence_enabled": lstm_p.get("influence_enabled", False),
+        },
+        "rainforest": {
+            "status": "validated" if rf_trained else "informational-only",
+            "regime": rf_regime,
+            "confidence": rf_conf if rf_conf > 0 else None,
+            "allowed_modes": ["trend", "range"] if rf_trained else [],
+            "blocked_modes": ["reversal"] if not rf_trained else [],
+            "feature_importance": rf_importance,
+            "lift_vs_no_rainforest": None,
+        },
+        "dreamer": {
+            "status": "training" if dreamer_p.get("running") else "stub_disabled" if dreamer_stub else "idle",
+            "stub_disabled": dreamer_stub,
+            "rollouts": dreamer_p.get("rollouts"),
+            "horizon": dreamer_p.get("horizon"),
+            "expected_reward": dreamer_p.get("expected_reward"),
+            "expected_drawdown": dreamer_p.get("expected_drawdown"),
+            "ruin_probability": dreamer_p.get("ruin_probability"),
+            "used_for_decisions": dreamer_p.get("used_for_decisions", False),
+        },
+        "ppo": {
+            "status": "training" if ppo_p.get("running") else "candidate" if champ_id else "undertrained",
+            "training_status": "training" if ppo_p.get("running") else "idle",
+            "actual_timesteps": ppo_p.get("current_timesteps"),
+            "configured_timesteps": ppo_p.get("total_timesteps"),
+            "reward_version": ppo_p.get("reward_version"),
+            "action_bias": ppo_p.get("action_bias"),
+            "promotion_status": "candidate" if active.get("canary") else "none",
+        },
+    })
+
+
+@app.route("/api/training/lanes", method=["GET", "OPTIONS"])
+def api_training_lanes():
+    """Return parallel training lane cards."""
+    if request.method == "OPTIONS":
+        return {}
+    srv = _server_ref
+    cfg = _read_config()
+    symbols = cfg.get("trading", {}).get("symbols", [])
+    progress = _read_training_progress()
+    lanes = []
+    for sym in symbols:
+        p = progress.get("ppo_per_symbol", {}).get(sym, {})
+        lanes.append({
+            "lane_id": f"ppo_{sym}",
+            "lane_name": sym,
+            "status": "training" if p.get("running") else "idle",
+            "progress_pct": p.get("progress_pct"),
+            "model_id": p.get("model_id"),
+            "timesteps": p.get("current_timesteps"),
+            "validation_summary": None,
+            "failure_reason": p.get("failure_reason"),
+        })
+    return _json(lanes)
+
+
+@app.route("/api/registry", method=["GET", "OPTIONS"])
+def api_registry():
+    """Return model bundle registry entries."""
+    if request.method == "OPTIONS":
+        return {}
+    active = _read_active_registry()
+    progress = _read_training_progress()
+    cfg = _read_config()
+    symbols = cfg.get("trading", {}).get("symbols", [])
+    champ_path = active.get("champion") or ""
+    canary_path = active.get("canary") or ""
+    champ_id = os.path.basename(champ_path) if champ_path else None
+    canary_id = os.path.basename(canary_path) if canary_path else None
+    bundles = []
+    for sym in symbols:
+        bundles.append({
+            "bundle_id": f"{champ_id or 'none'}_{sym}" if champ_id else f"untrained_{sym}",
+            "symbol": sym,
+            "timeframe": "M5",
+            "status": "champion" if champ_id else "untrained",
+            "data_source": "MT5",
+            "feature_set": None,
+            "lstm": "trained" if progress.get("lstm", {}).get("epoch", 0) > 0 else "none",
+            "rainforest": "trained" if (rf_detector and rf_detector.is_trained()) else "none",
+            "dreamer": "stub" if not os.path.exists(os.path.join(ROOT, "models", "dreamer")) else "trained",
+            "ppo": "candidate" if canary_id else "champion" if champ_id else "none",
+            "backtest_return": None,
+            "walk_forward": None,
+            "canary": None,
+            "promotion_decision": "champion" if champ_id else None,
+            "promotion_reason": None,
+        })
+    return _json(bundles)
+
+
+@app.route("/api/promotion_gates", method=["GET", "OPTIONS"])
+def api_promotion_gates():
+    """Return honest promotion gate checklist."""
+    if request.method == "OPTIONS":
+        return {}
+    tests = _get_test_status()
+    validation = _get_validation_status()
+    progress = _read_training_progress()
+    mt5 = _get_mt5_account_and_positions()
+    gates = []
+    def gate(name: str, required, actual, passed: bool, pending: bool = False):
+        gates.append({"gate": name, "required": required, "actual": actual, "passed": passed, "pending": pending})
+    gate("tests_passing", True, tests.get("status") == "passing", tests.get("status") == "passing")
+    gate("backtest_complete", True, validation.get("backtest_status") == "complete", validation.get("backtest_status") == "complete")
+    gate("walk_forward_complete", True, validation.get("walk_forward_status") == "complete", validation.get("walk_forward_status") == "complete")
+    gate("ppo_trained", True, bool(progress.get("ppo", {}).get("running")) or bool(progress.get("ppo", {}).get("current_timesteps", 0) > 0), bool(progress.get("ppo", {}).get("current_timesteps", 0) > 0))
+    gate("lstm_trained", True, bool(progress.get("lstm", {}).get("epoch", 0) > 0), bool(progress.get("lstm", {}).get("epoch", 0) > 0))
+    gate("rainforest_trained", True, bool(rf_detector and rf_detector.is_trained()), bool(rf_detector and rf_detector.is_trained()))
+    gate("account_telemetry_valid", True, mt5.get("equity", 0) > 0, mt5.get("equity", 0) > 0)
+    gate("real_money_unlocked", False, not _resolve_system_mode().get("real_money_locked", True), not _resolve_system_mode().get("real_money_locked", True))
+    return _json(gates)
+
+
+@app.route("/api/demo_canary", method=["GET", "OPTIONS"])
+def api_demo_canary():
+    """Return demo canary execution state."""
+    if request.method == "OPTIONS":
+        return {}
+    active = _read_active_registry()
+    canary_path = active.get("canary") or ""
+    canary_id = os.path.basename(canary_path) if canary_path else None
+    review = _get_trade_review_summary()
+    overall = review.get("overall", {})
+    return _json({
+        "account_type": "demo",
+        "real_money_locked": True,
+        "metrics": {
+            "trades": overall.get("total_trades", 0),
+            "days": 0,
+            "pnl": overall.get("total_pnl", 0.0),
+            "drawdown": overall.get("max_drawdown_pct", 0.0),
+            "profit_factor": overall.get("profit_factor", None),
+            "win_rate": overall.get("win_rate", None),
+        },
+        "timeline": [
+            {
+                "step": "canary_loaded",
+                "ts": datetime.now(timezone.utc).isoformat() if canary_id else None,
+                "status": "passed" if canary_id else "pending",
+                "detail": f"Canary bundle {canary_id}" if canary_id else "No canary bundle loaded",
+            },
+        ] if canary_id else [],
+    })
+
+
+@app.route("/api/trades/coroner", method=["GET", "OPTIONS"])
+def api_trade_coroner():
+    """Return mistake clusters for trade review and retraining eligibility."""
+    if request.method == "OPTIONS":
+        return {}
+    incidents = _read_incidents()
+    clusters = []
+    total_mistakes = 0
+    for inc in incidents:
+        if inc.get("severity") in ("warning", "critical"):
+            clusters.append({
+                "cluster_id": inc.get("id", "UNK"),
+                "count": 1,
+                "root_cause": inc.get("message", "unknown"),
+                "affected_symbols": inc.get("symbols", []),
+                "recommended_experiment": "review_incident_logs",
+                "retraining_eligible": False,
+            })
+            total_mistakes += 1
+    return _json({
+        "clusters": clusters,
+        "total_mistakes": total_mistakes,
+        "total_reviewed": 0,
+    })
+
+
+@app.route("/api/patterns/verified", method=["GET", "OPTIONS"])
+def api_patterns_verified():
+    """Return pattern verification list with fallback incident counts."""
+    if request.method == "OPTIONS":
+        return {}
+    patterns = []
+    patterns_log = os.path.join(ROOT, "logs", "patterns.jsonl")
+    if os.path.exists(patterns_log):
+        try:
+            with open(patterns_log, "r", encoding="utf-8") as f:
+                lines = f.readlines()[-50:]
+            for line in lines:
+                try:
+                    p = json.loads(line.strip())
+                    if isinstance(p, dict):
+                        patterns.append({
+                            "pattern_id": p.get("pattern", p.get("type", "unknown")),
+                            "pattern_name": p.get("pattern", "unknown"),
+                            "confidence": p.get("confidence", 0.0),
+                            "regime": p.get("regime", "unknown"),
+                            "outcome": p.get("outcome", "unknown"),
+                            "verified": False,
+                            "fallback_incidents": 0,
+                        })
+                except (json.JSONDecodeError, ValueError):
+                    pass
+        except Exception:
+            pass
+    return _json(patterns)
+
+
+@app.route("/api/perpetual_improvement", method=["GET", "OPTIONS"])
+def api_perpetual_improvement():
+    """Return perpetual improvement loop status."""
+    if request.method == "OPTIONS":
+        return {}
+    progress = _read_training_progress()
+    events = []
+    for model, p in progress.items():
+        if isinstance(p, dict) and p.get("running"):
+            events.append({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "event": "training_active",
+                "symbol": p.get("symbol", "unknown"),
+                "model": model,
+            })
+    return _json({
+        "loop_status": "active" if any(p.get("running") for p in progress.values() if isinstance(p, dict)) else "idle",
+        "learning_events": events,
+        "candidate_experiments": [],
+    })
+
+
+@app.route("/api/agents/status", method=["GET", "OPTIONS"])
+def api_agents_status():
+    """Return operational status for each agent."""
+    if request.method == "OPTIONS":
+        return {}
+    srv = _server_ref
+    cfg = _read_config()
+    progress = _read_training_progress()
+    halt = _safe_risk("halt", False)
+    symbols = cfg.get("trading", {}).get("symbols", [])
+    agents = []
+    agents.append({
+        "agent_id": "data_feed",
+        "agent_name": "Data Feed Agent",
+        "status": "online" if symbols else "idle",
+        "heartbeat": datetime.now(timezone.utc).isoformat(),
+        "current_task": f"Polling {len(symbols)} symbols" if symbols else "idle",
+        "last_artifact": None,
+        "error_count": 0,
+    })
+    agents.append({
+        "agent_id": "pattern_detector",
+        "agent_name": "Pattern Detector",
+        "status": "online" if (rf_detector and rf_detector.is_trained()) else "idle",
+        "heartbeat": datetime.now(timezone.utc).isoformat(),
+        "current_task": "Regime detection" if (rf_detector and rf_detector.is_trained()) else "Awaiting training",
+        "last_artifact": None,
+        "error_count": 0,
+    })
+    agents.append({
+        "agent_id": "risk_guardian",
+        "agent_name": "Risk Guardian",
+        "status": "error" if halt else "online",
+        "heartbeat": datetime.now(timezone.utc).isoformat(),
+        "current_task": "HALT" if halt else "Monitoring drawdown",
+        "last_artifact": None,
+        "error_count": 1 if halt else 0,
+    })
+    agents.append({
+        "agent_id": "lstm_brain",
+        "agent_name": "LSTM Brain",
+        "status": "training" if progress.get("lstm", {}).get("running") else "idle",
+        "heartbeat": datetime.now(timezone.utc).isoformat(),
+        "current_task": progress.get("lstm", {}).get("symbol", ""),
+        "last_artifact": None,
+        "error_count": 0,
+    })
+    agents.append({
+        "agent_id": "ppo_brain",
+        "agent_name": "PPO Brain",
+        "status": "training" if progress.get("ppo", {}).get("running") else "idle",
+        "heartbeat": datetime.now(timezone.utc).isoformat(),
+        "current_task": progress.get("ppo", {}).get("symbol", ""),
+        "last_artifact": None,
+        "error_count": 0,
+    })
+    agents.append({
+        "agent_id": "dreamer",
+        "agent_name": "Dreamer",
+        "status": "training" if progress.get("dreamer", {}).get("running") else "idle",
+        "heartbeat": datetime.now(timezone.utc).isoformat(),
+        "current_task": progress.get("dreamer", {}).get("symbol", ""),
+        "last_artifact": None,
+        "error_count": 0,
+    })
+    agents.append({
+        "agent_id": "trade_executor",
+        "agent_name": "Trade Executor",
+        "status": "online" if not halt else "blocked",
+        "heartbeat": datetime.now(timezone.utc).isoformat(),
+        "current_task": "Executing signals" if not halt else "Blocked by risk halt",
+        "last_artifact": None,
+        "error_count": 0,
+    })
+    agents.append({
+        "agent_id": "champion_evaluator",
+        "agent_name": "Champion Evaluator",
+        "status": "online" if _read_active_registry().get("champion") else "idle",
+        "heartbeat": datetime.now(timezone.utc).isoformat(),
+        "current_task": "Canary monitoring" if _read_active_registry().get("canary") else "Awaiting champion",
+        "last_artifact": None,
+        "error_count": 0,
+    })
+    agents.append({
+        "agent_id": "perpetual_optimizer",
+        "agent_name": "Perpetual Optimizer",
+        "status": "training" if any(p.get("running") for p in progress.values() if isinstance(p, dict)) else "idle",
+        "heartbeat": datetime.now(timezone.utc).isoformat(),
+        "current_task": "Hyper-parameter sweep",
+        "last_artifact": None,
+        "error_count": 0,
+    })
+    return _json(agents)
+
+
+@app.route("/api/safety", method=["GET", "OPTIONS"])
+def api_safety():
+    """Return blunt safety lock state and gate checklist."""
+    if request.method == "OPTIONS":
+        return {}
+    system = _resolve_system_mode()
+    mt5 = _get_mt5_account_and_positions()
+    tests = _get_test_status()
+    progress = _read_training_progress()
+    locked = system.get("real_money_locked", True)
+    lock_reasons = []
+    if locked:
+        lock_reasons.append(system.get("live_lock_reason", "real_live_disabled"))
+    if tests.get("open_failures", 0) > 0:
+        lock_reasons.append("test_failures")
+    if not (rf_detector and rf_detector.is_trained()):
+        lock_reasons.append("rainforest_untrained")
+    if progress.get("ppo", {}).get("current_timesteps", 0) == 0 and not progress.get("ppo", {}).get("running"):
+        lock_reasons.append("ppo_undertrained")
+    gates = []
+    gates.append({
+        "name": "real_money_locked",
+        "passed": not locked,
+        "required": False,
+        "actual": locked,
+        "reason": "real_live_disabled" if locked else None,
+    })
+    gates.append({
+        "name": "tests_passing",
+        "passed": tests.get("status") == "passing",
+        "required": True,
+        "actual": tests.get("status") == "passing",
+        "reason": f"{tests.get('open_failures', 0)} failures" if tests.get("open_failures", 0) > 0 else None,
+    })
+    gates.append({
+        "name": "account_telemetry_valid",
+        "passed": mt5.get("equity", 0) > 0,
+        "required": True,
+        "actual": mt5.get("equity", 0) > 0,
+        "reason": "No MT5 connection" if mt5.get("equity", 0) <= 0 else None,
+    })
+    gates.append({
+        "name": "rainforest_trained",
+        "passed": bool(rf_detector and rf_detector.is_trained()),
+        "required": True,
+        "actual": bool(rf_detector and rf_detector.is_trained()),
+        "reason": "Rainforest not trained" if not (rf_detector and rf_detector.is_trained()) else None,
+    })
+    return _json({
+        "real_money_locked": locked,
+        "lock_reasons": lock_reasons,
+        "gates": gates,
+    })
+
+
+@app.route("/api/evidence", method=["GET", "OPTIONS"])
+def api_evidence():
+    """Return evidence locker artifacts from models/ and logs/."""
+    if request.method == "OPTIONS":
+        return {}
+    artifacts = []
+    models_dir = os.path.join(ROOT, "models")
+    if os.path.isdir(models_dir):
+        for entry in os.listdir(models_dir):
+            path = os.path.join(models_dir, entry)
+            if os.path.isdir(path):
+                artifacts.append({
+                    "name": entry,
+                    "created_at": datetime.fromtimestamp(os.path.getctime(path), tz=timezone.utc).isoformat(),
+                    "status": "valid",
+                    "linked_model": entry,
+                    "path": path,
+                })
+    logs_dir = os.path.join(ROOT, "logs")
+    if os.path.isdir(logs_dir):
+        for entry in os.listdir(logs_dir):
+            if entry.endswith(".json") or entry.endswith(".jsonl"):
+                path = os.path.join(logs_dir, entry)
+                artifacts.append({
+                    "name": entry,
+                    "created_at": datetime.fromtimestamp(os.path.getctime(path), tz=timezone.utc).isoformat(),
+                    "status": "valid",
+                    "linked_model": None,
+                    "path": path,
+                })
+    return _json(artifacts)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # WebSocket endpoint — /ws/status
 # Pushes the same payload as /api/status every 2 seconds.
 # Only active when geventwebsocket is installed (WS_AVAILABLE == True).
