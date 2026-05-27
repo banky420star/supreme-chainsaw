@@ -110,5 +110,11 @@ registry:
         min_trades: 60
 data:
   source: mt5
+
+mt5:
+  login: ENV:MT5_LOGIN
+  password: ENV:MT5_PASSWORD
+  server: ENV:MT5_SERVER
+
 cycle:
   skip_completed_training: false

@@ -5,8 +5,20 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="description" content="Chain Gambler - Autonomous AI Trading System with PPO, LSTM, and Advanced Risk Management" />
     <meta name="theme-color" content="#0a0a0f" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Chain Gambler" />
     <link rel="icon" href="/app_icon.ico" />
+    <link rel="apple-touch-icon" href="/app_icon.png" />
+    <link rel="manifest" href="/manifest.json" />
     <title>Chain Gambler | Money Printer Edition</title>
+    <script type="module">
+      if ("serviceWorker" in navigator) {
+        window.addEventListener("load", () => {
+          navigator.serviceWorker.register("/sw.js", { scope: "/" }).catch(() => {});
+        });
+      }
+    </script>
   </head>
   <body>
     <div id="root"></div>

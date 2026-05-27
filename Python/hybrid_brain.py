@@ -272,17 +272,27 @@ class HybridBrain:
             feature_version = str(meta.get("feature_set_version", ENGINEERED_V2) or ENGINEERED_V2)
             try:
                 model = PPO.load(model_path)
-                vec_norm = None
-                if os.path.exists(vec_path):
+            except Exception as exc:
+                logger.warning(f"Skipping PPO artifact from {source} due to model load error: {exc}")
+                continue
+            vec_norm = None
+            if os.path.exists(vec_path):
+                try:
                     obs_dim = int(np.prod(model.observation_space.shape))
                     portfolio_feature_count = self._infer_portfolio_feature_count(obs_dim, feature_version=feature_version)
                     dummy = self._build_dummy_env(feature_version, portfolio_feature_count)
                     vec_norm = VecNormalize.load(vec_path, dummy)
                     vec_norm.training = False
                     vec_norm.norm_reward = False
-            except Exception as exc:
-                logger.warning(f"Skipping PPO artifact from {source} due to load error: {exc}")
-                continue
+                except Exception as vec_exc:
+                    # Non-security improvement: make VecNormalize mismatch much more visible
+                    # for champion models (the ones actually used for decisions).
+                    is_champion = "champion" in str(source).lower() or "registry" in str(source).lower()
+                    log = logger.error if is_champion else logger.warning
+                    log(
+                        f"VecNormalize mismatch for {model_path} (continuing without normalization): {vec_exc}"
+                    )
+                    vec_norm = None
 
             bundle = {
                 "model": model,
@@ -627,7 +637,9 @@ class HybridBrain:
 
     def live_trade(self, symbol, exposure, max_lots, action_meta=None, execution_context=None):
         if not self.risk.can_trade(symbol):
+            logger.warning(f"HybridBrain.live_trade blocked — risk.can_trade({symbol})=False | exposure={exposure}")
             return
+        logger.info(f"HybridBrain.live_trade executing — {symbol} exposure={exposure} max_lots={max_lots}")
         meta = action_meta or self.get_last_action_meta()
         tick = self.executor.get_tick(symbol)
         order_meta = translate_trade_action(symbol, meta, exposure, max_lots, tick) if meta else None

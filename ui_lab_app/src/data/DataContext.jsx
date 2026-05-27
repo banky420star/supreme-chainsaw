@@ -149,6 +149,13 @@ function mapStatusToState(status, trades = [], tradeReview = null, learning = nu
         alignment: Number(dreamer.alignment || 0),
         state: dreamer.state || "idle",
       },
+      rainforest: {
+        enabled: Boolean(status?.training?.rainforest_running),
+        state: visual.rainforest?.state || "idle",
+        rows: Number(visual.rainforest?.rows || 0),
+        classes: visual.rainforest?.classes || [],
+        topFeature: visual.rainforest?.top_feature || "",
+      },
       pipeline: {
         trainingActiveSymbols: Number(status?.training?.pipeline_summary?.training_active_symbols || 0),
         canaryReviewSymbols: Number(status?.training?.pipeline_summary?.canary_review_symbols || 0),

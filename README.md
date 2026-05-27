@@ -17,7 +17,8 @@
 
 ## Quick Start (Development)
 
-**Prerequisites:** Windows with MetaTrader 5 installed, Python 3.12
+**Prerequisites (Windows for live):** Windows + MT5 + Python 3.12+.  
+**macOS / Linux:** Dry-run / simulation mode only (real MT5 orders require Windows VPS or complex Wine bridge). Use `start_dryrun_mac.sh`.
 
 ```powershell
 # 1. Create and activate the virtual environment
@@ -31,12 +32,13 @@ pip install -r requirements.txt
 Copy-Item config.yaml.example config.yaml
 # Edit config.yaml: set mt5.login, mt5.password, mt5.server, telegram.token, telegram.chat_id
 
-# 4. Start the live server (dry-run by default)
+# 4. Start the server (dry-run by default everywhere; live needs Windows MT5)
+#   macOS convenience: bash start_dryrun_mac.sh
 python -m Python.Server_AGI
 
 # 5. Start the dashboard (separate terminal)
 python tools/project_status_ui.py
-# Open: http://127.0.0.1:8088
+# Open: http://127.0.0.1:8088 (or the port your UI uses)
 ```
 
 Run the test suite to verify the installation:

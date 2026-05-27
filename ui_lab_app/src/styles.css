@@ -434,6 +434,24 @@ a:hover { opacity: 0.8; }
 .progress-fill.tone-fail { background: linear-gradient(90deg, #c43a4d, var(--accent-red)); }
 
 /* ═══════════════════════════════════════
+   LOADING SCREEN DIAGNOSTICS
+   ═══════════════════════════════════════ */
+
+.check-ok { color: var(--accent-green); }
+.check-fail { color: var(--accent-red); }
+.check-warn { color: var(--accent-amber); }
+.check-spin {
+  color: var(--accent-cyan);
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+.diagnostic-panel {
+  animation: fadeUp 0.5s ease both;
+}
+
+/* ═══════════════════════════════════════
    BUTTONS
    ═══════════════════════════════════════ */
 
@@ -607,6 +625,18 @@ a:hover { opacity: 0.8; }
 .animate-in { animation: slideInUp 0.4s cubic-bezier(0.2, 0.8, 0.2, 1) both; }
 
 .pulse { animation: pulse 2s ease infinite; }
+
+/* ═══════════════════════════════════════
+   PWA / STANDALONE MODE
+   ═══════════════════════════════════════ */
+
+@media (display-mode: standalone) {
+  body {
+    -webkit-user-select: none;
+    user-select: none;
+    overscroll-behavior: none;
+  }
+}
 
 /* ═══════════════════════════════════════
    SCROLLBAR STYLES

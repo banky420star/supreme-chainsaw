@@ -65,6 +65,10 @@ class RiskSupervisor:
         except Exception:
             pass
 
+    @staticmethod
+    def _is_demo_mode() -> bool:
+        return os.environ.get("CHAIN_GAMBLER_EXECUTION_MODE", "").strip().lower() == "demo"
+
     def _load_state(self) -> None:
         try:
             state_path = self._state_path()
@@ -72,9 +76,11 @@ class RiskSupervisor:
                 return
             with open(state_path, "r", encoding="utf-8") as f:
                 state = json.load(f)
-            halt_until_str = state.get("halt_until")
-            if halt_until_str:
-                self.halt_until = dt.datetime.fromisoformat(halt_until_str)
+            # Never load a persisted halt in demo mode — user expects continuous trading
+            if not self._is_demo_mode():
+                halt_until_str = state.get("halt_until")
+                if halt_until_str:
+                    self.halt_until = dt.datetime.fromisoformat(halt_until_str)
             for k, v in (state.get("last_trade_at") or {}).items():
                 self.last_trade_at_by_symbol[str(k)] = dt.datetime.fromisoformat(v)
         except Exception:
@@ -93,7 +99,8 @@ class RiskSupervisor:
 
     def enforce_halt(self, minutes: int, reason: str) -> RiskDecision:
         self.halt_until = self._now() + dt.timedelta(minutes=max(1, int(minutes)))
-        self._save_state()
+        if not self._is_demo_mode():
+            self._save_state()
         return RiskDecision(False, reason)
 
     def allow_trade(
@@ -123,7 +130,8 @@ class RiskSupervisor:
         min_trade_interval_sec = int(symbol_profile.get("min_trade_interval_sec", self.min_trade_interval_sec))
 
         now = self._now()
-        if self.halt_until and now < self.halt_until:
+        # Demo mode runs continuously; halts should not block trading
+        if not self._is_demo_mode() and self.halt_until and now < self.halt_until:
             return RiskDecision(False, f"halt_until {self.halt_until.isoformat()}")
 
         pnl_today = float(snapshot.get("pnl_today", 0.0) or 0.0)

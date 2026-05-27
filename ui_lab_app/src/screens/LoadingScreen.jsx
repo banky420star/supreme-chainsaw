@@ -1,218 +1,250 @@
-import React, { useEffect, useState, useRef, useCallback } from "react";
-import { Activity, Shield, Cpu, Network, Zap, Brain, CandlestickChart, GitBranch, Rocket, Eye, Lock, Sparkles, TrendingUp, Gauge, Database, HeartPulse } from "lucide-react";
+import React, { useEffect, useState, useRef } from "react";
+import {
+  CheckCircle2, XCircle, Loader2, AlertTriangle,
+  Activity, Shield, Cpu, Brain, Database,
+  GitBranch, Rocket, TrendingUp, Radio, Server,
+} from "lucide-react";
 
-const BOOT_SEQUENCE = [
-  { label: "Initializing neural pathways...", icon: Brain, duration: 1200, quip: "Synapses firing up" },
-  { label: "Connecting to market data feed...", icon: Network, duration: 900, quip: "Riding the wire" },
-  { label: "Loading LSTM context memory...", icon: Cpu, duration: 1100, quip: "150 features, zero excuses" },
-  { label: "Warming up PPO champion model...", icon: Activity, duration: 1000, quip: "Policy mode: engaged" },
-  { label: "Scanning symbol lanes...", icon: CandlestickChart, duration: 800, quip: "4 symbols, 1 brain" },
-  { label: "Initializing reversal detector...", icon: TrendingUp, duration: 700, quip: "5 methods, zero mercy" },
-  { label: "Calibrating speed simulator...", icon: Gauge, duration: 600, quip: "Latency profiles loaded" },
-  { label: "Mounting backup manager...", icon: Database, duration: 500, quip: "7-day retention active" },
-  { label: "Starting health check endpoint...", icon: HeartPulse, duration: 400, quip: "/api/health ready" },
-  { label: "Verifying risk authority...", icon: Shield, duration: 700, quip: "Drawdown check: passed" },
-  { label: "Arming trailing stop manager...", icon: Zap, duration: 600, quip: "Profits, protected" },
-  { label: "Calibrating deadzone threshold...", icon: Eye, duration: 500, quip: "LOW_VOL = hold tight" },
-  { label: "Locking canary gate...", icon: Lock, duration: 400, quip: "Canary not yet ready" },
-  { label: "Syncing evolutionary pipeline...", icon: GitBranch, duration: 600, quip: "Always improving" },
-  { label: "Running final sanity check...", icon: Sparkles, duration: 500, quip: "All systems nominal" },
-  { label: "Going live.", icon: Rocket, duration: 300, quip: "" },
+const API_BASE = "/api";
+
+async function fetchJSON(path, fallback = null) {
+  try {
+    const res = await fetch(`${API_BASE}${path}`, { cache: "no-store" });
+    if (!res.ok) return fallback;
+    return await res.json();
+  } catch {
+    return fallback;
+  }
+}
+
+const CHECKS = [
+  {
+    id: "api",
+    label: "API Server",
+    icon: Server,
+    check: async () => {
+      const data = await fetchJSON("/health", null);
+      const ok = !!data;
+      return { ok, detail: ok ? "Online" : "No response" };
+    },
+  },
+  {
+    id: "data",
+    label: "Data Feed",
+    icon: Database,
+    check: async () => {
+      const data = await fetchJSON("/status", null);
+      const mode = data?.account?.mode;
+      const isDemo = mode === "demo" || mode === "mt5_demo";
+      const ok = data?.account?.connected || mode === "paper" || mode === "live" || isDemo;
+      return { ok, detail: mode === "paper" ? "Paper mode" : (isDemo ? "Demo feed" : (mode === "live" ? "Live feed" : (ok ? "Connected" : "No data"))) };
+    },
+  },
+  {
+    id: "brain",
+    label: "AGI Brain",
+    icon: Brain,
+    check: async () => {
+      const data = await fetchJSON("/status", null);
+      const ok = data?.server?.running === true;
+      return { ok, detail: ok ? "Loaded" : "Not loaded" };
+    },
+  },
+  {
+    id: "models",
+    label: "Models",
+    icon: Cpu,
+    check: async () => {
+      const data = await fetchJSON("/status", null);
+      const champ = data?.active_models?.champion;
+      const visual = data?.training?.visual || {};
+      const hasDreamer = !!visual.dreamer;
+      const hasPPO = !!visual.ppo;
+      const hasLSTM = !!visual.lstm;
+      const ok = champ !== "none" && champ !== null || hasDreamer || hasPPO || hasLSTM;
+      return { ok, detail: ok ? "Ready" : "Loading" };
+    },
+  },
+  {
+    id: "training",
+    label: "Training",
+    icon: Activity,
+    check: async () => {
+      const data = await fetchJSON("/status", null);
+      const symbols = data?.training?.configured_symbols || [];
+      const ok = symbols.length > 0;
+      return { ok, detail: ok ? `${symbols.length} symbols` : "No symbols" };
+    },
+  },
+  {
+    id: "risk",
+    label: "Risk Engine",
+    icon: Shield,
+    check: async () => {
+      const data = await fetchJSON("/status", null);
+      const risk = data?.risk || {};
+      // Halted = fail, can_trade = ok, neither = warn (active but waiting)
+      if (risk.halt) return { ok: false, detail: "Halted" };
+      if (risk.can_trade) return { ok: true, detail: "Armed" };
+      return { ok: false, detail: "Waiting" };
+    },
+  },
+  {
+    id: "pipeline",
+    label: "Pipeline",
+    icon: GitBranch,
+    check: async () => {
+      const data = await fetchJSON("/status", null);
+      const summary = data?.training?.pipeline_summary || {};
+      const total = summary.symbols_total || 0;
+      const ok = total > 0;
+      return { ok, detail: ok ? `${total} symbols` : "Initializing" };
+    },
+  },
+  {
+    id: "ready",
+    label: "Ready to Trade",
+    icon: Rocket,
+    check: async () => {
+      const data = await fetchJSON("/status", null);
+      const risk = data?.risk || {};
+      const hasSymbols = (data?.training?.configured_symbols || []).length > 0;
+      const serverOk = data?.server?.running === true;
+      const ok = serverOk && hasSymbols && !risk.halt;
+      return { ok, detail: ok ? "GO" : "Waiting" };
+    },
+  },
 ];
 
-export default function LoadingScreen() {
-  const [progress, setProgress] = useState(0);
-  const [currentStep, setCurrentStep] = useState(0);
-  const [completedSteps, setCompletedSteps] = useState([]);
-  const [showQuip, setShowQuip] = useState(false);
-  const [matrixChars, setMatrixChars] = useState([]);
-  const apiReadyRef = useRef(false);
-  const doneRef = useRef(false);
+function StatusIcon({ status }) {
+  if (status === "ok") return <CheckCircle2 size={13} style={{ color: "var(--accent-green)" }} />;
+  if (status === "fail") return <XCircle size={13} style={{ color: "var(--accent-red)" }} />;
+  if (status === "warn") return <AlertTriangle size={13} style={{ color: "var(--accent-amber)" }} />;
+  return <Loader2 size={13} style={{ color: "var(--accent-cyan)", animation: "spin 1s linear infinite" }} />;
+}
 
-  // Poll API until it responds
+export default function LoadingScreen({ onReady }) {
+  const [checks, setChecks] = useState(
+    CHECKS.map((c) => ({ id: c.id, label: c.label, status: "pending", detail: "...", icon: c.icon }))
+  );
+  const [done, setDone] = useState(false);
+  const doneRef = useRef(false);
+  const minSplashOver = useRef(false);
+
+  const okCount = checks.filter((r) => r.status === "ok").length;
+  const total = checks.length;
+  const progress = done ? 100 : Math.min(90, (okCount / total) * 90);
+
   useEffect(() => {
     let cancelled = false;
-    async function checkApi() {
-      while (!cancelled) {
+    async function run() {
+      for (let i = 0; i < CHECKS.length; i++) {
+        if (cancelled) return;
+        const def = CHECKS[i];
+        setChecks((prev) => prev.map((r, idx) => (idx === i ? { ...r, status: "running", detail: "Checking..." } : r)));
         try {
-          const res = await fetch("/api/status", { cache: "no-store" });
-          if (res.ok) {
-            apiReadyRef.current = true;
-            return;
-          }
-        } catch {}
-        await new Promise((r) => setTimeout(r, 1500));
+          const result = await def.check();
+          if (cancelled) return;
+          setChecks((prev) => prev.map((r, idx) => (idx === i ? { ...r, status: result.ok ? "ok" : "fail", detail: result.detail } : r)));
+        } catch (e) {
+          setChecks((prev) => prev.map((r, idx) => (idx === i ? { ...r, status: "fail", detail: "Error" } : r)));
+        }
+        await new Promise((r) => setTimeout(r, 300));
       }
+      setDone(true);
     }
-    checkApi();
+    run();
     return () => { cancelled = true; };
   }, []);
 
-  // Progress and step animation
   useEffect(() => {
-    const totalDuration = BOOT_SEQUENCE.reduce((a, s) => a + s.duration, 0);
-    let elapsed = 0;
-    let stepIdx = 0;
-    let stepElapsed = 0;
-
-    const interval = setInterval(() => {
-      if (stepIdx < BOOT_SEQUENCE.length) {
-        const step = BOOT_SEQUENCE[stepIdx];
-        stepElapsed += 50;
-
-        setCurrentStep(stepIdx);
-        setShowQuip(true);
-
-        if (stepElapsed >= step.duration) {
-          setCompletedSteps((prev) => [...prev, stepIdx]);
-          stepIdx++;
-          stepElapsed = 0;
-          setShowQuip(false);
-        }
-      }
-
-      elapsed += 50;
-      setProgress((prev) => {
-        let target;
-        if (apiReadyRef.current) {
-          target = Math.min(100, prev + 3);
-        } else {
-          const t = Math.min(1, elapsed / totalDuration);
-          target = Math.min(90, (1 - (1 - t) * (1 - t)) * 90);
-        }
-        if (target >= 99.5 && !doneRef.current) {
-          doneRef.current = true;
-        }
-        return target;
-      });
-    }, 50);
-
-    return () => clearInterval(interval);
+    const t = setTimeout(() => { minSplashOver.current = true; }, 2000);
+    return () => clearTimeout(t);
   }, []);
 
-  // Matrix rain effect
   useEffect(() => {
-    const chars = "01ACGT$%@#&<>{}[]";
-    const interval = setInterval(() => {
-      setMatrixChars((prev) => {
-        const next = [...prev];
-        if (next.length < 25) {
-          next.push({
-            char: chars[Math.floor(Math.random() * chars.length)],
-            x: Math.random() * 100,
-            y: -5,
-            speed: 0.5 + Math.random() * 2,
-            opacity: 0.05 + Math.random() * 0.1,
-            id: Date.now() + Math.random(),
-          });
-        }
-        return next
-          .map((c) => ({ ...c, y: c.y + c.speed }))
-          .filter((c) => c.y < 105);
-      });
-    }, 100);
-    return () => clearInterval(interval);
-  }, []);
-
-  const step = BOOT_SEQUENCE[currentStep] || BOOT_SEQUENCE[BOOT_SEQUENCE.length - 1];
-  const CurrentIcon = step.icon;
-  const isComplete = progress >= 99.5;
+    if (done && minSplashOver.current && !doneRef.current) {
+      doneRef.current = true;
+      const t = setTimeout(() => { if (onReady) onReady(); }, 600);
+      return () => clearTimeout(t);
+    }
+  }, [done, onReady]);
 
   return (
-    <div className="loading-screen">
-      {/* Matrix rain background */}
-      <div className="loading-matrix-bg">
-        {matrixChars.map((c) => (
-          <span
-            key={c.id}
-            className="matrix-char"
-            style={{
-              left: `${c.x}%`,
-              top: `${c.y}%`,
-              opacity: c.opacity,
-            }}
-          >
-            {c.char}
-          </span>
-        ))}
-      </div>
-
-      <div className="loading-content">
-        {/* Animated hex logo */}
-        <div className="logo-container">
-          <div className="logo-pulse"></div>
-          <div className="logo-pulse" style={{ animationDelay: "0.7s" }}></div>
-          <div className="logo-core">
-            <svg viewBox="0 0 100 100" className="brand-logo">
-              <path d="M50 5 L88.97 27.5 L88.97 72.5 L50 95 L11.03 72.5 L11.03 27.5 Z" fill="none" stroke="var(--accent-cyan)" strokeWidth="2" strokeDasharray="30 10" style={{ animation: "sweep 8s linear infinite" }} />
-              <path d="M50 20 L75 35 L75 65 L50 80 L25 65 L25 35 Z" fill="none" stroke="var(--accent-purple)" strokeWidth="1.5" strokeDasharray="4 6" style={{ animation: "sweep 4s linear infinite reverse" }} />
-              <path d="M50 30 L65 38.75 L65 61.25 L50 70 L35 61.25 L35 38.75 Z" fill="none" stroke="var(--accent-green)" strokeWidth="1" strokeDasharray="2 4" style={{ animation: "sweep 2.5s linear infinite" }} />
-              <circle cx="50" cy="50" r="8" fill="var(--accent-cyan)" style={{ animation: "pulse 1.5s infinite" }} />
-              <circle cx="50" cy="50" r="4" fill="#fff" style={{ animation: "pulse 1.5s infinite 0.3s" }} />
-            </svg>
+    <div style={{
+      position: "fixed", inset: 0, background: "var(--bg-base)",
+      display: "flex", alignItems: "center", justifyContent: "center",
+      fontFamily: "var(--display)", color: "var(--text-primary)", zIndex: 9999
+    }}>
+      <div style={{
+        width: "100%", maxWidth: 360, padding: "0 24px", textAlign: "center"
+      }}>
+        <div style={{ marginBottom: 20 }}>
+          <h1 style={{
+            fontSize: "1rem", fontWeight: 700, letterSpacing: 2,
+            textTransform: "uppercase", margin: 0
+          }}>
+            Chain Gambler
+          </h1>
+          <div style={{
+            fontSize: "0.65rem", color: "var(--text-muted)", marginTop: 4,
+            letterSpacing: 1, textTransform: "uppercase"
+          }}>
+            {done ? "System Online" : "Initializing..."}
           </div>
-          {/* Orbiting dots */}
-          <div className="orbit-dot orbit-1" />
-          <div className="orbit-dot orbit-2" />
-          <div className="orbit-dot orbit-3" />
         </div>
 
-        {/* Brand */}
-        <h1 className={`brand-title ${isComplete ? "brand-ready" : ""}`}>
-          CHAIN GAMBLER
-        </h1>
-        <div className="brand-subtitle" style={{ fontSize: "0.85rem", opacity: 0.7, marginTop: -8, marginBottom: 8 }}>
-          Money Printer Edition
-        </div>
-        <div className="brand-subtitle">
-          {isComplete ? "SYSTEM ONLINE" : "AUTONOMOUS TRADING PIPELINE"}
+        <div style={{
+          background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)",
+          borderRadius: 10, padding: "12px 16px", marginBottom: 16, textAlign: "left"
+        }}>
+          <div style={{
+            display: "flex", justifyContent: "space-between", alignItems: "center",
+            marginBottom: 8, fontSize: "0.6rem", fontWeight: 600,
+            textTransform: "uppercase", letterSpacing: 1, color: "var(--text-muted)"
+          }}>
+            <span>Diagnostics</span>
+            <span style={{ color: "var(--accent-cyan)" }}>{okCount}/{total}</span>
+          </div>
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>
+            {checks.map((check) => {
+              const Icon = check.icon;
+              return (
+                <div key={check.id} style={{
+                  display: "flex", alignItems: "center", gap: 8,
+                  padding: "4px 0", opacity: check.status === "pending" ? 0.4 : 1,
+                  transition: "opacity 0.2s"
+                }}>
+                  <Icon size={12} style={{ color: "var(--text-muted)", minWidth: 14 }} />
+                  <span style={{ flex: 1, fontSize: "0.75rem", color: "var(--text-secondary)" }}>
+                    {check.label}
+                  </span>
+                  <span style={{ fontSize: "0.6rem", color: "var(--text-muted)", marginRight: 6 }}>
+                    {check.detail}
+                  </span>
+                  <StatusIcon status={check.status} />
+                </div>
+              );
+            })}
+          </div>
         </div>
 
-        {/* Boot sequence log */}
-        <div className="boot-log">
-          {completedSteps.map((idx) => {
-            const s = BOOT_SEQUENCE[idx];
-            if (!s || !s.icon) return null;
-            const SIcon = s.icon;
-            return (
-              <div className="boot-line done" key={idx}>
-                <SIcon size={12} className="boot-line-icon done" />
-                <span className="boot-line-text">{s.label}</span>
-                <span className="boot-line-check">&#10003;</span>
-              </div>
-            );
-          })}
-          {!isComplete && (
-            <div className="boot-line active" key={currentStep}>
-              <CurrentIcon size={12} className="boot-line-icon active" />
-              <span className="boot-line-text">{step.label}</span>
-              <span className="boot-line-spinner" />
-            </div>
-          )}
+        <div style={{
+          height: 3, borderRadius: 2, background: "rgba(255,255,255,0.05)", overflow: "hidden"
+        }}>
+          <div style={{
+            height: "100%", borderRadius: 2,
+            background: done ? "var(--accent-green)" : "var(--accent-cyan)",
+            width: `${progress}%`, transition: "width 0.4s ease"
+          }} />
         </div>
-
-        {/* Quip */}
-        {showQuip && step.quip && (
-          <div className="boot-quip" key={currentStep}>
-            {step.quip}
-          </div>
-        )}
-
-        {/* Progress bar with segments */}
-        <div className="progress-section">
-          <div className="global-progress-bar">
-            <div className="global-progress-fill" style={{ width: `${progress}%` }}>
-              <div className="global-progress-glow" />
-            </div>
-          </div>
-          <div className="progress-info">
-            <span className="progress-pct">{Math.floor(progress)}%</span>
-            <span className="progress-detail">
-              {isComplete
-                ? "Dashboard loading..."
-                : `Step ${currentStep + 1}/${BOOT_SEQUENCE.length}`}
-            </span>
-          </div>
+        <div style={{
+          display: "flex", justifyContent: "space-between",
+          marginTop: 6, fontSize: "0.6rem", color: "var(--text-muted)"
+        }}>
+          <span>{done ? "Ready" : "Checking..."}</span>
+          <span>{Math.floor(progress)}%</span>
         </div>
       </div>
     </div>

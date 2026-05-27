@@ -6,12 +6,18 @@ import subprocess
 import tempfile
 from datetime import datetime, timezone
 
+from filelock import FileLock
 from loguru import logger
 
 from Python.config_utils import load_project_config
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
-INTEGRITY_TARGETS = {"model": "ppo_trading.zip", "vec_normalize": "vec_normalize.pkl"}
+INTEGRITY_TARGETS = {
+    "model": "ppo_trading.zip",
+    "vec_normalize": "vec_normalize.pkl",
+    "metadata": "metadata.json",
+    "scorecard": "scorecard.json",
+}
 
 
 class ModelRegistry:
@@ -47,6 +53,7 @@ class ModelRegistry:
         self.registry_config = registry_config or self._load_registry_config()
 
         self.active_path = os.path.join(self.root, "active.json")
+        self._lock = FileLock(f"{self.active_path}.lock")
         self.champion_dir = os.path.join(self.root, "champion")
         self.canary_dir = os.path.join(self.root, "canary")
         self.candidates_dir = os.path.join(self.root, "candidates")
@@ -112,16 +119,17 @@ class ModelRegistry:
         return out
 
     def _read_active(self):
-        try:
-            with open(self.active_path, "r", encoding="utf-8") as f:
-                payload = json.load(f)
-            return self._normalize_active(payload)
-        except json.JSONDecodeError as exc:
-            logger.warning(f"active.json is corrupt ({exc}); resetting to empty registry state")
-            return self._normalize_active({})
-        except Exception as exc:
-            logger.warning(f"Failed to read active.json ({exc}); using empty registry state")
-            return self._normalize_active({})
+        with self._lock:
+            try:
+                with open(self.active_path, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                return self._normalize_active(payload)
+            except json.JSONDecodeError as exc:
+                logger.warning(f"active.json is corrupt ({exc}); resetting to empty registry state")
+                return self._normalize_active({})
+            except Exception as exc:
+                logger.warning(f"Failed to read active.json ({exc}); using empty registry state")
+                return self._normalize_active({})
 
     def _load_registry_config(self) -> dict:
         try:
@@ -131,23 +139,24 @@ class ModelRegistry:
             return {}
 
     def _write_active(self, payload: dict):
-        normalized = self._normalize_active(payload)
-        normalized["registry_metadata"] = self._build_registry_metadata(normalized)
+        with self._lock:
+            normalized = self._normalize_active(payload)
+            normalized["registry_metadata"] = self._build_registry_metadata(normalized)
 
-        tmp = tempfile.NamedTemporaryFile(mode="w", delete=False, dir=self.root, suffix=".json", encoding="utf-8")
-        try:
-            json.dump(normalized, tmp, indent=2)
-        finally:
-            tmp.close()
-
-        if os.path.exists(self.active_path):
-            backup_path = f"{self.active_path}.bak"
+            tmp = tempfile.NamedTemporaryFile(mode="w", delete=False, dir=self.root, suffix=".json", encoding="utf-8")
             try:
-                shutil.copy2(self.active_path, backup_path)
-            except Exception:
-                logger.warning("Unable to backup active registry file.")
+                json.dump(normalized, tmp, indent=2)
+            finally:
+                tmp.close()
 
-        shutil.move(tmp.name, self.active_path)
+            if os.path.exists(self.active_path):
+                backup_path = f"{self.active_path}.bak"
+                try:
+                    shutil.copy2(self.active_path, backup_path)
+                except Exception:
+                    logger.warning("Unable to backup active registry file.")
+
+            shutil.move(tmp.name, self.active_path)
 
     def _build_registry_metadata(self, active: dict) -> dict:
         meta = {
@@ -219,14 +228,22 @@ class ModelRegistry:
         if not isinstance(recorded, dict) or not recorded:
             return True
         for label, expected in recorded.items():
-            target = INTEGRITY_TARGETS.get(label)
-            if not target or not expected:
+            if not expected:
                 continue
-            path = os.path.join(candidate_dir, target)
+            fname = INTEGRITY_TARGETS.get(label)
+            if not fname:
+                # Unknown label from older snapshot — skip gracefully
+                continue
+            path = os.path.join(candidate_dir, fname)
             if not os.path.exists(path):
                 return False
             actual = self._file_hash(path)
             if not actual or str(actual) != str(expected):
+                return False
+        # Also validate that all known target files exist (not just recorded ones)
+        for label, fname in INTEGRITY_TARGETS.items():
+            path = os.path.join(candidate_dir, fname)
+            if not os.path.exists(path):
                 return False
         return True
 

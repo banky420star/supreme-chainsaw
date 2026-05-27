@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from datetime import timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from loguru import logger
@@ -11,6 +11,8 @@ from loguru import logger
 from Python.mt5_compat import mt5 as _mt5
 
 _STATE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "live_state.json")
+_LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
+PAPER_CLOSED_LOG = os.path.join(_LOG_DIR, "paper_closed_trades.jsonl")
 
 PAPER_DEFAULT_BALANCE = 100_000.0
 
@@ -33,7 +35,7 @@ def _save_state(state: dict):
 
 def get_mode() -> str:
     env_mode = os.environ.get("CHAIN_GAMBLER_EXECUTION_MODE", "").strip().lower()
-    if env_mode in ("paper", "live"):
+    if env_mode in ("paper", "demo", "live"):
         return env_mode
     state = _load_state()
     return state.get("trading", {}).get("mode", "paper")
@@ -194,6 +196,30 @@ def paper_close_position(position_ticket: int, price: float | None = None, volum
             _save_state(state)
 
             logger.info(f"[PAPER] Simulated close #{position_ticket} {pos['symbol']} @ {close_price} PnL={pnl:.2f}")
+
+            # Persist closed trade for dashboard equity curve
+            try:
+                os.makedirs(_LOG_DIR, exist_ok=True)
+                with open(PAPER_CLOSED_LOG, "a") as f:
+                    f.write(
+                        json.dumps(
+                            {
+                                "ticket": pos["ticket"],
+                                "symbol": pos["symbol"],
+                                "side": pos["type"],
+                                "volume": pos["volume"],
+                                "open_price": pos["open_price"],
+                                "close_price": close_price,
+                                "profit": round(pnl, 2),
+                                "close_time": datetime.now(timezone.utc).isoformat(),
+                                "bot_lane": pos.get("bot_lane", "paper"),
+                                "comment": pos.get("comment", ""),
+                            }
+                        )
+                        + "\n"
+                    )
+            except Exception as exc:
+                logger.warning(f"Failed to log paper closed trade: {exc}")
 
             class _FakeResult:
                 retcode = _mt5.TRADE_RETCODE_DONE

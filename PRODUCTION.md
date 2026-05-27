@@ -52,13 +52,13 @@ Open `config.yaml` and set all required fields:
 
 ```yaml
 mt5:
-  login: 435656990          # Your MT5 account number
-  password: "your_password" # Your MT5 password
-  server: "Exness-MT5Trial9" # Your broker's MT5 server name
+  login: ENV:MT5_LOGIN       # Or your MT5 account number
+  password: ENV:MT5_PASSWORD  # Or your MT5 password
+  server: ENV:MT5_SERVER    # Or your broker's MT5 server name
 
 telegram:
-  token: "7123456789:AAF..."  # From @BotFather
-  chat_id: "-100123456789"    # Your Telegram group or user chat ID
+  token: "YOUR_BOT_TOKEN_HERE"  # From @BotFather
+  chat_id: "YOUR_CHAT_ID_HERE"    # Your Telegram group or user chat ID
 
 trading:
   symbols:

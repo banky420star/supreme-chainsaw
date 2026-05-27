@@ -1,6 +1,7 @@
 import React from 'react'
 import { DemoCanaryState, fetchDemoCanary } from '../services/api'
 import TruthBadge from './TruthBadge'
+import LoadingBar from './LoadingBar'
 
 const colors = {
   bg: '#0d1726',
@@ -61,9 +62,7 @@ const DemoCanaryPanel: React.FC = () => {
         Demo Canary
       </h2>
 
-      {loading && !state && (
-        <div style={{ ...panelStyle, color: colors.muted }}>Loading demo canary...</div>
-      )}
+      {loading && !state && <LoadingBar label="Loading demo canary..." />}
       {!loading && !state && (
         <div style={{ ...panelStyle, color: colors.muted }}>
           No demo canary data available. The endpoint returned empty.

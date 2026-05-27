@@ -1,6 +1,7 @@
 import React from 'react'
 import { PatternRecord } from '../types'
 import { LSTMExplanation, RainforestResponse, RainforestSymbolData, fetchRainforest } from '../services/api'
+import LoadingBar from './LoadingBar'
 
 interface Props {
   patterns: PatternRecord[]
@@ -362,11 +363,7 @@ const PatternLibraryPanel: React.FC<Props> = ({ patterns, status, lstmExpl: _lst
             </div>
           )}
 
-          {rfLoading && !hasRfData && (
-            <div style={{ textAlign: 'center', color: '#889', padding: 40 }}>
-              Loading Rainforest data...
-            </div>
-          )}
+          {rfLoading && !hasRfData && <LoadingBar label="Loading Rainforest data..." />}
 
           {!rfLoading && !hasRfData && (
             <div style={{

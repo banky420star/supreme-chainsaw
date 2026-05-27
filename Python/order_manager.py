@@ -598,45 +598,60 @@ class OrderManager:
     # ── Dollar profit calculation ────────────────────────────────────────
 
     @staticmethod
+    def _fallback_dollar_profit(symbol: str, volume: float, open_price: float,
+                                 current_price: float, is_buy: bool) -> float:
+        """Rough estimate when MT5 is unavailable or symbol_info returns None."""
+        if "XAU" in symbol.upper():
+            return (current_price - open_price) * volume * 100 if is_buy else (open_price - current_price) * volume * 100
+        elif "BTC" in symbol.upper():
+            return (current_price - open_price) * volume if is_buy else (open_price - current_price) * volume
+        else:
+            return (current_price - open_price) * volume * 100000 if is_buy else (open_price - current_price) * volume * 100000
+
+    @staticmethod
+    def _fallback_pip_value_per_lot(symbol: str) -> float:
+        """Rough pip value per lot when MT5 is unavailable."""
+        if "XAU" in symbol.upper():
+            return 100.0
+        elif "BTC" in symbol.upper():
+            return 1.0
+        else:
+            return 100000.0
+
+    @staticmethod
     def _pip_value_per_lot(symbol: str) -> float:
         """Get pip value per lot for a symbol using MT5 symbol info."""
         if _mt5 is None or not _MT5_AVAILABLE:
-            return 0.0
+            return OrderManager._fallback_pip_value_per_lot(symbol)
         try:
             if not _mt5.initialize():
-                return 0.0
+                return OrderManager._fallback_pip_value_per_lot(symbol)
             info = _mt5.symbol_info(symbol)
             if info is None:
-                return 0.0
+                return OrderManager._fallback_pip_value_per_lot(symbol)
             tick_size = getattr(info, 'trade_tick_size', 0)
             tick_value = getattr(info, 'trade_tick_value', 0)
             if tick_size > 0 and tick_value > 0:
                 # Pip value per 1.0 lot = tick_value / tick_size * pip_size
                 # For simplicity: value per tick per lot
                 return tick_value / tick_size
-            return 0.0
+            return OrderManager._fallback_pip_value_per_lot(symbol)
         except Exception:
-            return 0.0
+            return OrderManager._fallback_pip_value_per_lot(symbol)
 
     @staticmethod
     def _calc_dollar_profit(symbol: str, volume: float, open_price: float,
                              current_price: float, is_buy: bool) -> float:
         """Calculate dollar profit for a position using MT5 tick values."""
         if _mt5 is None or not _MT5_AVAILABLE:
-            # Fallback: rough estimate
-            if "XAU" in symbol.upper():
-                return (current_price - open_price) * volume * 100 if is_buy else (open_price - current_price) * volume * 100
-            elif "BTC" in symbol.upper():
-                return (current_price - open_price) * volume if is_buy else (open_price - current_price) * volume
-            else:
-                return (current_price - open_price) * volume * 100000 if is_buy else (open_price - current_price) * volume * 100000
+            return OrderManager._fallback_dollar_profit(symbol, volume, open_price, current_price, is_buy)
 
         try:
             if not _mt5.initialize():
-                return 0.0
+                return OrderManager._fallback_dollar_profit(symbol, volume, open_price, current_price, is_buy)
             info = _mt5.symbol_info(symbol)
             if info is None:
-                return 0.0
+                return OrderManager._fallback_dollar_profit(symbol, volume, open_price, current_price, is_buy)
             tick_size = getattr(info, 'trade_tick_size', 0)
             tick_value = getattr(info, 'trade_tick_value', 0)
             contract_size = getattr(info, 'trade_contract_size', 100000)
@@ -650,7 +665,7 @@ class OrderManager:
                 price_diff = (current_price - open_price) if is_buy else (open_price - current_price)
                 return price_diff * contract_size * volume
         except Exception:
-            return 0.0
+            return OrderManager._fallback_dollar_profit(symbol, volume, open_price, current_price, is_buy)
 
     # ── Main Position Management Loop ───────────────────────────────────
 

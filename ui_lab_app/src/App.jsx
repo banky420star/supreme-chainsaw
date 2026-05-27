@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import { useData } from "./data/DataContext";
 import Layout from "./components/Layout";
 import LoadingScreen from "./screens/LoadingScreen";
@@ -50,12 +50,11 @@ export default function App() {
   const [selectedSymbol, setSelectedSymbol] = useState("BTCUSDm");
   const [splashDone, setSplashDone] = useState(false);
 
-  // Enforce minimum splash screen duration
-  useEffect(() => {
-    const timer = setTimeout(() => setSplashDone(true), MIN_SPLASH_MS);
-    return () => clearTimeout(timer);
+  const handleSplashReady = useCallback(() => {
+    setSplashDone(true);
   }, []);
 
+  // Enforce minimum splash screen duration via LoadingScreen internal timer
   useEffect(() => {
     if (data?.trading?.lanes?.length) {
       const symbols = data.trading.lanes.map((l) => l.symbol);
@@ -63,13 +62,13 @@ export default function App() {
     }
   }, [data, selectedSymbol]);
 
-  if (loading || !splashDone) return <LoadingScreen />;
+  if (loading || !splashDone) return <LoadingScreen onReady={handleSplashReady} />;
 
   if (error && !data) {
     return (
       <div style={{ padding: 40, color: "var(--accent-red)", background: "var(--bg-base)", minHeight: "100vh" }}>
         <h2>Cannot connect to backend</h2>
-        <p style={{ color: "var(--text-secondary)" }}>Make sure the backend is running at http://localhost:5000</p>
+        <p style={{ color: "var(--text-secondary)" }}>Make sure the backend is running at http://localhost:5050</p>
         <p style={{ color: "var(--text-muted)", fontFamily: "monospace", fontSize: 12 }}>{error}</p>
         <button onClick={() => window.location.reload()}
           style={{ marginTop: 20, padding: "8px 16px", background: "var(--accent-cyan)", color: "#000", border: "none", cursor: "pointer", borderRadius: 8 }}>

@@ -1,5 +1,6 @@
 import React from 'react'
 import { Trade, TradesResponse, TradeSummary, EconomicEvent, fetchTrades, fetchTradesSummary } from '../services/api'
+import LoadingBar from './LoadingBar'
 
 const colors = {
   bg: '#0d1726',
@@ -210,6 +211,7 @@ const TradeHistoryPanel: React.FC<TradeHistoryPanelProps> = ({ calendar = [] }) 
   const [total, setTotal] = React.useState(0)
   const [offset, setOffset] = React.useState(0)
   const [summary, setSummary] = React.useState<TradeSummary | null>(null)
+  const [loading, setLoading] = React.useState(true)
 
   // Filters
   const [filterSymbol, setFilterSymbol] = React.useState('')
@@ -230,6 +232,7 @@ const TradeHistoryPanel: React.FC<TradeHistoryPanelProps> = ({ calendar = [] }) 
   }, [offset, filterSymbol, filterSide, filterOutcome, filterLane])
 
   const loadData = React.useCallback(async (resetOffset = false) => {
+    setLoading(true)
     const currentOffset = resetOffset ? 0 : offset
     const params = buildParams(currentOffset)
     if (resetOffset) {
@@ -252,6 +255,7 @@ const TradeHistoryPanel: React.FC<TradeHistoryPanelProps> = ({ calendar = [] }) 
     setTrades(tradesRes.trades)
     setTotal(tradesRes.total)
     setSummary(summaryRes)
+    setLoading(false)
   }, [buildParams, offset, filterSymbol, filterSide, filterOutcome, filterLane])
 
   // Initial load + auto-refresh every 15s
@@ -286,6 +290,7 @@ const TradeHistoryPanel: React.FC<TradeHistoryPanelProps> = ({ calendar = [] }) 
       <h2 style={{ margin: '0 0 16px', fontSize: 18, color: colors.cyan, fontWeight: 700 }}>
         Trade History — MT5
       </h2>
+      {loading && trades.length === 0 && <LoadingBar label="Loading trade history..." />}
       <div style={{ display: 'flex', gap: 16, alignItems: 'flex-start' }}>
       <div style={{ flex: 1, minWidth: 0 }}>
 

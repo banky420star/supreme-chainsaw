@@ -1,6 +1,7 @@
 import React from 'react'
 import { ModelBundle, fetchRegistry } from '../services/api'
 import TruthBadge from './TruthBadge'
+import LoadingBar from './LoadingBar'
 
 const colors = {
   bg: '#0d1726',
@@ -82,9 +83,7 @@ const RegistryPanel: React.FC = () => {
         Registry — Model Bundles
       </h2>
 
-      {loading && bundles.length === 0 && (
-        <div style={{ ...panelStyle, color: colors.muted }}>Loading registry...</div>
-      )}
+      {loading && bundles.length === 0 && <LoadingBar label="Loading registry..." />}
       {!loading && bundles.length === 0 && (
         <div style={{ ...panelStyle, color: colors.muted }}>
           No bundles in registry. The endpoint returned empty.

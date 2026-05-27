@@ -1,98 +1,196 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════════════════════
-# Chain Gambler Launcher
+# Chain Gambler macOS Launcher
 # Double-click to open Terminal and start the entire trading stack.
 # Close the Terminal window to stop all services.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 cd "$(dirname "$0")"
 
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# ── Source .env if present (MT5 credentials, tokens, etc.) ──
+if [ -f "$(pwd)/.env" ]; then
+    set -a
+    source "$(pwd)/.env"
+    set +a
+fi
 
-PROJECT_ROOT="$(pwd)"
-TMP_DIR="$PROJECT_ROOT/.tmp"
-WINEPREFIX="/Users/bank/Library/Application Support/net.metaquotes.wine.metatrader5"
-WINE_BIN="/Applications/MetaTrader 5.app/Contents/SharedSupport/wine/bin/wine64"
-VENV_PYTHON="$PROJECT_ROOT/.venv/bin/python"
-VENV_NPM="/opt/homebrew/bin/npm"
+# ── Colors ──
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+CYAN='\033[0;36m'
+NC='\033[0m'
 
-mkdir -p "$TMP_DIR"
-
-echo "[Chain Gambler] Starting trading stack..."
-
-# -- MT5 Wine RPyC Bridge ------------------------------------------------------
-if ! lsof -i :18812 | grep LISTEN >/dev/null 2>&1; then
-    echo "[Chain Gambler] Starting MT5 Wine bridge..."
-    export WINEPREFIX="$WINEPREFIX"
-    export WINEDEBUG=-all
-    export MT5_WINE_HOST=127.0.0.1
-    export MT5_WINE_PORT=18812
-    WINPY="C:\\winpython\\python.exe"
-    SCRIPT="$PROJECT_ROOT/tools/mt5_wine_server.py"
-    nohup "$WINE_BIN" "$WINPY" "$SCRIPT" > "$TMP_DIR/mt5_wine_server.log" 2>&1 &
-    sleep 6
-    if lsof -i :18812 | grep LISTEN >/dev/null 2>&1; then
-        echo "[Chain Gambler] MT5 bridge ready."
-    else
-        echo "[Chain Gambler] WARNING: MT5 bridge failed to start."
+# ── Find Python ──
+PYTHON=""
+for candidate in \
+    "$(pwd)/.venv312/bin/python" \
+    "$(pwd)/.venv/bin/python" \
+    "$(which python3)" \
+    "$(which python)"; do
+    if [ -x "$candidate" ]; then
+        PYTHON="$candidate"
+        break
     fi
-else
-    echo "[Chain Gambler] MT5 bridge already running."
+done
+
+if [ -z "$PYTHON" ]; then
+    echo -e "${RED}ERROR: Python not found. Install Python 3.12+ and create a venv.${NC}"
+    read -n 1 -s -r -p "Press any key to exit..."
+    exit 1
 fi
 
-# -- API Server ----------------------------------------------------------------
-if ! lsof -i :9090 | grep LISTEN >/dev/null 2>&1; then
-    echo "[Chain Gambler] Starting API server on 9090..."
-    cd "$PROJECT_ROOT"
-    export AGI_API_PORT=9090
-    nohup "$VENV_PYTHON" Python/api_server.py > "$TMP_DIR/api_server.log" 2>&1 &
-    sleep 2
-    echo "[Chain Gambler] API server started."
-else
-    echo "[Chain Gambler] API server already running."
+echo -e "${GREEN}Using Python: ${PYTHON}${NC}"
+"$PYTHON" --version
+
+# ── Install dependencies if needed ──
+if [ ! -d "$(pwd)/.venv312" ] && [ ! -d "$(pwd)/.venv" ]; then
+    echo -e "${YELLOW}No venv found. Creating one...${NC}"
+    "$PYTHON" -m venv "$(pwd)/.venv"
+    PYTHON="$(pwd)/.venv/bin/python"
+    "$PYTHON" -m pip install --upgrade pip
+    "$PYTHON" -m pip install -r "$(pwd)/requirements.txt"
 fi
 
-# -- Server_AGI ----------------------------------------------------------------
-if ! pgrep -f "Server_AGI" >/dev/null 2>&1; then
-    echo "[Chain Gambler] Starting Server_AGI in paper mode..."
-    cd "$PROJECT_ROOT"
-    export AGI_API_PORT=9090
-    export CHAIN_GAMBLER_EXECUTION_MODE=paper
-    export CHAIN_GAMBLER_ALLOW_LIVE=0
-    rm -f "$TMP_DIR/server_agi.lock"
-    nohup "$VENV_PYTHON" -m Python.Server_AGI > "$TMP_DIR/server_agi.log" 2>&1 &
-    sleep 4
-    echo "[Chain Gambler] Server_AGI started."
+# ── Environment ──
+export AGI_CONTROL_TOKEN=chain_gambler_2026
+export AGI_DEADZONE_CONFIDENCE=0.99
+export AGI_ACTION_THRESHOLD=0.0001
+export AGI_HIGH_VOL_MIN_ACTION=0.0001
+export AGI_LOW_VOL_MIN_ACTION=0.0001
+export AGI_MED_VOL_MIN_ACTION=0.0001
+export AGI_MIN_LOTS=0.02
+export AGI_RISK_PERCENT=1.0
+export AGI_TRADE_INTERVAL_SEC=30
+export AGI_NEG_TIMEOUT_MIN=60
+export AGI_TRAIL_INTERVAL_SEC=15
+export AGI_BIAS_WINDOW=50
+export AGI_BIAS_STRENGTH=0.5
+export AGI_EQUITY_POLL_SEC=15
+export AGI_MAX_POS_PER_SYMBOL=3
+export AGI_SL_COOLDOWN_MIN=3
+export AGI_HEARTBEAT_SEC=1800
+export CANARY_LOT_MULT=1.0
+export CANARY_MAX_LOSS_PCT=10
+export AGI_TRAIN_INTERVAL_HOURS=2
+
+# ── Kill old processes ──
+echo -e "${YELLOW}Cleaning up old processes...${NC}"
+pkill -9 -f "Server_AGI" 2>/dev/null || true
+pkill -9 -f "Python.api_server" 2>/dev/null || true
+pkill -9 -f "api_server.py" 2>/dev/null || true
+pkill -9 -f "vite.*4180" 2>/dev/null || true
+sleep 3
+
+# ── Remove stale lock files ──
+rm -f "$(pwd)/.tmp/server_agi.lock" "$(pwd)/.tmp/champion_cycle.lock" 2>/dev/null || true
+
+# ── Check ports ──
+check_port() {
+    local port=$1
+    if lsof -i :$port -P -n 2>/dev/null | grep -q LISTEN; then
+        echo -e "${YELLOW}WARNING: Port $port in use, killing...${NC}"
+        lsof -ti :$port 2>/dev/null | xargs kill -9 2>/dev/null || true
+        sleep 3
+    fi
+}
+check_port 5050
+check_port 4180
+sleep 2
+
+# ── Start Backend ──
+echo -e "${GREEN}Starting Backend Server (paper mode on Mac)...${NC}"
+echo "  Note: Live MT5 trading requires Windows. Mac runs in simulation mode."
+"$PYTHON" -m Python.Server_AGI &
+BACKEND_PID=$!
+echo "  Backend PID: $BACKEND_PID"
+
+# ── Start API Server ──
+echo -e "${GREEN}Starting API Server (port 5050)...${NC}"
+"$PYTHON" -m Python.api_server &
+API_PID=$!
+echo "  API PID: $API_PID"
+
+# ── Wait for backend ──
+echo -e "${YELLOW}Waiting for backend to load models (30s)...${NC}"
+sleep 30
+
+# ── Health check ──
+if curl -s http://localhost:5050/api/status > /dev/null 2>&1; then
+    echo -e "${GREEN}API Server is ONLINE${NC}"
 else
-    echo "[Chain Gambler] Server_AGI already running."
+    echo -e "${YELLOW}WARNING: API not responding yet, may need more time${NC}"
 fi
 
-# -- Frontend ------------------------------------------------------------------
-if ! lsof -i :5173 | grep LISTEN >/dev/null 2>&1; then
-    echo "[Chain Gambler] Starting frontend dev server..."
-    cd "$PROJECT_ROOT/frontend"
-    nohup "$VENV_NPM" run dev > "$TMP_DIR/frontend.log" 2>&1 &
-    sleep 3
-    echo "[Chain Gambler] Frontend ready."
+# ── Start Frontend ──
+echo -e "${GREEN}Starting UI Lab Frontend...${NC}"
+if [ -d "$(pwd)/ui_lab_app" ]; then
+    cd "$(pwd)/ui_lab_app"
+    if [ -d "node_modules" ]; then
+        npm run dev -- --host 0.0.0.0 --port 4180 &
+        FRONTEND_PID=$!
+        echo "  Frontend PID: $FRONTEND_PID"
+    else
+        echo -e "${YELLOW}Installing frontend dependencies...${NC}"
+        npm install
+        npm run dev -- --host 0.0.0.0 --port 4180 &
+        FRONTEND_PID=$!
+    fi
+    cd "$(dirname "$0")"
 else
-    echo "[Chain Gambler] Frontend already running."
+    echo -e "${YELLOW}No ui_lab_app directory found, skipping frontend.${NC}"
 fi
 
-echo "[Chain Gambler] Opening dashboard..."
-open "http://localhost:5173/app/"
+sleep 5
 
-echo "[Chain Gambler] All systems go. Press Ctrl+C or close this window to stop."
+echo ""
+echo -e "${GREEN}============================================${NC}"
+echo -e "${GREEN} All systems launched! CHAIN GAMBLER ACTIVE${NC}"
+echo -e "${GREEN}============================================${NC}"
+echo ""
+echo "  Backend API : http://localhost:5050/api/status"
+echo "  Frontend UI : http://localhost:4180/"
+echo "  Emergency stop:"
+echo "  curl -X POST http://localhost:5050/api/control -H 'Content-Type: application/json' -H 'X-Control-Token: chain_gambler_2026' -d '{\"action\":\"emergency_stop\"}'"
+echo ""
+echo "  Close this Terminal window to stop all services."
 
-# Health-check loop: restart Server_AGI if it dies
+# ── Auto-open browser in app mode ──
+sleep 2
+APP_URL="http://localhost:4180"
+if [ -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ]; then
+    open -na "Google Chrome" --args --app="$APP_URL" --window-size=1400,900 &
+elif [ -x "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser" ]; then
+    open -na "Brave Browser" --args --app="$APP_URL" --window-size=1400,900 &
+else
+    open "$APP_URL" &
+fi
+
+# ── Graceful shutdown ──
+cleanup() {
+    echo ""
+    echo -e "${YELLOW}Shutting down...${NC}"
+    kill $BACKEND_PID 2>/dev/null || true
+    kill $API_PID 2>/dev/null || true
+    kill $FRONTEND_PID 2>/dev/null || true
+    pkill -f "Server_AGI" 2>/dev/null || true
+    pkill -f "api_server" 2>/dev/null || true
+    pkill -f "vite.*4180" 2>/dev/null || true
+    echo -e "${GREEN}All services stopped.${NC}"
+    exit 0
+}
+
+trap cleanup SIGINT SIGTERM
+
+# ── Health-check loop: restart dead services ──
 while true; do
     /bin/sleep 10
-    if ! pgrep -f "Server_AGI" >/dev/null 2>&1; then
-        echo "[Chain Gambler] Server_AGI died -- restarting..."
-        cd "$PROJECT_ROOT"
-        export AGI_API_PORT=9090
-        export CHAIN_GAMBLER_EXECUTION_MODE=paper
-        export CHAIN_GAMBLER_ALLOW_LIVE=0
-        rm -f "$TMP_DIR/server_agi.lock"
-        nohup "$VENV_PYTHON" -m Python.Server_AGI > "$TMP_DIR/server_agi.log" 2>&1 &
+    if ! pgrep -f "Server_AGI" > /dev/null 2>&1; then
+        echo -e "${YELLOW}[Health Check] Server_AGI died -- restarting...${NC}"
+        "$PYTHON" -m Python.Server_AGI &
+    fi
+    if ! pgrep -f "api_server" > /dev/null 2>&1; then
+        echo -e "${YELLOW}[Health Check] API server died -- restarting...${NC}"
+        "$PYTHON" -m Python.api_server &
     fi
 done

@@ -2,6 +2,7 @@ import React from 'react'
 import { StatusPayload } from '../types'
 import { Trade, TradeSummary, fetchTrades, fetchTradesSummary, fetchEquityCurve, EquityCurveResponse } from '../services/api'
 import EquityChart from './EquityChart'
+import LoadingBar from './LoadingBar'
 
 interface Props {
   status: StatusPayload
@@ -91,15 +92,18 @@ const DashboardPanel: React.FC<Props> = ({ status }) => {
   const [recentTrades, setRecentTrades] = React.useState<Trade[]>([])
   const [equityCurve, setEquityCurve] = React.useState<EquityCurveResponse | null>(null)
   const [equityWindow, setEquityWindow] = React.useState<'30d' | '90d' | 'all'>('all')
+  const [loading, setLoading] = React.useState(true)
 
   React.useEffect(() => {
     const loadTradeData = async () => {
+      setLoading(true)
       const [summaryRes, tradesRes] = await Promise.all([
         fetchTradesSummary().catch((): TradeSummary => ({ overall: {} as any, by_symbol: {} })),
         fetchTrades({ limit: '5' }).catch(() => ({ trades: [] as Trade[], total: 0, limit: 5, offset: 0 })),
       ])
       setTradeSummary(summaryRes)
       setRecentTrades(tradesRes.trades)
+      setLoading(false)
     }
     loadTradeData()
     const interval = setInterval(loadTradeData, 15_000)
@@ -127,6 +131,7 @@ const DashboardPanel: React.FC<Props> = ({ status }) => {
 
   return (
     <div style={{ background: colors.bg, color: colors.text, padding: 20 }}>
+      {loading && <LoadingBar label="Loading dashboard..." />}
       {/* KPI Grid */}
       <div
         style={{

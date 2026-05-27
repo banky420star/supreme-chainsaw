@@ -21,6 +21,9 @@ class RiskEngine:
         self.max_daily_losing_trades_per_symbol = int(risk_cfg.get("max_daily_losing_trades_per_symbol", 10))
         self.max_lots = float(risk_cfg.get("max_lots", 1.0))
 
+        # Kelly fraction: default Quarter-Kelly (0.25) for safety
+        self.kelly_fraction = float(trading_cfg.get("kelly_fraction", 0.25))
+
         # Default symbol profile used when a symbol-specific profile does not exist.
         self.default_symbol_profile = {
             "entry_deviation": int(trading_cfg.get("entry_deviation", 20)),
@@ -99,16 +102,20 @@ class RiskEngine:
     def can_trade(self, symbol=None):
         self.maybe_roll_day()
         if self.halt:
-            logger.debug(f"RiskEngine: trade blocked — halt ({self._halt_reason})")
+            logger.warning(f"RiskEngine: trade blocked — halt ({getattr(self, '_halt_reason', 'unknown')})")
             return False
         if self.daily_trades >= self.max_daily_trades:
-            logger.debug(f"RiskEngine: trade blocked — daily trade limit ({self.daily_trades}/{self.max_daily_trades})")
+            logger.warning(f"RiskEngine: trade blocked — daily trade limit ({self.daily_trades}/{self.max_daily_trades})")
             return False
         if symbol:
             key = str(symbol)
-            if int(self.daily_trades_by_symbol.get(key, 0)) >= self.max_daily_trades_per_symbol:
+            ds = int(self.daily_trades_by_symbol.get(key, 0))
+            dl = int(self.daily_losing_trades_by_symbol.get(key, 0))
+            if ds >= self.max_daily_trades_per_symbol:
+                logger.warning(f"RiskEngine: trade blocked — symbol trade limit ({key}: {ds}/{self.max_daily_trades_per_symbol})")
                 return False
-            if int(self.daily_losing_trades_by_symbol.get(key, 0)) >= self.max_daily_losing_trades_per_symbol:
+            if dl >= self.max_daily_losing_trades_per_symbol:
+                logger.warning(f"RiskEngine: trade blocked — symbol losing trade limit ({key}: {dl}/{self.max_daily_losing_trades_per_symbol})")
                 return False
         return True
 

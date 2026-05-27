@@ -1,6 +1,7 @@
 import React from 'react'
 import { EvidenceArtifact, fetchEvidence } from '../services/api'
 import TruthBadge from './TruthBadge'
+import LoadingBar from './LoadingBar'
 
 const colors = {
   bg: '#0d1726',
@@ -77,9 +78,7 @@ const EvidenceLockerPanel: React.FC = () => {
         Evidence Locker
       </h2>
 
-      {loading && artifacts.length === 0 && (
-        <div style={{ ...panelStyle, color: colors.muted }}>Loading evidence locker...</div>
-      )}
+      {loading && artifacts.length === 0 && <LoadingBar label="Loading evidence locker..." />}
       {!loading && artifacts.length === 0 && (
         <div style={{ ...panelStyle, color: colors.muted }}>
           No artifacts in evidence locker. The endpoint returned empty.

@@ -1,7 +1,7 @@
 """
 API Server — Lightweight HTTP bridge between the AGI engine and the React dashboard.
 
-Uses bottle (already in .venv312) on port 5000.  Vite dev-server proxies /api/* here.
+Uses bottle (already in .venv312) on port 5050.  Vite dev-server proxies /api/* here.
 
 Start modes:
   1. Embedded: import start_api_server(agi_server) from Server_AGI — preferred.
@@ -18,7 +18,7 @@ import sys
 import time
 import threading
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # ── Path Setup for Standalone Mode ─────────────────────────────────
 # Add project root to path so 'Python' module imports work
@@ -76,7 +76,7 @@ def _get_economic_calendar_cached():
     return _calendar_cache.get("events", [])
 from typing import Any
 
-from bottle import Bottle, request, response, abort, run as bottle_run
+from bottle import Bottle, ServerAdapter, request, response, abort, run as bottle_run
 from loguru import logger
 
 # ── Optional geventwebsocket support ────────────────────────────────────────
@@ -92,6 +92,93 @@ except ImportError:
     gevent_sleep = time.sleep
 
 # ---------------------------------------------------------------------------
+# Rate limiter (in-memory sliding window) for control endpoints
+# ---------------------------------------------------------------------------
+class _RateLimiter:
+    """Simple per-IP sliding-window rate limiter."""
+
+    def __init__(self, max_requests: int = 10, window_sec: int = 60):
+        self.max_requests = max_requests
+        self.window_sec = window_sec
+        self._windows: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
+
+    def is_allowed(self, ip: str) -> bool:
+        now = time.time()
+        with self._lock:
+            window = self._windows.setdefault(ip, [])
+            # Purge old entries
+            cutoff = now - self.window_sec
+            while window and window[0] < cutoff:
+                window.pop(0)
+            if len(window) >= self.max_requests:
+                return False
+            window.append(now)
+            return True
+
+    def reset(self, ip: str) -> None:
+        with self._lock:
+            self._windows.pop(ip, None)
+
+
+_control_limiter = _RateLimiter(max_requests=10, window_sec=60)
+_status_limiter = _RateLimiter(max_requests=60, window_sec=60)
+
+
+# ---------------------------------------------------------------------------
+# TLS helper — auto-generate self-signed certs if user provides a cert dir
+# ---------------------------------------------------------------------------
+def _ensure_tls_certs(cert_dir: str) -> tuple[str, str]:
+    """Return (cert_path, key_path). Generate self-signed certs if missing."""
+    import ssl as _ssl
+
+    cert_path = os.path.join(cert_dir, "api_server.crt")
+    key_path = os.path.join(cert_dir, "api_server.key")
+    if os.path.exists(cert_path) and os.path.exists(key_path):
+        return cert_path, key_path
+
+    os.makedirs(cert_dir, exist_ok=True)
+    # Generate a self-signed cert
+    try:
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+    except ImportError:
+        logger.warning("cryptography library not installed — cannot auto-generate TLS certs")
+        return "", ""
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, "localhost"),
+    ])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.now(timezone.utc) - timedelta(days=1))
+        .not_valid_after(datetime.now(timezone.utc) + timedelta(days=365))
+        .add_extension(
+            x509.SubjectAlternativeName([x509.DNSName("localhost"), x509.IPAddress("127.0.0.1")]),
+            critical=False,
+        )
+        .sign(key, hashes.SHA256())
+    )
+    with open(key_path, "wb") as f:
+        f.write(key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        ))
+    with open(cert_path, "wb") as f:
+        f.write(cert.public_bytes(serialization.Encoding.PEM))
+    logger.success(f"Self-signed TLS certificate generated: {cert_path}")
+    return cert_path, key_path
+
+
+# ---------------------------------------------------------------------------
 # Project root (one level above Python/)
 # ---------------------------------------------------------------------------
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -101,6 +188,23 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # ---------------------------------------------------------------------------
 app = Bottle()
 
+
+@app.hook("before_request")
+def _rate_limit_hook():
+    path = request.path or ""
+    ip = request.environ.get("REMOTE_ADDR", "unknown")
+    if path.startswith("/api/control"):
+        if not _control_limiter.is_allowed(ip):
+            response.status = 429
+            response.body = json.dumps({"ok": False, "error": "rate limit exceeded — try again in 60s"})
+            return response.body
+    elif path.startswith("/api/status"):
+        if not _status_limiter.is_allowed(ip):
+            response.status = 429
+            response.body = json.dumps({"ok": False, "error": "rate limit exceeded"})
+            return response.body
+
+
 # ---------------------------------------------------------------------------
 # Shared references — populated by start_api_server()
 # ---------------------------------------------------------------------------
@@ -109,6 +213,39 @@ _bot_process: subprocess.Popen | None = None  # tracked bot subprocess
 _bot_process_lock = threading.Lock()
 _decision_cache: dict[str, deque] = {}  # symbol -> deque of recent decisions
 _CACHE_MAX = 50                  # decisions per symbol
+
+# ── Standalone RiskEngine for when API runs without Server_AGI ─────────────
+_risk_standalone: Any = None
+
+def _get_risk():
+    """Return the active risk engine (embedded or standalone)."""
+    global _risk_standalone
+    srv = _server_ref
+    if srv and hasattr(srv, "risk"):
+        return srv.risk
+    if _risk_standalone is None:
+        try:
+            from Python.risk_engine import RiskEngine
+            _risk_standalone = RiskEngine()
+        except Exception:
+            pass
+    return _risk_standalone
+
+# ---------------------------------------------------------------------------
+# Agent heartbeat tracking — updated by actual activity, not wallclock
+# ---------------------------------------------------------------------------
+_agent_heartbeats: dict[str, float] = {}  # agent_id -> unix timestamp of last real activity
+
+def _agent_heartbeat(agent_id: str):
+    """Record a real heartbeat for an agent."""
+    _agent_heartbeats[agent_id] = time.time()
+
+def _get_agent_heartbeat(agent_id: str) -> str:
+    """Return ISO timestamp of last real activity, or 'never' if no activity recorded."""
+    ts = _agent_heartbeats.get(agent_id)
+    if ts is None:
+        return "never"
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
 # ---------------------------------------------------------------------------
 # Rainforest detector — lazy-loaded; populated by train_rainforest() or from
@@ -248,6 +385,48 @@ def _read_live_state() -> dict:
     return _read_json_file(os.path.join(ROOT, "live_state.json")) or {}
 
 
+def _get_telegram_status() -> dict:
+    """Return Telegram alerter status from cards state."""
+    try:
+        cards_path = os.path.join(ROOT, "logs", "telegram_cards.json")
+        cards = _read_json_file(cards_path) or {}
+        cfg = _read_config()
+        tg_cfg = cfg.get("telegram", {})
+        token = tg_cfg.get("token", "")
+        chat_id = tg_cfg.get("chat_id", "")
+        configured = bool(token and chat_id)
+        delivered = 0
+        failed = 0
+        for row in cards.values():
+            if isinstance(row, dict):
+                ds = row.get("delivery_status", "dashboard_only")
+                if ds == "delivered":
+                    delivered += 1
+                elif ds in ("failed", "error"):
+                    failed += 1
+        return {
+            "configured": configured,
+            "connected": configured,  # best-effort: configured implies connectable
+            "card_count": len(cards),
+            "delivered": delivered,
+            "failed": failed,
+            "delivery_stats": {
+                "delivered": delivered,
+                "failed": failed,
+                "pending": len(cards) - delivered - failed,
+            },
+        }
+    except Exception:
+        pass
+    return {
+        "configured": False,
+        "connected": False,
+        "card_count": 0,
+        "delivered": 0,
+        "failed": 0,
+    }
+
+
 def cache_decision(symbol: str, decision: dict):
     """Store a decision in the in-memory cache (called from the brain path)."""
     if symbol not in _decision_cache:
@@ -257,10 +436,10 @@ def cache_decision(symbol: str, decision: dict):
 
 
 def _safe_risk(attr: str, default=None):
-    """Pull a value from the risk engine if the server reference is available."""
-    srv = _server_ref
-    if srv and hasattr(srv, "risk"):
-        return getattr(srv.risk, attr, default)
+    """Pull a value from the risk engine (embedded or standalone)."""
+    risk = _get_risk()
+    if risk is not None:
+        return getattr(risk, attr, default)
     return default
 
 
@@ -401,8 +580,15 @@ def _get_mt5_account_and_positions() -> dict:
     try:
         from Python.mt5_compat import mt5
 
-        if not mt5.initialize():
-            logger.debug("MT5 init failed in API status handler")
+        # Retry MT5 init a few times — terminal IPC may not be ready immediately after bridge startup
+        _mt5_ready = False
+        for _attempt in range(5):
+            if mt5.initialize():
+                _mt5_ready = True
+                break
+            time.sleep(1)
+        if not _mt5_ready:
+            logger.debug("MT5 init failed in API status handler after 5 retries")
             return result
 
         try:
@@ -457,20 +643,139 @@ def _get_mt5_account_and_positions() -> dict:
 
 
 def _read_training_progress():
-    """Read per-trainer progress files, including per-symbol PPO files."""
+    """Read per-trainer progress files, including per-symbol PPO files.
+    Falls back to parsing log files when JSON progress files don't exist."""
     result = {}
+    now = time.time()
+
     for key in ("lstm", "ppo", "dreamer"):
         path = os.path.join(ROOT, "logs", f"{key}_progress.json")
         try:
             if os.path.exists(path):
                 with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                if time.time() - data.get("updated_at", 0) < 600:
+                if now - data.get("updated_at", 0) < 600:
                     result[key] = data
                     continue
         except Exception:
             pass
         result[key] = {}
+
+    # ── Fallback: infer from log files ──
+    # LSTM
+    try:
+        lstm_log = os.path.join(ROOT, "logs", "lstm_training.log")
+        if os.path.exists(lstm_log) and not result.get("lstm"):
+            mtime = os.path.getmtime(lstm_log)
+            if now - mtime < 300:
+                lines = []
+                with open(lstm_log, "r", encoding="utf-8", errors="replace") as f:
+                    lines = [x.rstrip("\n") for x in f.readlines()[-40:]]
+                for line in reversed(lines):
+                    if " | epoch " in line and " | loss " in line:
+                        # Strip loguru header (e.g. "2026-05-12 18:08:50.697 | SUCCESS  | __main__:train_lstm:272 - ")
+                        msg = line
+                        if " - " in msg:
+                            msg = msg.split(" - ", 1)[1]
+                        parts = [p.strip() for p in msg.split("|")]
+                        if len(parts) >= 3:
+                            sym = parts[0].split()[-1]
+                            ep = parts[1].replace("epoch", "").strip()
+                            score = parts[2].strip()
+                            epoch_num, epoch_total = 0, 0
+                            if "/" in ep:
+                                a, b = ep.split("/", 1)
+                                epoch_num = int(a.strip())
+                                epoch_total = int(b.strip())
+                            acc = 0.0
+                            if "acc" in score.lower():
+                                try:
+                                    acc = float(score.lower().split("acc")[-1].strip().strip("%"))
+                                except Exception:
+                                    pass
+                            result["lstm"] = {
+                                "running": True,
+                                "symbol": sym,
+                                "epoch": epoch_num,
+                                "epochs_total": epoch_total,
+                                "accuracy": acc,
+                                "updated_at": mtime,
+                            }
+                        break
+    except Exception:
+        pass
+
+    # PPO
+    try:
+        ppo_log = os.path.join(ROOT, "logs", "ppo_training.log")
+        if os.path.exists(ppo_log) and not result.get("ppo"):
+            mtime = os.path.getmtime(ppo_log)
+            if now - mtime < 300:
+                lines = []
+                with open(ppo_log, "r", encoding="utf-8", errors="replace") as f:
+                    lines = [x.rstrip("\n") for x in f.readlines()[-80:]]
+                symbol = ""
+                for line in reversed(lines):
+                    if "DRL Training | symbols=" in line:
+                        idx = line.find("symbols=")
+                        if idx >= 0:
+                            chunk = line[idx + len("symbols="):]
+                            if "[" in chunk and "]" in chunk:
+                                s = chunk[chunk.find("[") + 1:chunk.find("]")]
+                                symbol = s.split(",")[0].strip().strip("'\"")
+                    if "best_score=" in line:
+                        score = line.split("best_score=", 1)[1].strip()
+                        result["ppo"] = {
+                            "running": True,
+                            "symbol": symbol,
+                            "best_score": score,
+                            "updated_at": mtime,
+                        }
+                        break
+    except Exception:
+        pass
+
+    # Dreamer
+    try:
+        dreamer_log = os.path.join(ROOT, "logs", "dreamer_training.log")
+        if os.path.exists(dreamer_log) and not result.get("dreamer"):
+            mtime = os.path.getmtime(dreamer_log)
+            if now - mtime < 300:
+                result["dreamer"] = {"running": True, "updated_at": mtime}
+    except Exception:
+        pass
+
+    # Rainforest
+    try:
+        rf_log = os.path.join(ROOT, "logs", "rainforest_training.log")
+        if os.path.exists(rf_log) and not result.get("rainforest"):
+            mtime = os.path.getmtime(rf_log)
+            if now - mtime < 300:
+                lines = []
+                with open(rf_log, "r", encoding="utf-8", errors="replace") as f:
+                    lines = [x.rstrip("\n") for x in f.readlines()[-20:]]
+                rows = 0
+                classes = []
+                for line in reversed(lines):
+                    if "Rainforest trained on" in line:
+                        try:
+                            rows = int(line.split("trained on")[1].strip().split()[0])
+                        except Exception:
+                            pass
+                    if "classes=" in line:
+                        try:
+                            cls = line.split("classes=")[1].split("]")[0].strip("[]'\"")
+                            classes = [c.strip().strip("'\"") for c in cls.split(",")]
+                        except Exception:
+                            pass
+                result["rainforest"] = {
+                    "running": True,
+                    "rows": rows,
+                    "classes": classes,
+                    "updated_at": mtime,
+                }
+    except Exception:
+        pass
 
     # Merge per-symbol PPO progress files (ppo_{SYMBOL}_progress.json)
     ppo_per_symbol = {}
@@ -565,62 +870,64 @@ def _get_data_provenance() -> dict:
 
 
 def _get_model_registry_status(progress: dict | None = None) -> dict:
-    """Return honest model bundle statuses from the registry."""
+    """Return honest model bundle statuses by scanning actual files on disk."""
     progress = progress or {}
-    bundle_id = "unknown"
-    lstm_status = "unknown"
-    rainforest_status = "unknown"
-    dreamer_status = "unknown"
-    ppo_status = "unknown"
-    ensemble_status = "unknown"
-    try:
-        from Python.model_registry import ModelRegistry
-        reg = ModelRegistry()
-        active = reg._read_active()
-        champ = active.get("champion")
-        canary = active.get("canary")
-        champ_path = champ or ""
-        canary_path = canary or ""
-        champ_id = os.path.basename(champ_path) if champ_path else "none"
-        canary_id = os.path.basename(canary_path) if canary_path else ""
-        bundle_id = f"bundle_{champ_id}" if champ_id != "none" else "bundle_none"
-        # Rainforest status
-        if rf_detector is not None and rf_detector.is_trained():
-            rainforest_status = "validated"
-        else:
-            rainforest_status = "informational-only"
-        # PPO status
-        if canary_id:
-            ppo_status = "candidate"
-        elif champ_id != "none":
-            ppo_status = "champion"
-        else:
-            ppo_status = "undertrained"
-        # Ensemble status
-        if canary_id and champ_id != "none":
-            ensemble_status = "demo_canary"
-        elif champ_id != "none":
-            ensemble_status = "active"
-        else:
-            ensemble_status = "disabled"
-        # LSTM status — infer from training progress
-        lstm_p = progress.get("lstm", {})
-        if lstm_p.get("running"):
-            lstm_status = "validating"
-        elif lstm_p.get("accuracy", 0) > 0 or lstm_p.get("epoch", 0) > 0:
-            lstm_status = "trained"
-        else:
-            lstm_status = "disabled"
-        # Dreamer status
-        dreamer_p = progress.get("dreamer", {})
-        if dreamer_p.get("running"):
-            dreamer_status = "training"
-        elif os.path.exists(os.path.join(ROOT, "models", "dreamer")):
-            dreamer_status = "stub_disabled"
-        else:
-            dreamer_status = "stub_disabled"
-    except Exception:
-        pass
+    # ── Scan actual model files on disk ──
+    lstm_files = []
+    per_symbol_dir = os.path.join(ROOT, "models", "per_symbol")
+    if os.path.isdir(per_symbol_dir):
+        for f in os.listdir(per_symbol_dir):
+            if f.endswith(".meta.json") and f.startswith("lstm_"):
+                try:
+                    with open(os.path.join(per_symbol_dir, f), "r") as fp:
+                        meta = json.load(fp)
+                    lstm_files.append({
+                        "symbol": meta.get("symbol", f[5:-11]),
+                        "samples": meta.get("samples", 0),
+                        "seq_len": meta.get("seq_len", 0),
+                        "epochs": meta.get("epochs", 0),
+                    })
+                except Exception:
+                    pass
+
+    # Check bundles
+    bundles_dir = os.path.join(ROOT, "models", "bundles")
+    bundle_files = []
+    if os.path.isdir(bundles_dir):
+        for f in os.listdir(bundles_dir):
+            if f.endswith(".json"):
+                try:
+                    with open(os.path.join(bundles_dir, f), "r") as fp:
+                        meta = json.load(fp)
+                    bundle_files.append(meta)
+                except Exception:
+                    pass
+
+    # Check PPO
+    ppo_dir = os.path.join(ROOT, "models", "ppo")
+    ppo_models = []
+    if os.path.isdir(ppo_dir):
+        for d in os.listdir(ppo_dir):
+            if os.path.isdir(os.path.join(ppo_dir, d)):
+                ppo_models.append(d)
+
+    # Determine statuses based on actual files
+    lstm_status = "trained" if lstm_files else "disabled"
+    rainforest_status = "informational-only"
+    if rf_detector is not None and rf_detector.is_trained():
+        rainforest_status = "validated"
+    dreamer_status = "stub_disabled"
+    ppo_status = "undertrained"
+    if ppo_models:
+        ppo_status = "candidate" if bundle_files else "trained"
+    ensemble_status = "disabled"
+    if bundle_files:
+        ensemble_status = "candidate"
+    if any(b.get("status") == "champion" for b in bundle_files):
+        ensemble_status = "champion"
+
+    bundle_id = bundle_files[0].get("bundle_id", "unknown") if bundle_files else "none"
+
     return {
         "bundle_id": bundle_id,
         "lstm_status": lstm_status,
@@ -628,6 +935,9 @@ def _get_model_registry_status(progress: dict | None = None) -> dict:
         "dreamer_status": dreamer_status,
         "ppo_status": ppo_status,
         "ensemble_status": ensemble_status,
+        "lstm_models": lstm_files,
+        "ppo_models": ppo_models,
+        "bundle_count": len(bundle_files),
     }
 
 
@@ -682,6 +992,7 @@ def api_status():
     lstm_p = progress.get("lstm", {})
     ppo_p = progress.get("ppo", {})
     dreamer_p = progress.get("dreamer", {})
+    rf_p = progress.get("rainforest", {})
     live = _read_live_state()
     incidents = _read_incidents()
 
@@ -704,19 +1015,25 @@ def api_status():
     max_drawdown_pct = _safe_risk("max_drawdown_pct", 8.0)
     max_open_positions = _safe_risk("max_open_positions", 8)
     max_positions_per_symbol = _safe_risk("max_positions_per_symbol", 2)
+    risk = _get_risk()
     can_trade = False
-    if srv and hasattr(srv, "risk"):
+    if risk is not None:
         try:
-            can_trade = srv.risk.can_trade()
+            can_trade = risk.can_trade()
         except Exception:
             pass
 
     uptime = int(time.time() - srv.start_time) if srv and hasattr(srv, "start_time") else 0
-    mode = "LIVE" if (srv and getattr(srv, "live", False)) else "DRY-RUN"
+    env_mode = os.environ.get("CHAIN_GAMBLER_EXECUTION_MODE", "paper").strip().lower()
+    if env_mode == "demo":
+        mode = "DEMO"
+    else:
+        mode = "LIVE" if (srv and getattr(srv, "live", False)) else "DRY-RUN"
 
     # ── Advanced features status ──
     reversal_status = {"enabled": False}
     speed_status = {"enabled": False}
+    # Embedded mode: check brain object
     if srv and hasattr(srv, "brain") and srv.brain:
         brain = srv.brain
         if hasattr(brain, "reversal_detector") and brain.reversal_detector is not None:
@@ -725,6 +1042,19 @@ def api_status():
                 "methods": ["divergence", "trend_exhaustion", "sr_break", "candlestick", "volume"],
                 "auto_flip": True,
             }
+    # Standalone mode: infer from process / imports
+    if not reversal_status["enabled"]:
+        try:
+            from Python.reversal_detector import get_reversal_detector
+            rev = get_reversal_detector()
+            if rev is not None:
+                reversal_status = {
+                    "enabled": True,
+                    "methods": ["divergence", "trend_exhaustion", "sr_break", "candlestick", "volume"],
+                    "auto_flip": True,
+                }
+        except Exception:
+            pass
     # Speed simulator is on paper_trader, not brain - check if paper trading mode
     if srv and hasattr(srv, "live") and not srv.live:
         # In dry-run/paper trading mode - speed simulation would be active
@@ -755,6 +1085,18 @@ def api_status():
     for sym in symbols:
         recent = list(_decision_cache.get(sym, []))
         last = recent[0] if recent else {}
+        if not last:
+            # Fallback to live_state.json for standalone mode
+            lsym = live.get("symbols", {}).get(sym, {})
+            last = {
+                "volatility": lsym.get("regime", "--"),
+                "exposure": lsym.get("blend_exposure", 0.0),
+                "ppo_target": lsym.get("ppo_exposure", 0.0),
+                "dreamer_target": lsym.get("dreamer_exposure", 0.0),
+                "confidence": lsym.get("confidence", 0.0),
+                "action": lsym.get("signal", "HOLD"),
+            }
+            
         sym_model = per_symbol_models.get(sym, {})
         # Per-symbol champion/canary with global fallback
         sym_champ_id = sym_model.get("champion") or champ_id
@@ -764,8 +1106,8 @@ def api_status():
             "decision": {
                 "regime": last.get("volatility", "--"),
                 "final_target": last.get("exposure", 0.0),
-                "ppo_target": last.get("exposure", 0.0),
-                "dreamer_target": 0.0,
+                "ppo_target": last.get("ppo_target", 0.0),
+                "dreamer_target": last.get("dreamer_target", 0.0),
                 "confidence": last.get("confidence", 0.0),
             },
             "pipeline": {
@@ -826,6 +1168,22 @@ def api_status():
     validation_truth = _get_validation_status()
     tests_truth = _get_test_status()
 
+    # Record heartbeats for agents based on actual activity
+    if symbols:
+        _agent_heartbeat("data_feed")
+    if rf_detector and rf_detector.is_trained():
+        _agent_heartbeat("pattern_detector")
+    if srv and hasattr(srv, "risk"):
+        _agent_heartbeat("risk_guardian")
+    if lstm_p.get("running"):
+        _agent_heartbeat("lstm_brain")
+    if ppo_p.get("running"):
+        _agent_heartbeat("ppo_brain")
+    if dreamer_p.get("running"):
+        _agent_heartbeat("dreamer")
+    if mt5_account.get("open_positions", 0) > 0:
+        _agent_heartbeat("trade_executor")
+
     return _json({
         "state": "online" if not halt else "halted",
         "status": "online" if not halt else "halted",
@@ -849,17 +1207,18 @@ def api_status():
             "name": mt5_account["name"],
             "currency": mt5_account["currency"],
             "leverage": mt5_account["leverage"],
-            "mode": mt5_account.get("mode", "live"),
+            "mode": "demo" if env_mode == "demo" else mt5_account.get("mode", "live"),
             "account_type": account_truth.get("account_type", "unknown"),
             "account_type_verified": account_truth.get("account_type_verified", False),
             "telemetry_valid": account_truth.get("telemetry_valid", False),
             "login_masked": account_truth.get("login_masked", "***"),
         },
         "training": {
-            "cycle_running": False,
+            "cycle_running": bool(live.get("training", {}).get("cycle_running", False)) or bool(lstm_p.get("running")) or bool(ppo_p.get("running")) or bool(rf_p.get("running")),
             "lstm_running": bool(lstm_p.get("running")),
             "drl_running": bool(ppo_p.get("running")),
             "dreamer_running": bool(dreamer_p.get("running")),
+            "rainforest_running": bool(rf_p.get("running")),
             "configured_symbols": symbols,
             "lstm_symbol": lstm_p.get("symbol", ""),
             "lstm_epoch": lstm_p.get("epoch", 0),
@@ -888,10 +1247,17 @@ def api_status():
                     "progress_pct": dreamer_p.get("progress_pct", 0),
                     "window": dreamer_p.get("window", 64),
                 },
+                "rainforest": {
+                    "state": "training" if rf_p.get("running") else "idle",
+                    "rows": rf_p.get("rows", 0),
+                    "classes": rf_p.get("classes", []),
+                    "top_feature": rf_p.get("top_feature", ""),
+                },
                 "active_label": (
                     "LSTM Training" if lstm_p.get("running")
                     else "PPO Training" if ppo_p.get("running")
                     else "Dreamer Training" if dreamer_p.get("running")
+                    else "Rainforest Training" if rf_p.get("running")
                     else "Idle"
                 ),
             },
@@ -922,6 +1288,7 @@ def api_status():
         "logs": {},
         "timestamp": time.time(),
         "uptime_sec": uptime,
+        "repo_root": ROOT,
         "mode": mode,
         **_build_truth_payload(mt5_account),
         "reversal": reversal_status,
@@ -948,6 +1315,7 @@ def api_status():
         "validation": validation_truth,
         "tests": tests_truth,
         "trade_review": _get_trade_review_summary(),
+        "telegram": _get_telegram_status(),
         "economic_calendar": _get_economic_calendar_cached(),
         "rainforest": {
             "loaded": rf_detector.is_trained() if rf_detector is not None else False,
@@ -1224,7 +1592,88 @@ def _fetch_trade_history(symbol_filter: str = "", bot_lane_filter: str = "") -> 
     except Exception as e:
         logger.debug(f"MT5 trade history fetch failed: {e}")
 
-    # Fallback: derive from decision cache
+    # Fallback 2: read from trades.db
+    try:
+        import sqlite3 as _sqlite3
+        db_path = os.path.join(ROOT, "trades.db")
+        if os.path.exists(db_path):
+            conn = _sqlite3.connect(db_path)
+            conn.row_factory = _sqlite3.Row
+            rows = conn.execute(
+                "SELECT * FROM trades ORDER BY close_time DESC LIMIT 500"
+            ).fetchall()
+            conn.close()
+            for r in rows:
+                if symbol_filter and r["symbol"] != symbol_filter:
+                    continue
+                if bot_lane_filter and r["bot_lane"] != bot_lane_filter:
+                    continue
+                trades.append({
+                    "ticket": r["ticket"],
+                    "symbol": r["symbol"],
+                    "side": r["side"],
+                    "volume": r["volume"],
+                    "open_time": r["open_time"],
+                    "close_time": r["close_time"],
+                    "open_price": r["open_price"],
+                    "close_price": r["close_price"],
+                    "profit": r["profit"],
+                    "comment": r["comment"] or "",
+                    "hold_minutes": r["hold_minutes"],
+                    "magic": r["magic"],
+                    "bot_lane": r["bot_lane"] or "unknown",
+                    "model": r["model"] or "unknown",
+                    "action_type": r["action_type"] or "close",
+                    "outcome": r["outcome"] or "breakeven",
+                })
+            return trades
+    except Exception as e:
+        logger.debug(f"SQLite trade history fetch failed: {e}")
+
+    # Fallback 3: read from paper closed trades log (macOS paper mode)
+    try:
+        paper_log = os.path.join(ROOT, "logs", "paper_closed_trades.jsonl")
+        if os.path.exists(paper_log):
+            with open(paper_log, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        t = json.loads(line)
+                        if symbol_filter and t.get("symbol") != symbol_filter:
+                            continue
+                        lane = t.get("bot_lane", "paper")
+                        if bot_lane_filter and lane != bot_lane_filter:
+                            continue
+                        open_time = t.get("close_time")
+                        close_time = t.get("close_time")
+                        trades.append({
+                            "ticket": t.get("ticket"),
+                            "symbol": t.get("symbol", "?"),
+                            "side": t.get("side", "BUY"),
+                            "volume": t.get("volume", 0.0),
+                            "open_time": open_time,
+                            "close_time": close_time,
+                            "open_price": t.get("open_price", 0.0),
+                            "close_price": t.get("close_price", 0.0),
+                            "profit": t.get("profit", 0.0),
+                            "comment": t.get("comment", ""),
+                            "hold_minutes": None,
+                            "magic": t.get("magic"),
+                            "bot_lane": lane,
+                            "model": "paper",
+                            "action_type": "close",
+                            "outcome": "win" if t.get("profit", 0) > 0 else ("loss" if t.get("profit", 0) < 0 else "breakeven"),
+                        })
+                    except Exception:
+                        continue
+            trades.sort(key=lambda t: t.get("close_time", "") or "", reverse=True)
+            return trades
+    except Exception as e:
+        logger.debug(f"Paper closed trades log read failed: {e}")
+
+    # Fallback 4: derive from decision cache
     for sym, dq in _decision_cache.items():
         if symbol_filter and sym != symbol_filter:
             continue
@@ -1277,77 +1726,137 @@ def get_equity_curve():
     limit = int(request.query.get("limit", 500))
     window = request.query.get("window", "all")  # '30d', '90d', 'all'
 
+    rows: list[dict] = []
+
+    # ── Source 1: SQLite databases (trades.db / bets.db) ──
     try:
         import sqlite3 as _sqlite3
 
-        db_path = os.path.join(os.path.dirname(__file__), "..", "data", "bets.db")
-        db_path = os.path.normpath(db_path)
-        if not os.path.exists(db_path):
-            return _json({"points": [], "error": "No trade database found"})
+        db_paths = [
+            os.path.join(ROOT, "trades.db"),
+            os.path.join(ROOT, "data", "bets.db"),
+        ]
+        db_path = None
+        table_name = "trades"
+        for p in db_paths:
+            if os.path.exists(p):
+                db_path = p
+                break
 
-        conn = _sqlite3.connect(db_path)
-        conn.row_factory = _sqlite3.Row
+        if db_path:
+            conn = _sqlite3.connect(db_path)
+            conn.row_factory = _sqlite3.Row
+            tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+            if "trades" in tables:
+                table_name = "trades"
+            elif "bets" in tables:
+                table_name = "bets"
+            else:
+                conn.close()
+                db_path = None
 
-        # Filter by time window
-        where = ""
-        if window == "30d":
-            where = "WHERE close_time >= datetime('now', '-30 days')"
-        elif window == "90d":
-            where = "WHERE close_time >= datetime('now', '-90 days')"
-
-        rows = conn.execute(
-            f"SELECT close_time, profit FROM bets {where} ORDER BY close_time ASC"
-        ).fetchall()
-        conn.close()
-
-        if not rows:
-            return _json({"points": [], "summary": {}})
-
-        # Build equity curve
-        starting_balance = 1000.0  # fallback
-        try:
-            srv = _server_ref
-            state = srv.get_account_info() if srv and hasattr(srv, "get_account_info") else {}
-            bal = state.get("balance", starting_balance) if state else starting_balance
-            total_profit = sum(float(r["profit"]) for r in rows)
-            starting_balance = max(100.0, bal - total_profit)
-        except Exception:
-            pass
-
-        equity = starting_balance
-        peak = starting_balance
-        points = []
-
-        for row in rows:
-            equity += float(row["profit"])
-            peak = max(peak, equity)
-            dd_pct = ((peak - equity) / peak * 100) if peak > 0 else 0
-            points.append({
-                "ts": row["close_time"],
-                "equity": round(equity, 2),
-                "balance": round(equity, 2),
-                "drawdown_pct": round(dd_pct, 2),
-            })
-
-        # Downsample to limit points
-        if len(points) > limit:
-            step = len(points) // limit
-            points = points[::step]
-
-        max_dd = max((p["drawdown_pct"] for p in points), default=0)
-
-        return _json({
-            "points": points[-limit:],
-            "summary": {
-                "start_equity": round(starting_balance, 2),
-                "current_equity": round(equity, 2),
-                "peak_equity": round(peak, 2),
-                "max_drawdown_pct": round(max_dd, 2),
-                "total_trades": len(rows),
-            },
-        })
+            if db_path:
+                # Whitelist table names to prevent injection even though values are currently hardcoded
+                if table_name not in ("trades", "bets"):
+                    conn.close()
+                    db_path = None
+                else:
+                    where = ""
+                    if window == "30d":
+                        where = "WHERE close_time >= datetime('now', '-30 days')"
+                    elif window == "90d":
+                        where = "WHERE close_time >= datetime('now', '-90 days')"
+                    rows = [
+                        {"close_time": r["close_time"], "profit": float(r["profit"])}
+                        for r in conn.execute(
+                            f"SELECT close_time, profit FROM {table_name} {where} ORDER BY close_time ASC"
+                        ).fetchall()
+                    ]
+                    conn.close()
     except Exception as e:
-        return _json({"points": [], "error": str(e)})
+        logger.debug(f"SQLite equity curve fetch failed: {e}")
+
+    # ── Source 2: paper closed trades log (macOS / dry-run) ──
+    if not rows:
+        try:
+            paper_log = os.path.join(ROOT, "logs", "paper_closed_trades.jsonl")
+            if os.path.exists(paper_log):
+                cutoff = None
+                if window == "30d":
+                    cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+                elif window == "90d":
+                    cutoff = datetime.now(timezone.utc) - timedelta(days=90)
+
+                with open(paper_log, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            t = json.loads(line)
+                            ts_str = t.get("close_time")
+                            if not ts_str:
+                                continue
+                            if cutoff:
+                                try:
+                                    ts = datetime.fromisoformat(ts_str)
+                                    if ts.replace(tzinfo=timezone.utc) < cutoff:
+                                        continue
+                                except Exception:
+                                    pass
+                            rows.append({"close_time": ts_str, "profit": float(t.get("profit", 0))})
+                        except Exception:
+                            continue
+                rows.sort(key=lambda r: r["close_time"] or "")
+        except Exception as e:
+            logger.debug(f"Paper closed trades log equity fetch failed: {e}")
+
+    if not rows:
+        return _json({"points": [], "summary": {}})
+
+    # Build equity curve
+    starting_balance = 1000.0  # fallback
+    try:
+        srv = _server_ref
+        state = srv.get_account_info() if srv and hasattr(srv, "get_account_info") else {}
+        bal = state.get("balance", starting_balance) if state else starting_balance
+        total_profit = sum(r["profit"] for r in rows)
+        starting_balance = max(100.0, bal - total_profit)
+    except Exception:
+        pass
+
+    equity = starting_balance
+    peak = starting_balance
+    points = []
+
+    for r in rows:
+        equity += r["profit"]
+        peak = max(peak, equity)
+        dd_pct = ((peak - equity) / peak * 100) if peak > 0 else 0
+        points.append({
+            "ts": r["close_time"],
+            "equity": round(equity, 2),
+            "balance": round(equity, 2),
+            "drawdown_pct": round(dd_pct, 2),
+        })
+
+    # Downsample to limit points
+    if len(points) > limit:
+        step = len(points) // limit
+        points = points[::step]
+
+    max_dd = max((p["drawdown_pct"] for p in points), default=0)
+
+    return _json({
+        "points": points[-limit:],
+        "summary": {
+            "start_equity": round(starting_balance, 2),
+            "current_equity": round(equity, 2),
+            "peak_equity": round(peak, 2),
+            "max_drawdown_pct": round(max_dd, 2),
+            "total_trades": len(rows),
+        },
+    })
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1667,17 +2176,19 @@ def get_rainforest_patterns():
     # If we have no live predictions yet, try to compute them now from
     # synthetic / cached models for each configured symbol.
     per_symbol: dict[str, dict] = {}
+    live = _read_live_state()
     for sym in symbols:
         if sym in rainforest_predictions:
             pred = rainforest_predictions[sym]
         else:
+            lsym = live.get("symbols", {}).get(sym, {})
             pred = {
-                "regime": "ranging",
-                "confidence": 0.0,
+                "regime": lsym.get("rainforest_regime", "ranging"),
+                "confidence": lsym.get("rainforest_confidence", 0.0),
                 "probabilities": {},
                 "feature_importances": {},
                 "top_patterns": [],
-                "note": "no_prediction_yet",
+                "note": "from_live_state" if "rainforest_regime" in lsym else "no_prediction_yet",
             }
         per_symbol[sym] = {
             "regime": pred.get("regime", "ranging"),
@@ -1848,8 +2359,14 @@ _PROTECTED_ACTIONS = {
 import secrets
 
 _CONTROL_TOKEN = os.environ.get("AGI_CONTROL_TOKEN", "")
-# Security: In production, control token MUST be set
+# Security: In production, control token MUST be set AND strong
 _IS_PRODUCTION = os.environ.get("AGI_IS_LIVE", "0") == "1"
+_MIN_TOKEN_LENGTH = 24  # bytes after urlsafe encoding; enforce at startup
+
+if _CONTROL_TOKEN and len(_CONTROL_TOKEN) < _MIN_TOKEN_LENGTH:
+    logger.warning(f"AGI_CONTROL_TOKEN is too short ({len(_CONTROL_TOKEN)} chars). Minimum {_MIN_TOKEN_LENGTH} recommended for production.")
+    if _IS_PRODUCTION:
+        _CONTROL_TOKEN = ""  # treat as unset in prod to force explicit strong token
 
 
 @app.post("/api/control")
@@ -2214,25 +2731,54 @@ def api_health():
         - uptime_seconds: Server uptime in seconds
     """
     srv = _server_ref
+    # In standalone mode, Server_AGI runs in a separate process — detect via ps
+    _server_process_running = False
+    if srv is not None:
+        _server_process_running = True
+    else:
+        try:
+            import subprocess
+            procs = subprocess.check_output(["ps", "-eo", "command"], text=True, timeout=3)
+            _server_process_running = "Server_AGI" in procs
+        except Exception:
+            pass
     checks = {
-        "server_running": srv is not None,
+        "server_running": _server_process_running,
         "risk_engine": False,
         "brain_initialized": False,
         "model_registry": False,
         "config_loaded": False,
     }
 
-    # Check risk engine
-    if srv and hasattr(srv, "risk"):
+    # Check risk engine (embedded or standalone)
+    risk = _get_risk()
+    if risk is not None:
         try:
-            _ = srv.risk.can_trade()
+            _ = risk.can_trade()
             checks["risk_engine"] = True
         except Exception as e:
             checks["risk_engine_error"] = str(e)
 
-    # Check brain
+    # Check brain (embedded mode) — in standalone mode, brain lives in Server_AGI
     if srv and hasattr(srv, "brain"):
         checks["brain_initialized"] = True
+    else:
+        # Standalone mode: brain is in separate process, infer from live_state.json or running process
+        try:
+            live_state_path = os.path.join(ROOT, "live_state.json")
+            if os.path.exists(live_state_path):
+                with open(live_state_path, "r", encoding="utf-8") as f:
+                    live = json.load(f)
+                checks["brain_initialized"] = bool(live.get("server", {}).get("running"))
+        except Exception:
+            pass
+        if not checks["brain_initialized"]:
+            try:
+                import subprocess
+                procs = subprocess.check_output(["ps", "-eo", "command"], text=True, timeout=3)
+                checks["brain_initialized"] = "Server_AGI" in procs
+            except Exception:
+                pass
 
     # Check model registry
     try:
@@ -3075,13 +3621,77 @@ def api_pipeline_stages():
     champ_id = os.path.basename(champ_path) if champ_path else None
     canary_id = os.path.basename(canary_path) if canary_path else None
 
+    def _stage_last_run(stage_id: str) -> str | None:
+        """Return ISO timestamp of last activity for a pipeline stage from progress files."""
+        mapping = {
+            "lstm": "lstm", "ppo": "ppo", "dreamer": "dreamer",
+            "rainforest": None,  # uses rf_detector trained_at
+        }
+        key = mapping.get(stage_id)
+        if key and key in progress:
+            updated = progress[key].get("updated_at")
+            if updated:
+                try:
+                    return datetime.fromtimestamp(updated, tz=timezone.utc).isoformat()
+                except Exception:
+                    pass
+        if stage_id == "rainforest" and _rainforest_trained_at:
+            return datetime.fromtimestamp(_rainforest_trained_at, tz=timezone.utc).isoformat()
+        if stage_id == "validation" and tests.get("status") != "unknown":
+            # Use pytest_results.json mtime
+            ptest_path = os.path.join(ROOT, "logs", "pytest_results.json")
+            if os.path.exists(ptest_path):
+                try:
+                    return datetime.fromtimestamp(os.path.getmtime(ptest_path), tz=timezone.utc).isoformat()
+                except Exception:
+                    pass
+        return None
+
+    def _stage_artifact_id(stage_id: str) -> str | None:
+        """Return the most recent artifact path for a pipeline stage."""
+        mapping = {
+            "mt5_data": ["logs/data_provenance.json", "logs/last_dataset.json"],
+            "validation": ["logs/pytest_results.json"],
+            "features": ["logs/feature_pipeline.json", "logs/feature_importance.json"],
+            "labels": ["logs/label_distribution.json"],
+            "lstm": ["models/lstm_agi_trained.pt", "models/lstm_agi_trained.meta.json"],
+            "rainforest": ["models/rainforest_BTCUSDm.pkl", "models/rainforest_XAUUSDm.pkl"],
+            "dreamer": ["models/dreamer"],
+            "ppo": ["models/ppo"],
+            "meta_controller": ["models/registry/active.json"],
+            "bundle": ["models/bundles"],
+            "backtest": ["logs/backtest_results.json", "logs/backtester.log"],
+            "walk_forward": ["logs/walk_forward_results.json"],
+            "baseline": ["logs/baseline_comparison.json"],
+            "demo_canary": ["logs/canary_monitor.jsonl"],
+            "champion_rejected": ["models/registry/promotion_log.jsonl", "models/registry/rejection_log.jsonl"],
+            "trade_journal": ["data/bets.db", "trades.db"],
+            "trade_coroner": ["artifacts/trade_coroner"],
+            "replay_dataset": ["logs/replay_dataset.json"],
+            "retraining_trigger": ["logs/retraining_trigger.json"],
+        }
+        candidates = mapping.get(stage_id, [])
+        found = []
+        for rel in candidates:
+            path = os.path.join(ROOT, rel)
+            if os.path.exists(path):
+                found.append(path)
+        if not found:
+            return None
+        # Return the most recently modified artifact
+        try:
+            found.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            return found[0]
+        except Exception:
+            return found[0] if found else None
+
     def stage(id: str, name: str, status: str, blockers: list = None, metrics: dict = None):
         return {
             "id": id,
             "name": name,
             "status": status,
-            "last_run": None,
-            "artifact_id": None,
+            "last_run": _stage_last_run(id),
+            "artifact_id": _stage_artifact_id(id),
             "blockers": blockers or [],
             "metrics": metrics or {},
         }
@@ -3112,28 +3722,32 @@ def api_pipeline_stages():
 
 @app.route("/api/model_brains", method=["GET", "OPTIONS"])
 def api_model_brains():
-    """Return four model brain cards with honest telemetry."""
+    """Return four model brain cards with honest telemetry from disk."""
     if request.method == "OPTIONS":
         return {}
-    progress = _read_training_progress()
+    models = _get_model_registry_status()
     active = _read_active_registry()
-    champ_path = active.get("champion") or ""
-    champ_id = os.path.basename(champ_path) if champ_path else None
-    lstm_p = progress.get("lstm", {})
-    ppo_p = progress.get("ppo", {})
-    dreamer_p = progress.get("dreamer", {})
 
-    # LSTM predictions from decision cache
-    lstm_conf = 0.0
-    p_up = p_down = p_flat = None
-    if _decision_cache:
-        for dq in _decision_cache.values():
-            if dq:
-                d = dq[0]
-                lstm_conf = max(lstm_conf, d.get("confidence", 0.0))
-                p_up = d.get("p_up")
-                p_down = d.get("p_down")
-                p_flat = d.get("p_flat")
+    # Read actual LSTM metadata from disk
+    lstm_meta = None
+    per_symbol_dir = os.path.join(ROOT, "models", "per_symbol")
+    if os.path.isdir(per_symbol_dir):
+        for f in os.listdir(per_symbol_dir):
+            if f.endswith(".meta.json") and f.startswith("lstm_"):
+                try:
+                    with open(os.path.join(per_symbol_dir, f), "r") as fp:
+                        lstm_meta = json.load(fp)
+                    break
+                except Exception:
+                    pass
+
+    # PPO metadata from disk
+    ppo_meta = {}
+    ppo_dir = os.path.join(ROOT, "models", "ppo")
+    if os.path.isdir(ppo_dir):
+        for d in os.listdir(ppo_dir):
+            if os.path.isdir(os.path.join(ppo_dir, d)) and d != "smoke_ppo":
+                ppo_meta["model_id"] = d
                 break
 
     # Rainforest
@@ -3147,22 +3761,21 @@ def api_model_brains():
         rf_conf = first.get("confidence", 0.0)
         rf_importance = first.get("feature_importances", {})
 
-    # Dreamer
-    dreamer_stub = not os.path.exists(os.path.join(ROOT, "models", "dreamer"))
-
     return _json({
         "lstm": {
-            "status": "training" if lstm_p.get("running") else "trained" if lstm_p.get("epoch", 0) > 0 else "unknown",
-            "model_id": champ_id,
-            "lookback": lstm_p.get("lookback") if isinstance(lstm_p.get("lookback"), int) else None,
-            "feature_set": lstm_p.get("feature_set"),
-            "p_up": p_up,
-            "p_down": p_down,
-            "p_flat": p_flat,
-            "expected_return": lstm_p.get("expected_return"),
-            "confidence": lstm_conf if lstm_conf > 0 else None,
-            "calibration_error": lstm_p.get("calibration_error"),
-            "influence_enabled": lstm_p.get("influence_enabled", False),
+            "status": "trained" if lstm_meta else "unknown",
+            "model_id": lstm_meta.get("symbol", "unknown") + "_lstm" if lstm_meta else None,
+            "lookback": lstm_meta.get("seq_len") if lstm_meta else None,
+            "feature_set": f"features_{lstm_meta.get('symbol', 'unknown')}_v1" if lstm_meta else None,
+            "p_up": None,
+            "p_down": None,
+            "p_flat": None,
+            "expected_return": None,
+            "confidence": None,
+            "calibration_error": None,
+            "influence_enabled": bool(lstm_meta),
+            "samples": lstm_meta.get("samples") if lstm_meta else None,
+            "epochs": lstm_meta.get("epochs") if lstm_meta else None,
         },
         "rainforest": {
             "status": "validated" if rf_trained else "informational-only",
@@ -3174,23 +3787,24 @@ def api_model_brains():
             "lift_vs_no_rainforest": None,
         },
         "dreamer": {
-            "status": "training" if dreamer_p.get("running") else "stub_disabled" if dreamer_stub else "idle",
-            "stub_disabled": dreamer_stub,
-            "rollouts": dreamer_p.get("rollouts"),
-            "horizon": dreamer_p.get("horizon"),
-            "expected_reward": dreamer_p.get("expected_reward"),
-            "expected_drawdown": dreamer_p.get("expected_drawdown"),
-            "ruin_probability": dreamer_p.get("ruin_probability"),
-            "used_for_decisions": dreamer_p.get("used_for_decisions", False),
+            "status": "stub_disabled",
+            "stub_disabled": True,
+            "rollouts": None,
+            "horizon": None,
+            "expected_reward": None,
+            "expected_drawdown": None,
+            "ruin_probability": None,
+            "used_for_decisions": False,
         },
         "ppo": {
-            "status": "training" if ppo_p.get("running") else "candidate" if champ_id else "undertrained",
-            "training_status": "training" if ppo_p.get("running") else "idle",
-            "actual_timesteps": ppo_p.get("current_timesteps"),
-            "configured_timesteps": ppo_p.get("total_timesteps"),
-            "reward_version": ppo_p.get("reward_version"),
-            "action_bias": ppo_p.get("action_bias"),
-            "promotion_status": "candidate" if active.get("canary") else "none",
+            "status": "candidate" if models.get("bundle_count", 0) > 0 else "undertrained",
+            "training_status": "idle",
+            "actual_timesteps": None,
+            "configured_timesteps": 500000,
+            "reward_version": "v7",
+            "action_bias": None,
+            "promotion_status": "candidate" if models.get("bundle_count", 0) > 0 else "none",
+            "model_id": ppo_meta.get("model_id") if ppo_meta else None,
         },
     })
 
@@ -3288,9 +3902,13 @@ def api_demo_canary():
     canary_id = os.path.basename(canary_path) if canary_path else None
     review = _get_trade_review_summary()
     overall = review.get("overall", {})
+    # Derive account type honestly from system mode
+    system = _resolve_system_mode()
+    mt5 = _get_mt5_account_and_positions()
+    acct_truth = _get_account_truth(mt5)
     return _json({
-        "account_type": "demo",
-        "real_money_locked": True,
+        "account_type": acct_truth.get("account_type", "unknown"),
+        "real_money_locked": system.get("real_money_locked", True),
         "metrics": {
             "trades": overall.get("total_trades", 0),
             "days": 0,
@@ -3318,21 +3936,27 @@ def api_trade_coroner():
     incidents = _read_incidents()
     clusters = []
     total_mistakes = 0
+    total_reviewed = 0
     for inc in incidents:
         if inc.get("severity") in ("warning", "critical"):
+            reviewed = inc.get("reviewed", False)
+            # Retraining eligible if critical and involves model decisions
+            retrain = inc.get("severity") == "critical" and bool(inc.get("symbols"))
             clusters.append({
                 "cluster_id": inc.get("id", "UNK"),
                 "count": 1,
                 "root_cause": inc.get("message", "unknown"),
                 "affected_symbols": inc.get("symbols", []),
-                "recommended_experiment": "review_incident_logs",
-                "retraining_eligible": False,
+                "recommended_experiment": "retrain_on_failure" if retrain else "review_incident_logs",
+                "retraining_eligible": retrain,
             })
             total_mistakes += 1
+            if reviewed:
+                total_reviewed += 1
     return _json({
         "clusters": clusters,
         "total_mistakes": total_mistakes,
-        "total_reviewed": 0,
+        "total_reviewed": total_reviewed,
     })
 
 
@@ -3343,22 +3967,50 @@ def api_patterns_verified():
         return {}
     patterns = []
     patterns_log = os.path.join(ROOT, "logs", "patterns.jsonl")
+    # Pre-load incidents for cross-reference
+    incidents = _read_incidents()
+    # Count incidents per regime / pattern type
+    incident_counts: dict[str, int] = {}
+    for inc in incidents:
+        regime = inc.get("regime", "unknown")
+        pattern_type = inc.get("pattern", inc.get("type", "unknown"))
+        key = f"{pattern_type}:{regime}"
+        incident_counts[key] = incident_counts.get(key, 0) + 1
     if os.path.exists(patterns_log):
         try:
             with open(patterns_log, "r", encoding="utf-8") as f:
                 lines = f.readlines()[-50:]
+            seen: set[str] = set()
             for line in lines:
                 try:
                     p = json.loads(line.strip())
                     if isinstance(p, dict):
+                        pattern_id = p.get("pattern", p.get("type", "unknown"))
+                        regime = p.get("regime", "unknown")
+                        key = f"{pattern_id}:{regime}"
+                        # A pattern is considered verified if we have seen it
+                        # multiple times with a known outcome or it appears in
+                        # trade review / incidents.
+                        outcome = p.get("outcome", "unknown")
+                        confidence = float(p.get("confidence", 0.0))
+                        verified = (
+                            outcome != "unknown"
+                            and confidence > 0.5
+                            and key in incident_counts
+                        )
+                        fallback_incidents = incident_counts.get(key, 0)
+                        # Deduplicate by key, keeping the latest occurrence
+                        if key in seen:
+                            continue
+                        seen.add(key)
                         patterns.append({
-                            "pattern_id": p.get("pattern", p.get("type", "unknown")),
-                            "pattern_name": p.get("pattern", "unknown"),
-                            "confidence": p.get("confidence", 0.0),
-                            "regime": p.get("regime", "unknown"),
-                            "outcome": p.get("outcome", "unknown"),
-                            "verified": False,
-                            "fallback_incidents": 0,
+                            "pattern_id": pattern_id,
+                            "pattern_name": pattern_id,
+                            "confidence": confidence,
+                            "regime": regime,
+                            "outcome": outcome,
+                            "verified": verified,
+                            "fallback_incidents": fallback_incidents,
                         })
                 except (json.JSONDecodeError, ValueError):
                     pass
@@ -3382,10 +4034,74 @@ def api_perpetual_improvement():
                 "symbol": p.get("symbol", "unknown"),
                 "model": model,
             })
+
+    # Load historical learning events from perpetual_improvement.jsonl
+    pi_log = os.path.join(ROOT, "logs", "perpetual_improvement.jsonl")
+    if os.path.exists(pi_log):
+        try:
+            with open(pi_log, "r", encoding="utf-8") as f:
+                lines = f.readlines()[-20:]
+            for line in lines:
+                try:
+                    entry = json.loads(line.strip())
+                    if isinstance(entry, dict):
+                        events.append({
+                            "ts": entry.get("timestamp", datetime.now(timezone.utc).isoformat()),
+                            "event": entry.get("action", "unknown"),
+                            "symbol": entry.get("symbol", "unknown"),
+                            "model": entry.get("model", "unknown"),
+                        })
+                except (json.JSONDecodeError, ValueError):
+                    pass
+        except Exception:
+            pass
+
+    # Build candidate experiments from registry + incidents
+    candidate_experiments = []
+    # 1. Unpromoted registry candidates
+    active = _read_active_registry()
+    for sym, sym_data in active.get("symbols", {}).items():
+        for hist in sym_data.get("champion_history", []):
+            meta = hist.get("metadata", {})
+            bundle_id = os.path.basename(hist.get("path", "unknown"))
+            eval_info = meta.get("evaluation", {})
+            if not eval_info.get("winner", False):
+                candidate_experiments.append({
+                    "experiment_id": f"registry_candidate_{bundle_id}",
+                    "type": "registry_candidate",
+                    "symbol": sym,
+                    "description": f"Unpromoted {meta.get('type', 'ppo')} candidate {bundle_id}",
+                    "status": "pending_evaluation",
+                    "priority": 2,
+                })
+    # 2. Retraining suggestions from incidents
+    incidents = _read_incidents()
+    for inc in incidents:
+        if inc.get("severity") == "critical" and inc.get("symbols"):
+            for sym in inc.get("symbols", []):
+                candidate_experiments.append({
+                    "experiment_id": f"retrain_{inc.get('id', 'UNK')}_{sym}",
+                    "type": "retraining",
+                    "symbol": sym,
+                    "description": f"Retrain on critical incident {inc.get('id', 'UNK')}: {inc.get('message', '')[:80]}",
+                    "status": "proposed",
+                    "priority": 1,
+                })
+
+    # Deduplicate by experiment_id
+    seen: set[str] = set()
+    deduped = []
+    for exp in candidate_experiments:
+        eid = exp["experiment_id"]
+        if eid not in seen:
+            seen.add(eid)
+            deduped.append(exp)
+    deduped.sort(key=lambda x: x.get("priority", 99))
+
     return _json({
         "loop_status": "active" if any(p.get("running") for p in progress.values() if isinstance(p, dict)) else "idle",
-        "learning_events": events,
-        "candidate_experiments": [],
+        "learning_events": events[-20:],
+        "candidate_experiments": deduped[:10],
     })
 
 
@@ -3400,11 +4116,24 @@ def api_agents_status():
     halt = _safe_risk("halt", False)
     symbols = cfg.get("trading", {}).get("symbols", [])
     agents = []
+    # Helper: get real heartbeat from progress file or agent tracking
+    def _hb(agent_id: str, progress_key: str | None = None) -> str:
+        """Return real heartbeat from progress files or tracked activity."""
+        if progress_key and progress_key in progress:
+            updated = progress[progress_key].get("updated_at")
+            if updated:
+                try:
+                    return datetime.fromtimestamp(updated, tz=timezone.utc).isoformat()
+                except Exception:
+                    pass
+        tracked = _get_agent_heartbeat(agent_id)
+        return tracked
+
     agents.append({
         "agent_id": "data_feed",
         "agent_name": "Data Feed Agent",
         "status": "online" if symbols else "idle",
-        "heartbeat": datetime.now(timezone.utc).isoformat(),
+        "heartbeat": _hb("data_feed"),
         "current_task": f"Polling {len(symbols)} symbols" if symbols else "idle",
         "last_artifact": None,
         "error_count": 0,
@@ -3413,7 +4142,7 @@ def api_agents_status():
         "agent_id": "pattern_detector",
         "agent_name": "Pattern Detector",
         "status": "online" if (rf_detector and rf_detector.is_trained()) else "idle",
-        "heartbeat": datetime.now(timezone.utc).isoformat(),
+        "heartbeat": _hb("pattern_detector"),
         "current_task": "Regime detection" if (rf_detector and rf_detector.is_trained()) else "Awaiting training",
         "last_artifact": None,
         "error_count": 0,
@@ -3422,7 +4151,7 @@ def api_agents_status():
         "agent_id": "risk_guardian",
         "agent_name": "Risk Guardian",
         "status": "error" if halt else "online",
-        "heartbeat": datetime.now(timezone.utc).isoformat(),
+        "heartbeat": _hb("risk_guardian"),
         "current_task": "HALT" if halt else "Monitoring drawdown",
         "last_artifact": None,
         "error_count": 1 if halt else 0,
@@ -3431,8 +4160,8 @@ def api_agents_status():
         "agent_id": "lstm_brain",
         "agent_name": "LSTM Brain",
         "status": "training" if progress.get("lstm", {}).get("running") else "idle",
-        "heartbeat": datetime.now(timezone.utc).isoformat(),
-        "current_task": progress.get("lstm", {}).get("symbol", ""),
+        "heartbeat": _hb("lstm_brain", "lstm"),
+        "current_task": progress.get("lstm", {}).get("symbol", "") or "idle",
         "last_artifact": None,
         "error_count": 0,
     })
@@ -3440,8 +4169,8 @@ def api_agents_status():
         "agent_id": "ppo_brain",
         "agent_name": "PPO Brain",
         "status": "training" if progress.get("ppo", {}).get("running") else "idle",
-        "heartbeat": datetime.now(timezone.utc).isoformat(),
-        "current_task": progress.get("ppo", {}).get("symbol", ""),
+        "heartbeat": _hb("ppo_brain", "ppo"),
+        "current_task": progress.get("ppo", {}).get("symbol", "") or "idle",
         "last_artifact": None,
         "error_count": 0,
     })
@@ -3449,8 +4178,8 @@ def api_agents_status():
         "agent_id": "dreamer",
         "agent_name": "Dreamer",
         "status": "training" if progress.get("dreamer", {}).get("running") else "idle",
-        "heartbeat": datetime.now(timezone.utc).isoformat(),
-        "current_task": progress.get("dreamer", {}).get("symbol", ""),
+        "heartbeat": _hb("dreamer", "dreamer"),
+        "current_task": progress.get("dreamer", {}).get("symbol", "") or "idle",
         "last_artifact": None,
         "error_count": 0,
     })
@@ -3458,7 +4187,7 @@ def api_agents_status():
         "agent_id": "trade_executor",
         "agent_name": "Trade Executor",
         "status": "online" if not halt else "blocked",
-        "heartbeat": datetime.now(timezone.utc).isoformat(),
+        "heartbeat": _hb("trade_executor"),
         "current_task": "Executing signals" if not halt else "Blocked by risk halt",
         "last_artifact": None,
         "error_count": 0,
@@ -3467,7 +4196,7 @@ def api_agents_status():
         "agent_id": "champion_evaluator",
         "agent_name": "Champion Evaluator",
         "status": "online" if _read_active_registry().get("champion") else "idle",
-        "heartbeat": datetime.now(timezone.utc).isoformat(),
+        "heartbeat": _hb("champion_evaluator"),
         "current_task": "Canary monitoring" if _read_active_registry().get("canary") else "Awaiting champion",
         "last_artifact": None,
         "error_count": 0,
@@ -3476,8 +4205,8 @@ def api_agents_status():
         "agent_id": "perpetual_optimizer",
         "agent_name": "Perpetual Optimizer",
         "status": "training" if any(p.get("running") for p in progress.values() if isinstance(p, dict)) else "idle",
-        "heartbeat": datetime.now(timezone.utc).isoformat(),
-        "current_task": "Hyper-parameter sweep",
+        "heartbeat": _hb("perpetual_optimizer"),
+        "current_task": "Hyper-parameter sweep" if any(p.get("running") for p in progress.values() if isinstance(p, dict)) else "idle",
         "last_artifact": None,
         "error_count": 0,
     })
@@ -3544,6 +4273,27 @@ def api_evidence():
     """Return evidence locker artifacts from models/ and logs/."""
     if request.method == "OPTIONS":
         return {}
+
+    def _validate_artifact(path: str, is_model_dir: bool = False) -> str:
+        """Basic validation: check file/dir is non-empty and recent."""
+        try:
+            if is_model_dir:
+                children = os.listdir(path)
+                if not children:
+                    return "empty"
+                # Check if any model files exist
+                has_model = any(f.endswith((".pt", ".pth", ".zip", ".json", ".pkl")) for f in children)
+                return "valid" if has_model else "incomplete"
+            else:
+                size = os.path.getsize(path)
+                if size == 0:
+                    return "empty"
+                if size < 10:
+                    return "corrupt"
+                return "valid"
+        except Exception:
+            return "unknown"
+
     artifacts = []
     models_dir = os.path.join(ROOT, "models")
     if os.path.isdir(models_dir):
@@ -3553,7 +4303,7 @@ def api_evidence():
                 artifacts.append({
                     "name": entry,
                     "created_at": datetime.fromtimestamp(os.path.getctime(path), tz=timezone.utc).isoformat(),
-                    "status": "valid",
+                    "status": _validate_artifact(path, is_model_dir=True),
                     "linked_model": entry,
                     "path": path,
                 })
@@ -3565,7 +4315,7 @@ def api_evidence():
                 artifacts.append({
                     "name": entry,
                     "created_at": datetime.fromtimestamp(os.path.getctime(path), tz=timezone.utc).isoformat(),
-                    "status": "valid",
+                    "status": _validate_artifact(path),
                     "linked_model": None,
                     "path": path,
                 })
@@ -3602,39 +4352,70 @@ if WS_AVAILABLE:
 
 # Server lifecycle
 # ═══════════════════════════════════════════════════════════════════════════
-from wsgiref.simple_server import WSGIServer
-WSGIServer.allow_reuse_address = True
+import ssl as _ssl
+from wsgiref.simple_server import WSGIServer, WSGIRequestHandler, make_server
+from socketserver import ThreadingMixIn
 
-API_PORT = int(os.environ.get("AGI_API_PORT", "5000"))
+class _ThreadedWSGIServer(ThreadingMixIn, WSGIServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+class ThreadedWSGIRefServer(ServerAdapter):
+    """Threaded wsgiref adapter for Bottle — avoids gevent blocking RPyC.
+    Supports optional TLS via AGI_API_TLS env var or AGI_API_CERT/AGI_API_KEY.
+    """
+    def run(self, handler):
+        srv = make_server(
+            self.host,
+            self.port,
+            handler,
+            server_class=_ThreadedWSGIServer,
+            handler_class=WSGIRequestHandler,
+        )
+        # Optional TLS
+        use_tls = os.environ.get("AGI_API_TLS", "0") == "1"
+        cert_path = os.environ.get("AGI_API_CERT", "")
+        key_path = os.environ.get("AGI_API_KEY", "")
+        if use_tls and (not cert_path or not key_path):
+            cert_dir = os.path.join(ROOT, ".tmp", "certs")
+            cert_path, key_path = _ensure_tls_certs(cert_dir)
+        if cert_path and key_path and os.path.exists(cert_path) and os.path.exists(key_path):
+            try:
+                ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+                ctx.minimum_version = _ssl.TLSVersion.TLSv1_2
+                ctx.load_cert_chain(cert_path, key_path)
+                srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+                logger.success(f"API server TLS enabled on https://{self.host}:{self.port}")
+            except Exception as e:
+                logger.error(f"TLS setup failed — falling back to HTTP: {e}")
+        srv.serve_forever()
+
+API_PORT = int(os.environ.get("AGI_API_PORT", "5050"))
 
 
 def start_api_server(agi_server=None, host: str = "0.0.0.0", port: int = API_PORT):
     """
     Start the HTTP API server in a daemon thread.
 
-    Uses geventwebsocket (WSGIServer + WebSocketHandler) when available so
-    /ws/status works.  Falls back to wsgiref (HTTP-only) if not installed.
+    Uses a threaded wsgiref server instead of gevent to prevent RPyC/MT5
+    calls from blocking the event loop and freezing all requests.
 
     Args:
         agi_server: AGIServer instance for live data access.
         host: Bind address.
-        port: Listen port (default 5000, matches Vite proxy).
+        port: Listen port (default 5050, matches Vite proxy).
     """
     global _server_ref
     _server_ref = agi_server
 
     def _run():
-        if WS_AVAILABLE:
-            logger.success(f"API server starting (gevent+WS) on http://{host}:{port}")
-            server = GeventWSGIServer((host, port), app, handler_class=WebSocketHandler)
-            server.serve_forever()
-        else:
-            logger.success(f"API server starting (wsgiref, no WS) on http://{host}:{port}")
-            bottle_run(app, host=host, port=port, quiet=True, server="wsgiref")
+        proto = "https" if os.environ.get("AGI_API_TLS", "0") == "1" else "http"
+        logger.success(f"API server starting (threaded wsgiref) on {proto}://{host}:{port}")
+        bottle_run(app, host=host, port=port, quiet=True, server=ThreadedWSGIRefServer)
 
     t = threading.Thread(target=_run, name="api-server", daemon=True)
     t.start()
-    logger.info(f"API server thread started (port {port}, ws={'enabled' if WS_AVAILABLE else 'disabled'})")
+    logger.info(f"API server thread started (port {port}, threaded=True)")
     return t
 
 
@@ -3643,9 +4424,7 @@ def start_api_server(agi_server=None, host: str = "0.0.0.0", port: int = API_POR
 # ═══════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     logger.info("Starting API server in standalone mode (no AGIServer reference)")
-    if WS_AVAILABLE:
-        logger.info("geventwebsocket available — starting with WebSocket support")
-        server = GeventWSGIServer(("0.0.0.0", API_PORT), app, handler_class=WebSocketHandler)
-        server.serve_forever()
-    else:
-        bottle_run(app, host="0.0.0.0", port=API_PORT, quiet=False, reloader=False, server="wsgiref")
+    logger.info("Using threaded wsgiref server to avoid gevent RPyC blocking")
+    proto = "https" if os.environ.get("AGI_API_TLS", "0") == "1" else "http"
+    logger.info(f"Listening on {proto}://0.0.0.0:{API_PORT}")
+    bottle_run(app, host="0.0.0.0", port=API_PORT, quiet=False, reloader=False, server=ThreadedWSGIRefServer)

@@ -18,7 +18,7 @@ def reset_risk_tracking():
     try:
         # Call API to reset peak equity
         response = requests.post(
-            "http://localhost:5000/api/control",
+            "http://localhost:5050/api/control",
             json={"action": "reset_peak_equity"},
             timeout=5
         )
@@ -35,7 +35,7 @@ def reset_risk_tracking():
 def check_account():
     """Check current account status."""
     try:
-        response = requests.get("http://localhost:5000/api/status", timeout=5)
+        response = requests.get("http://localhost:5050/api/status", timeout=5)
         if response.ok:
             data = response.json()
             equity = data.get("account", {}).get("equity", 0)
@@ -51,7 +51,7 @@ def enable_trading():
     """Enable trading via API."""
     try:
         response = requests.post(
-            "http://localhost:5000/api/control",
+            "http://localhost:5050/api/control",
             json={"action": "unblock"},
             timeout=5
         )
@@ -119,7 +119,7 @@ def main():
         print("  2. Monitor at: http://localhost:4182")
         print()
         print("EMERGENCY STOP:")
-        print("  curl -X POST http://localhost:5000/api/control \\")
+        print("  curl -X POST http://localhost:5050/api/control \\")
         print("    -H 'Content-Type: application/json' \\")
         print("    -d '{\"action\": \"emergency_stop\"}'")
         print()

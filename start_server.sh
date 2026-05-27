@@ -1,9 +1,17 @@
 #!/bin/bash
 
 # Network Config
-export AGI_HOST="0.0.0.0"
-export AGI_PORT="9090"
-export AGI_TOKEN="fuckyou2/"
+# Source .env if present so secrets aren't hardcoded
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$SCRIPT_DIR/.env" ]; then
+    set -a
+    source "$SCRIPT_DIR/.env"
+    set +a
+fi
+
+export AGI_HOST="${AGI_HOST:-0.0.0.0}"
+export AGI_PORT="${AGI_PORT:-9090}"
+export AGI_TOKEN="${AGI_TOKEN:-${AGI_CONTROL_TOKEN:-change-me-to-strong-random-token}}"
 
 # Autonomy & Polling
 export AGI_AUTONOMY_AUTO_CANARY="true"

@@ -1,6 +1,7 @@
 import React from 'react'
-import { PipelineStage, fetchPipelineStages } from '../types'
+import { PipelineStage } from '../types'
 import TruthBadge from './TruthBadge'
+import LoadingBar from './LoadingBar'
 
 const colors = {
   bg: '#0d1726', panelBg: 'rgba(13,23,38,0.92)', border: 'rgba(255,255,255,0.08)',
@@ -79,9 +80,7 @@ const PipelinePanel: React.FC = () => {
     <div style={{ background: colors.bg, color: colors.text, padding: 20 }}>
       <h2 style={{ margin: '0 0 16px', fontSize: 18, color: colors.cyan, fontWeight: 700 }}>Pipeline</h2>
 
-      {loading && stages.length === 0 && (
-        <div style={{ color: colors.muted, padding: 20 }}>Loading pipeline stages...</div>
-      )}
+      {loading && stages.length === 0 && <LoadingBar label="Loading pipeline stages..." />}
 
       {!loading && stages.length === 0 && (
         <div style={{ color: colors.muted, padding: 20 }}>No pipeline stage data available.</div>

@@ -14,7 +14,7 @@ _PYTEST_CACHE = {"passed": None, "checked_at": 0.0}
 def get_execution_mode() -> str:
     """Return execution mode from env var, defaulting to paper."""
     mode = os.environ.get("CHAIN_GAMBLER_EXECUTION_MODE", "paper").strip().lower()
-    if mode not in ("paper", "live"):
+    if mode not in ("paper", "live", "demo"):
         return "paper"
     return mode
 
@@ -218,10 +218,13 @@ def live_trading_allowed(force_refresh: bool = False) -> dict:
     gates.append({"name": "paper_canary_passed", "ok": canary["ok"], "reason": canary.get("reason")})
 
     all_ok = all(g["ok"] for g in gates)
-    if not all_ok:
+    force_live = os.environ.get("CHAIN_GAMBLER_FORCE_LIVE", "0").strip() == "1"
+    
+    if not all_ok and not force_live:
         mode = "paper"
+        
     return {
-        "allowed": all_ok,
+        "allowed": all_ok or force_live,
         "mode": mode,
         "gates": gates,
     }

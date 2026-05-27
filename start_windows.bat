@@ -11,12 +11,17 @@ taskkill /F /FI "WINDOWTITLE eq Server_AGI*" 2>nul || true
 timeout /t 2 /nobreak >nul
 
 REM ── Environment Variables ──
+REM WARNING: This is a PRODUCTION Windows launcher. AGI_LIVE_ENABLED=true here is aggressive.
+REM Always validate .env has strong AGI_CONTROL_TOKEN and explicit ALLOW_LIVE before running.
+REM Prefer start_prod or supervised service over direct .bat for real capital.
 set AGI_LIVE_ENABLED=true
 set AGI_REQUIRE_EXPLICIT_LIVE_ARM=false
-set AGI_CONTROL_TOKEN=chain_gambler_2026
+REM SECURITY: Never hardcode control tokens. Source from .env or generate strong random.
+REM Example (PowerShell one-liner to create strong token): [Convert]::ToBase64String((1..32|%{Get-Random -Max 256}))
+set AGI_CONTROL_TOKEN=CHANGE-TO-STRONG-TOKEN-FROM-.ENV-OR-GENERATE
 set AGI_HOST=0.0.0.0
 set AGI_PORT=9090
-set AGI_TOKEN=fuckyou2/
+set AGI_TOKEN=CHANGE-TO-STRONG-TOKEN-FROM-.ENV-OR-GENERATE
 
 REM ── Trading Speed & Frequency ──
 set AGI_TRADE_INTERVAL_SEC=300

@@ -1,138 +1,89 @@
-"""Execution-layer RiskSupervisor — mirrors RiskEngine API.
+"""Execution-layer RiskSupervisor — thin wrapper around the canonical RiskEngine.
 
-Tracks daily PnL, drawdown, trade count, losing trades per symbol, error
-count, and halt flags. Designed to be a drop-in companion to
-`Python.risk_engine.RiskEngine` inside the execution package.
+This reduces duplication with the top-level RiskEngine (Python/risk_engine.py)
+while adding a few execution-specific fields and the can_trade() helper used
+by the executor layer.
 """
 
 from __future__ import annotations
 
-import os
-from datetime import datetime, timezone
 from typing import Any
 
-import yaml
 from loguru import logger
 
-
-_CFG_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "config.yaml",
-)
+# Delegate the core daily risk counters / halt logic to the single canonical implementation
+from Python.risk_engine import RiskEngine as _CanonicalRiskEngine
 
 
 class RiskSupervisor:
-    """Risk supervisor matching the RiskEngine public API.
+    """Execution companion that delegates most behavior to canonical RiskEngine.
 
-    Methods:
-      can_trade(symbol=None)
-      record_trade(symbol)
-      record_pnl(amount)
-      record_trade_result(symbol, pnl)
-      record_error()
-      update_equity(equity)
-      reset_daily()
+    Only the extra fields needed by the execution path (max open positions,
+    drawdown guard, can_trade with position limits) are added here.
     """
 
     def __init__(self, config: dict | None = None):
-        cfg = config or self._load_cfg()
-        risk_cfg = cfg.get("risk", {}) if isinstance(cfg, dict) else {}
-        trading_cfg = cfg.get("trading", {}) if isinstance(cfg, dict) else {}
+        self._engine = _CanonicalRiskEngine()
 
-        self.max_daily_loss = float(risk_cfg.get("max_daily_loss", 1000))
-        self.max_daily_trades = int(risk_cfg.get("max_daily_trades", 50))
-        self.max_daily_trades_per_symbol = int(risk_cfg.get("max_daily_trades_per_symbol", 50))
-        self.max_daily_losing_trades_per_symbol = int(risk_cfg.get("max_daily_losing_trades_per_symbol", 10))
-        self.max_lots = float(risk_cfg.get("max_lots", 1.0))
+        # Execution-specific configuration only
+        risk_cfg = (config or {}).get("risk", {}) if isinstance(config, dict) else {}
         self.max_open_positions = int(risk_cfg.get("max_open_positions", 8))
         self.max_positions_per_symbol = int(risk_cfg.get("max_positions_per_symbol", 2))
         self.max_drawdown_pct = float(risk_cfg.get("max_drawdown_pct", 8.0))
 
-        self.default_symbol_profile = {
-            "entry_deviation": int(trading_cfg.get("entry_deviation", 20)),
-            "sl_points": int(trading_cfg.get("sl_points", 250)),
-            "tp_points": int(trading_cfg.get("tp_points", 450)),
-        }
-        self.symbol_profiles = trading_cfg.get("symbol_profiles", {}) or {}
+        # Mirror commonly accessed attributes for backward compatibility
+        self.max_daily_loss = self._engine.max_daily_loss
+        self.max_daily_trades = self._engine.max_daily_trades
+        self.max_daily_trades_per_symbol = self._engine.max_daily_trades_per_symbol
+        self.max_daily_losing_trades_per_symbol = self._engine.max_daily_losing_trades_per_symbol
+        self.max_lots = self._engine.max_lots
+        self.default_symbol_profile = self._engine.default_symbol_profile
+        self.symbol_profiles = self._engine.symbol_profiles
 
-        # Mutable daily state
-        self.realized_pnl_today = 0.0
-        self.daily_trades = 0
-        self.daily_trades_by_symbol: dict[str, int] = {}
-        self.daily_losing_trades_by_symbol: dict[str, int] = {}
-        self.halt = False
-        self.error_halt = False
-        self.error_count = 0
-        self.current_dd = 0.0
-        self.peak_equity: float | None = None
+        # Lightweight mirrors of mutable state (updated in delegation methods)
+        self.realized_pnl_today = self._engine.realized_pnl_today
+        self.daily_trades = self._engine.daily_trades
+        self.daily_trades_by_symbol = self._engine.daily_trades_by_symbol
+        self.daily_losing_trades_by_symbol = self._engine.daily_losing_trades_by_symbol
+        self.halt = self._engine.halt
+        self.error_halt = self._engine.error_halt
+        self.error_count = self._engine.error_count
+        self.current_dd = self._engine.current_dd
+        self.peak_equity = self._engine.peak_equity
         self._current_equity = 0.0
-        self._halt_reason = ""
-        self.last_reset_day = datetime.now(timezone.utc).date()
+        self._halt_reason = getattr(self._engine, "_halt_reason", "")
+        self.last_reset_day = self._engine.last_reset_day
 
-    @staticmethod
-    def _load_cfg() -> dict:
-        try:
-            with open(_CFG_PATH, "r", encoding="utf-8") as f:
-                return yaml.safe_load(f) or {}
-        except Exception:
-            return {}
+    # --- Delegation to canonical engine (eliminates duplicated logic) ---
 
     def reset_daily(self) -> None:
-        self.realized_pnl_today = 0.0
-        self.daily_trades = 0
-        self.daily_trades_by_symbol = {}
-        self.daily_losing_trades_by_symbol = {}
-        self.error_count = 0
-        if not self.error_halt:
-            self.halt = False
-            self._halt_reason = ""
-        self.last_reset_day = datetime.now(timezone.utc).date()
+        self._engine.reset_daily()
+        self._sync_from_engine()
 
     def maybe_roll_day(self) -> None:
-        today = datetime.now(timezone.utc).date()
-        if today != self.last_reset_day:
-            self.reset_daily()
+        self._engine.maybe_roll_day()
+        self._sync_from_engine()
 
     def record_trade(self, symbol: str | None = None) -> None:
-        self.maybe_roll_day()
-        self.daily_trades += 1
-        if symbol:
-            key = str(symbol)
-            self.daily_trades_by_symbol[key] = int(self.daily_trades_by_symbol.get(key, 0)) + 1
+        self._engine.record_trade(symbol)
+        self._sync_from_engine()
 
     def record_pnl(self, pnl: float) -> None:
-        self.maybe_roll_day()
-        self.realized_pnl_today += float(pnl)
-        if self.realized_pnl_today <= -abs(self.max_daily_loss):
-            self.halt = True
-            self._halt_reason = "daily_loss"
+        self._engine.record_pnl(pnl)
+        self._sync_from_engine()
 
     def record_trade_result(self, symbol: str | None, pnl: float) -> None:
-        self.maybe_roll_day()
-        self.record_pnl(pnl)
-        if symbol is None:
-            return
-        if float(pnl) < 0.0:
-            key = str(symbol)
-            self.daily_losing_trades_by_symbol[key] = int(self.daily_losing_trades_by_symbol.get(key, 0)) + 1
+        self._engine.record_trade_result(symbol, pnl)
+        self._sync_from_engine()
 
     def update_equity(self, equity: float) -> None:
-        eq = float(equity)
-        self._current_equity = eq
-        if self.peak_equity is None:
-            self.peak_equity = eq
-            self.current_dd = 0.0
-            return
-        self.peak_equity = max(self.peak_equity, eq)
-        if self.peak_equity > 0:
-            self.current_dd = (self.peak_equity - eq) / self.peak_equity * 100.0
+        self._engine.update_equity(equity)
+        self._sync_from_engine()
+        self._current_equity = float(equity)
 
     def record_error(self) -> None:
-        self.error_count += 1
-        if self.error_count >= 3:
-            self.halt = True
-            self.error_halt = True
-            self._halt_reason = "consecutive_errors"
+        self._engine.record_error()
+        self._sync_from_engine()
 
     def can_trade(self, symbol: str | None = None) -> bool:
         self.maybe_roll_day()
@@ -154,8 +105,21 @@ class RiskSupervisor:
         return True
 
     def get_symbol_profile(self, symbol: str) -> dict:
-        prof = self.default_symbol_profile.copy()
-        sym_prof = self.symbol_profiles.get(symbol, {})
-        if isinstance(sym_prof, dict):
-            prof.update(sym_prof)
-        return prof
+        return self._engine.get_symbol_profile(symbol) if hasattr(self._engine, "get_symbol_profile") else self.default_symbol_profile.copy()
+
+    # --- Internal ---
+
+    def _sync_from_engine(self) -> None:
+        """Keep our lightweight mirrors in sync after delegating to the engine."""
+        self.realized_pnl_today = self._engine.realized_pnl_today
+        self.daily_trades = self._engine.daily_trades
+        self.daily_trades_by_symbol = self._engine.daily_trades_by_symbol
+        self.daily_losing_trades_by_symbol = self._engine.daily_losing_trades_by_symbol
+        self.halt = self._engine.halt
+        self.error_halt = self._engine.error_halt
+        self.error_count = self._engine.error_count
+        self.current_dd = self._engine.current_dd
+        self.peak_equity = self._engine.peak_equity
+        self.last_reset_day = self._engine.last_reset_day
+        if hasattr(self._engine, "_halt_reason"):
+            self._halt_reason = self._engine._halt_reason

@@ -1,6 +1,7 @@
 import React from 'react'
 import { ModelBrains, fetchModelBrains } from '../services/api'
 import TruthBadge from './TruthBadge'
+import LoadingBar from './LoadingBar'
 
 const colors = {
   bg: '#0d1726',
@@ -100,9 +101,7 @@ const ModelBrainsPanel: React.FC = () => {
         Model Brains
       </h2>
 
-      {loading && !brains && (
-        <div style={{ ...panelStyle, color: colors.muted }}>Loading model brains...</div>
-      )}
+      {loading && !brains && <LoadingBar label="Loading model brains..." />}
       {!loading && !brains && (
         <div style={{ ...panelStyle, color: colors.muted }}>
           No model brain data available. The endpoint returned empty.

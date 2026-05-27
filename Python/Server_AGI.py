@@ -1,7 +1,8 @@
-﻿import atexit
+import atexit
 import datetime
 import json
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -32,6 +33,13 @@ try:
     from Python import live_safety
 except Exception:
     live_safety = None
+try:
+    from Python.reversal_detector import get_reversal_detector
+except Exception:
+    get_reversal_detector = None
+
+# Temporarily disabled — reversal detector was flattening every signal in ranging markets
+get_reversal_detector = None
 
 
 def _is_paper_mode() -> bool:
@@ -48,6 +56,14 @@ ACTIVE_MODELS_PATH = os.path.join(BASE_DIR, "models", "registry", "active.json")
 
 os.makedirs(LOG_DIR, exist_ok=True)
 logger.add(SERVER_LOG, rotation="10 MB", level="INFO")
+
+_shutdown_flag = threading.Event()
+
+
+def _shutdown_handler(signum, frame):
+    logger.info(f"Received signal {signum}, initiating graceful shutdown...")
+    _shutdown_flag.set()
+
 
 SYMBOL_EXECUTION_PROFILES = {
     "BTCUSDm": {
@@ -189,7 +205,13 @@ def _write_live_state(risk, symbols, last_symbol_state, models, training_state=N
             "canary_set_time": None,
             "canary_trades": 0,
             "signal": sstate.get("signal", "UNKNOWN"),
+            "regime": sstate.get("regime", "--"),
             "confidence": sstate.get("confidence", 0.0),
+            "rainforest_regime": sstate.get("rainforest_regime", "ranging"),
+            "rainforest_confidence": sstate.get("rainforest_confidence", 0.0),
+            "ppo_exposure": sstate.get("ppo_exposure", 0.0),
+            "dreamer_exposure": sstate.get("dreamer_exposure", 0.0),
+            "blend_exposure": sstate.get("blend_exposure", 0.0),
             "floating_pnl": sstate.get("floating_pnl", 0.0),
             "open_positions": sstate.get("open_positions", 0),
         }
@@ -213,22 +235,51 @@ def _training_state():
         "drl_symbol": None,
         "drl_score": None,
     }
+
+    # ── Detect training processes (Windows PowerShell + macOS/Linux ps) ──
     try:
-        cmd = (
-            "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
-            "Select-Object CommandLine | ConvertTo-Json -Depth 3"
-        )
-        raw = subprocess.check_output(["powershell", "-NoProfile", "-Command", cmd], text=True, timeout=6)
-        rows = json.loads(raw)
-        if isinstance(rows, dict):
-            rows = [rows]
-        lines = [str((r or {}).get("CommandLine") or "").lower().replace("\\", "/") for r in (rows or [])]
+        lines = []
+        if sys.platform == "win32":
+            cmd = (
+                "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+                "Select-Object CommandLine | ConvertTo-Json -Depth 3"
+            )
+            raw = subprocess.check_output(["powershell", "-NoProfile", "-Command", cmd], text=True, timeout=6)
+            rows = json.loads(raw)
+            if isinstance(rows, dict):
+                rows = [rows]
+            lines = [str((r or {}).get("CommandLine") or "").lower().replace("\\", "/") for r in (rows or [])]
+        else:
+            raw = subprocess.check_output(["ps", "-eo", "command"], text=True, timeout=6)
+            lines = [x.lower().replace("\\", "/") for x in raw.splitlines()]
         out["lstm_running"] = any("training/train_lstm.py" in x for x in lines)
         out["drl_running"] = any("training/train_drl.py" in x for x in lines)
         out["cycle_running"] = any(("tools/champion_cycle.py" in x or "tools/champion_cycle_loop.py" in x) for x in lines)
     except Exception:
         pass
 
+    # ── Fallback: infer running from recent log activity ──
+    now = time.time()
+    try:
+        lstm_log = os.path.join(LOG_DIR, "lstm_training.log")
+        if os.path.exists(lstm_log) and (now - os.path.getmtime(lstm_log)) < 180:
+            out["lstm_running"] = True
+    except Exception:
+        pass
+    try:
+        ppo_log = os.path.join(LOG_DIR, "ppo_training.log")
+        if os.path.exists(ppo_log) and (now - os.path.getmtime(ppo_log)) < 180:
+            out["drl_running"] = True
+    except Exception:
+        pass
+    try:
+        cycle_log = os.path.join(LOG_DIR, "champion_cycle.log")
+        if os.path.exists(cycle_log) and (now - os.path.getmtime(cycle_log)) < 180:
+            out["cycle_running"] = True
+    except Exception:
+        pass
+
+    # ── Parse LSTM log for progress metadata ──
     try:
         lstm_lines = []
         lstm_log = os.path.join(LOG_DIR, "lstm_training.log")
@@ -254,6 +305,7 @@ def _training_state():
     except Exception:
         pass
 
+    # ── Parse PPO log for progress metadata ──
     try:
         ppo_lines = []
         ppo_log = os.path.join(LOG_DIR, "ppo_training.log")
@@ -369,13 +421,65 @@ def _runtime_owner_health():
 
 
 def _acquire_single_instance_lock():
+    """Improved single-instance lock using filelock (when available) + stale PID cleanup.
+    Reduces classic TOCTOU window compared to pure check-then-create.
+    """
     os.makedirs(LOCK_DIR, exist_ok=True)
+
+    try:
+        from filelock import FileLock
+        # Use a .lock file for the advisory lock (more robust across restarts)
+        lock = FileLock(LOCK_PATH + ".lock", timeout=0)
+        lock.acquire()
+        # Write our PID into the human-readable lock file for diagnostics
+        try:
+            with open(LOCK_PATH, "w") as f:
+                f.write(str(os.getpid()))
+        except Exception:
+            pass
+
+        def _cleanup_lock():
+            try:
+                lock.release()
+            except Exception:
+                pass
+            try:
+                if os.path.exists(LOCK_PATH):
+                    os.remove(LOCK_PATH)
+            except Exception:
+                pass
+        return True, _cleanup_lock
+    except Exception:
+        # Fallback to previous O_EXCL logic if filelock unavailable or fails
+        pass
+
+    # Fallback path (original improved logic)
+    if os.path.exists(LOCK_PATH):
+        try:
+            with open(LOCK_PATH, "r") as f:
+                old_pid = int(f.read().strip())
+            try:
+                os.kill(old_pid, 0)
+                return False, None
+            except ProcessLookupError:
+                try:
+                    os.remove(LOCK_PATH)
+                except Exception:
+                    pass
+            except PermissionError:
+                return False, None
+        except Exception:
+            try:
+                os.remove(LOCK_PATH)
+            except Exception:
+                pass
+
     try:
         fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         os.write(fd, str(os.getpid()).encode("utf-8"))
         os.close(fd)
     except FileExistsError:
-        return False
+        return False, None
 
     def _cleanup_lock():
         try:
@@ -383,6 +487,8 @@ def _acquire_single_instance_lock():
                 os.remove(LOCK_PATH)
         except Exception:
             pass
+
+    return True, _cleanup_lock
 
     atexit.register(_cleanup_lock)
     return True
@@ -417,9 +523,19 @@ def _init_mt5(cfg):
     password = os.environ.get("MT5_PASSWORD") or _resolve_env_ref(mt5_cfg.get("password", ""))
     server = os.environ.get("MT5_SERVER") or _resolve_env_ref(mt5_cfg.get("server", ""))
 
-    if login and password and server:
-        return mt5.initialize(login=login, password=password, server=server)
-    return mt5.initialize()
+    for attempt in range(1, 6):
+        try:
+            if login and password and server:
+                ok = mt5.initialize(login=login, password=password, server=server)
+            else:
+                ok = mt5.initialize()
+            if ok:
+                return True
+        except Exception as e:
+            logger.warning(f"MT5 init attempt {attempt}/5 failed: {e}")
+        if attempt < 5:
+            time.sleep(2 ** attempt)  # exponential backoff: 2, 4, 8, 16s
+    return False
 
 
 def _to_mt5_timeframe(tf: str):
@@ -749,18 +865,29 @@ def _scan_trade_events(alerter, risk, known_open_tickets, seen_closed_deals, las
 
 
 def main(live=False):
-    if not _acquire_single_instance_lock():
+    acquired, cleanup_fn = _acquire_single_instance_lock()
+    if not acquired:
         raise RuntimeError("Server_AGI is already running (lock file exists)")
+
+    if cleanup_fn:
+        atexit.register(cleanup_fn)
+
+    signal.signal(signal.SIGTERM, _shutdown_handler)
+    signal.signal(signal.SIGINT, _shutdown_handler)
 
     # Determine execution mode: env var is primary, --live flag is secondary
     env_mode = live_safety.get_execution_mode() if live_safety else "paper"
-    requested_live = (env_mode == "live")
+    requested_live = env_mode in ("live", "demo")
     if live and env_mode == "paper":
         logger.warning("--live flag ignored because CHAIN_GAMBLER_EXECUTION_MODE=paper")
 
     # Gate live mode with comprehensive safety checks
     if requested_live:
-        if live_safety is not None:
+        if env_mode == "demo":
+            logger.info("Demo mode enabled — real orders to demo account.")
+            live = True
+            os.environ["AGI_IS_LIVE"] = "1"
+        elif live_safety is not None:
             gate = live_safety.live_trading_allowed()
             if not gate["allowed"]:
                 logger.warning(f"Live trading requested but safety gates failed: {gate['gates']}")
@@ -782,12 +909,27 @@ def main(live=False):
     cfg = _load_cfg(live=live)
     ok = _init_mt5(cfg)
     if not ok:
-        raise RuntimeError(f"MT5 init failed: {mt5.last_error()}")
+        if _is_paper_mode() or env_mode == "demo":
+            try:
+                err = mt5.last_error()
+            except Exception as e:
+                err = f"unknown error ({e})"
+            logger.warning(f"MT5 unavailable ({err}), continuing in {env_mode}-only mode")
+        else:
+            try:
+                err = mt5.last_error()
+            except Exception as e:
+                err = f"unknown error ({e})"
+            raise RuntimeError(f"MT5 init failed: {err}")
 
     runtime = _load_runtime_components()
     risk = runtime["RiskEngine"]()
     supervisor = runtime["RiskSupervisor"](cfg)
     executor = runtime["MT5Executor"](risk)
+
+    # Non-security fix for reviewer finding: protect shared mutable risk state
+    # from the background training thread and main trading loop.
+    risk_lock = threading.Lock()
 
     # Prevent HybridBrain from starting its own AutonomyLoop thread;
     # Server_AGI orchestrates training cycles directly in the main loop.
@@ -850,7 +992,7 @@ def main(live=False):
     _training_cycle_every_n = max(1, int(os.environ.get("AGI_TRAINING_CYCLE_EVERY_N", "50")))
     _training_thread = None
 
-    while True:
+    while not _shutdown_flag.is_set():
         now = time.time()
         _loop_counter += 1
 
@@ -863,9 +1005,9 @@ def main(live=False):
             _last_training_cycle = now
             _training_thread = threading.Thread(
                 target=autonomy.training_cycle,
-                args=(symbols,),
+                args=(symbols, _shutdown_flag),
                 name="training-cycle",
-                daemon=True,
+                daemon=False,
             )
             _training_thread.start()
             logger.info(f"Training cycle thread started (loop={_loop_counter})")
@@ -874,7 +1016,8 @@ def main(live=False):
             uptime = int(now - start_time)
             acc = mt5.account_info()
             if acc and getattr(acc, "_valid", True):
-                risk.update_equity(float(acc.equity))
+                with risk_lock:
+                    risk.update_equity(float(acc.equity))
             elif acc and not getattr(acc, "_valid", True):
                 logger.warning(
                     "[MT5 TELEMETRY] Invalid heartbeat telemetry: balance=%s, equity=%s",
@@ -988,6 +1131,25 @@ def main(live=False):
                 decision = _blend_symbol_decision(symbol, agi_meta, ppo_meta, dreamer_meta, cfg=cfg)
                 exposure = float(decision["target"])
 
+                # ── Reversal detection ──
+                if get_reversal_detector is not None and abs(exposure) > 0.01:
+                    try:
+                        rev = get_reversal_detector().detect_reversal(symbol, df, "BUY" if exposure > 0 else "SELL")
+                        if rev.detected and rev.confidence >= 0.65:
+                            # Reversal against our direction — flatten or reduce
+                            if (exposure > 0 and "bearish" in rev.direction) or (exposure < 0 and "bullish" in rev.direction):
+                                logger.warning(
+                                    f"REVERSAL {symbol} | {rev.direction} conf={rev.confidence:.2f} methods={rev.methods} — flattening exposure"
+                                )
+                                exposure = 0.0
+                                decision["target"] = 0.0
+                                decision["reversal_override"] = True
+                                decision["reversal_signal"] = rev.direction
+                                decision["reversal_confidence"] = rev.confidence
+                                decision["reversal_methods"] = rev.methods
+                    except Exception as rev_err:
+                        logger.debug(f"Reversal detection failed for {symbol}: {rev_err}")
+
                 logger.info(
                     "DECISION %s | regime=%s conf=%.4f risk=%.4f agi_bias=%.4f ppo=%.4f dreamer=%.4f raw=%.4f final=%.4f"
                     % (
@@ -1026,6 +1188,8 @@ def main(live=False):
                 sym_state = last_symbol_state.setdefault(str(symbol), {})
                 sym_state["signal"] = regime
                 sym_state["regime"] = regime
+                sym_state["rainforest_regime"] = str((agi_meta or {}).get("rainforest_regime", "ranging") or "ranging")
+                sym_state["rainforest_confidence"] = float((agi_meta or {}).get("rainforest_confidence", 0.0) or 0.0)
                 sym_state["confidence"] = conf
                 sym_state["risk_scalar"] = float((agi_meta or {}).get("risk_scalar", 1.0) or 1.0)
                 sym_state["trend_bias"] = float((agi_meta or {}).get("trend_bias", 0.0) or 0.0)
@@ -1073,7 +1237,7 @@ def main(live=False):
                             "agi_risk_scalar": float((agi_meta or {}).get("risk_scalar", 1.0) or 1.0),
                         },
                     )
-                    if order_meta:
+                    if order_meta and order_meta.get("executed"):
                         supervisor.mark_trade(symbol)
                 else:
                     order_meta = None
@@ -1127,14 +1291,16 @@ def main(live=False):
 
                 acc = mt5.account_info()
                 if acc and getattr(acc, "_valid", True):
-                    risk.update_equity(float(acc.equity))
+                    with risk_lock:
+                        risk.update_equity(float(acc.equity))
                 elif acc and not getattr(acc, "_valid", True):
                     logger.warning(
                         "[MT5 TELEMETRY] Invalid execution-loop telemetry: balance=%s, equity=%s",
                         acc.balance, acc.equity,
                     )
             except Exception as exc:
-                risk.record_error()
+                with risk_lock:
+                    risk.record_error()
                 alerter.alert(f"Execution loop error on {symbol}: {exc}")
                 logger.exception(f"Execution loop error on {symbol}: {exc}")
 
@@ -1198,6 +1364,37 @@ def main(live=False):
             pass
 
         time.sleep(max(5, loop_sleep_sec))
+
+    logger.info("Shutdown flag set; exiting main loop gracefully.")
+
+    if _training_thread is not None and _training_thread.is_alive():
+        logger.info("Waiting for training thread to finish (max 30s)...")
+        _training_thread.join(timeout=30)
+        if _training_thread.is_alive():
+            logger.warning("Training thread did not finish in time; proceeding with shutdown.")
+
+    try:
+        snap = _account_snapshot()
+        logger.info(
+            f"Shutdown snapshot — balance={snap['balance']}, equity={snap['equity']}, "
+            f"floating={snap['floating']}, open_positions={snap['open_positions']}"
+        )
+        _append_audit("shutdown", snap)
+    except Exception as exc:
+        logger.warning(f"Failed to record shutdown snapshot: {exc}")
+
+    try:
+        _write_live_state(
+            risk=risk,
+            symbols=symbols,
+            last_symbol_state=last_symbol_state,
+            models=_read_active_models(),
+            training_state=getattr(autonomy, "training_state", None),
+        )
+    except Exception:
+        pass
+
+    logger.info("Server_AGI stopped gracefully.")
 
 
 if __name__ == "__main__":

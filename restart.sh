@@ -77,7 +77,7 @@ echo -e "${GREEN}Using Python: $PYTHON${NC}"
 # ── Environment variables (Optimized for production) ──
 export AGI_LIVE_ENABLED=true
 export AGI_REQUIRE_EXPLICIT_LIVE_ARM=false
-export AGI_CONTROL_TOKEN=chain_gambler_2026
+export AGI_CONTROL_TOKEN="${AGI_CONTROL_TOKEN:-$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))' 2>/dev/null || echo 'CHANGE-THIS-STRONG-TOKEN')}"
 export AGI_HOST=0.0.0.0
 export AGI_PORT=9090
 

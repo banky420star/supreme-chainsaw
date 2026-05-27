@@ -1,6 +1,7 @@
 import React from 'react'
 import { TradeCoronerState, fetchTradeCoroner } from '../services/api'
 import TruthBadge from './TruthBadge'
+import LoadingBar from './LoadingBar'
 
 const colors = {
   bg: '#0d1726',
@@ -51,9 +52,7 @@ const TradeCoronerPanel: React.FC = () => {
         Trade Coroner
       </h2>
 
-      {loading && !state && (
-        <div style={{ ...panelStyle, color: colors.muted }}>Loading trade coroner...</div>
-      )}
+      {loading && !state && <LoadingBar label="Loading trade coroner..." />}
       {!loading && !state && (
         <div style={{ ...panelStyle, color: colors.muted }}>
           No trade coroner data available. The endpoint returned empty.

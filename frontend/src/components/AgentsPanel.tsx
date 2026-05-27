@@ -1,6 +1,7 @@
 import React from 'react'
 import { AgentOperationalStatus, fetchAgentsOperational } from '../services/api'
 import TruthBadge from './TruthBadge'
+import LoadingBar from './LoadingBar'
 
 const colors = {
   bg: '#0d1726',
@@ -68,9 +69,7 @@ const AgentsPanel: React.FC = () => {
         Agents — Operational Board
       </h2>
 
-      {loading && agents.length === 0 && (
-        <div style={{ ...panelStyle, color: colors.muted }}>Loading agents...</div>
-      )}
+      {loading && agents.length === 0 && <LoadingBar label="Loading agents..." />}
       {!loading && agents.length === 0 && (
         <div style={{ ...panelStyle, color: colors.muted }}>
           No agent data available. The endpoint returned empty.

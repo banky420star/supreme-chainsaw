@@ -56,30 +56,44 @@ type TabId =
   | 'settings' | 'legacy_dashboard'
 
 const TABS: { id: TabId; label: string }[] = [
-  { id: 'overview',        label: 'Overview'         },
-  { id: 'pipeline',        label: 'Pipeline'         },
+  { id: 'trades',          label: 'Trades'           },
   { id: 'model_brains',    label: 'Model Brains'     },
+  { id: 'pipeline',        label: 'Pipeline'         },
   { id: 'training',        label: 'Training'         },
   { id: 'registry',        label: 'Registry'         },
   { id: 'promotion_gates', label: 'Promotion Gates'  },
   { id: 'demo_canary',     label: 'Demo Canary'      },
-  { id: 'trades',          label: 'Trades'           },
   { id: 'trade_coroner',   label: 'Trade Coroner'    },
   { id: 'patterns',        label: 'Patterns'         },
   { id: 'perpetual',       label: 'Perpetual Improvement' },
   { id: 'agents',          label: 'Agents'           },
-  { id: 'safety',          label: 'Safety'           },
   { id: 'evidence',        label: 'Evidence Locker'  },
   { id: 'settings',        label: 'Settings'         },
-  { id: 'legacy_dashboard', label: 'Legacy Dash'    },
+  { id: 'overview',        label: 'System Truth'     },
+  { id: 'safety',          label: 'Safety Lock'      },
 ]
 
 const LOAD_STEPS = [
-  'CONNECTING BROKER...',
-  'LOADING MODELS...',
-  'CALIBRATING RISK...',
-  'ARMING SIGNALS...',
-  'STACK ONLINE',
+  'INITIALIZING KERNEL...',
+  'MOUNTING FILESYSTEMS...',
+  'LOADING NEURAL WEIGHTS...',
+  'CALIBRATING RISK ENGINE...',
+  'CONNECTING MT5 BRIDGE...',
+  'HANDSHAKING BROKER...',
+  'LOADING MARKET DATA...',
+  'BUILDING FEATURE SPACE...',
+  'WARMING LSTM SEQUENCE MEMORY...',
+  'WARMING RAINFOREST REGIME DETECTOR...',
+  'WARMING PPO POLICY NETWORK...',
+  'DREAMER WORLD MODEL: STUBBED...',
+  'SYNCHRONIZING AGENT SWARM...',
+  'VERIFYING SAFETY GATES...',
+  'RUNNING TELEMETRY CHECK...',
+  'LOADING CHAMPION REGISTRY...',
+  'CHECKING DEMO CANARY STATUS...',
+  'REAL MONEY: LOCKED',
+  'ARMING EXECUTION GATES...',
+  'SYSTEM ONLINE',
 ]
 
 function LoadingScreen() {
@@ -87,7 +101,9 @@ function LoadingScreen() {
   const [progress, setProgress] = React.useState(0)
 
   React.useEffect(() => {
-    const targets = [18, 42, 65, 85, 100]
+    const targets = Array.from({ length: LOAD_STEPS.length }, (_, i) =>
+      Math.round(((i + 1) / LOAD_STEPS.length) * 100)
+    )
     let i = 0
     const advance = () => {
       if (i >= targets.length) return
@@ -96,7 +112,7 @@ function LoadingScreen() {
       i++
     }
     advance()
-    const id = setInterval(advance, 480)
+    const id = setInterval(advance, 280)
     return () => clearInterval(id)
   }, [])
 
@@ -199,7 +215,7 @@ const EMPTY_PIPELINE: PipelineState = {
 
 const App: React.FC = () => {
   const [pipe, setPipe] = React.useState<PipelineState>(EMPTY_PIPELINE)
-  const [activeTab, setActiveTab] = React.useState<TabId>('overview')
+  const [activeTab, setActiveTab] = React.useState<TabId>('trades')
   const wsConnectedRef = React.useRef(false)
   const [wsConnected, setWsConnected] = React.useState(false)
 

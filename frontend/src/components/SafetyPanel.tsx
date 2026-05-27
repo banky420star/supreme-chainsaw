@@ -1,6 +1,7 @@
 import React from 'react'
 import { SafetyState, fetchSafety } from '../types'
 import TruthBadge from './TruthBadge'
+import LoadingBar from './LoadingBar'
 
 const colors = {
   bg: '#0d1726',
@@ -51,9 +52,7 @@ const SafetyPanel: React.FC = () => {
         Safety — Blunt Lock State
       </h2>
 
-      {loading && !safety && (
-        <div style={{ ...panelStyle, color: colors.muted }}>Loading safety state...</div>
-      )}
+      {loading && !safety && <LoadingBar label="Loading safety state..." />}
 
       {!loading && !safety && (
         <div style={{ ...panelStyle, color: colors.muted }}>

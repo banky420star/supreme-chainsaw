@@ -1,7 +1,71 @@
 import React from 'react'
-import { Trade, TradesResponse, TradeSummary, fetchTrades, fetchTradesSummary } from '../services/api'
+import { Trade, TradesResponse, TradeSummary, fetchTrades, fetchTradesSummary, fetchEquityCurve, EquityCurveResponse } from '../services/api'
 import { EconomicEvent } from '../services/api'
 import TruthBadge from './TruthBadge'
+import LoadingBar from './LoadingBar'
+
+function EquityChart({ data, height = 220 }: { data: EquityCurveResponse['points']; height?: number }) {
+  if (!data || data.length < 2) return <div style={{ color: '#97a9c6', fontSize: 12 }}>No equity data</div>
+  const w = 800
+  const h = height
+  const pad = { top: 10, right: 10, bottom: 30, left: 50 }
+  const chartW = w - pad.left - pad.right
+  const chartH = h - pad.top - pad.bottom
+
+  const equities = data.map((d) => d.equity)
+  const minE = Math.min(...equities)
+  const maxE = Math.max(...equities)
+  const range = maxE - minE || 1
+
+  const toX = (i: number) => pad.left + (i / (data.length - 1)) * chartW
+  const toY = (v: number) => pad.top + chartH - ((v - minE) / range) * chartH
+
+  let path = `M ${toX(0)} ${toY(equities[0])}`
+  for (let i = 1; i < data.length; i++) {
+    path += ` L ${toX(i)} ${toY(equities[i])}`
+  }
+
+  const startEq = equities[0]
+  const endEq = equities[equities.length - 1]
+  const isUp = endEq >= startEq
+  const stroke = isUp ? '#39d98a' : '#ff7b8f'
+  const fill = isUp ? 'rgba(57,217,138,0.08)' : 'rgba(255,123,143,0.08)'
+  const areaPath = `${path} L ${toX(data.length - 1)} ${pad.top + chartH} L ${toX(0)} ${pad.top + chartH} Z`
+
+  const yTicks = 4
+  const yTickVals = Array.from({ length: yTicks + 1 }, (_, i) => minE + (range * i) / yTicks)
+
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} style={{ width: '100%', height: 'auto' }}>
+      <defs>
+        <linearGradient id="eqGrad" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor={isUp ? '#39d98a' : '#ff7b8f'} stopOpacity="0.25" />
+          <stop offset="100%" stopColor={isUp ? '#39d98a' : '#ff7b8f'} stopOpacity="0" />
+        </linearGradient>
+      </defs>
+      {/* grid */}
+      {yTickVals.map((v, i) => (
+        <line key={i} x1={pad.left} y1={toY(v)} x2={pad.left + chartW} y2={toY(v)} stroke="rgba(255,255,255,0.04)" strokeDasharray="2,4" />
+      ))}
+      {/* area */}
+      <path d={areaPath} fill="url(#eqGrad)" />
+      {/* line */}
+      <path d={path} fill="none" stroke={stroke} strokeWidth={2} />
+      {/* start / end dots */}
+      <circle cx={toX(0)} cy={toY(equities[0])} r={3} fill={stroke} />
+      <circle cx={toX(data.length - 1)} cy={toY(equities[equities.length - 1])} r={3} fill={stroke} />
+      {/* Y axis labels */}
+      {yTickVals.map((v, i) => (
+        <text key={`yl-${i}`} x={pad.left - 6} y={toY(v)} textAnchor="end" alignmentBaseline="middle" fill="#97a9c6" fontSize={10} fontFamily="monospace">
+          ${v.toFixed(0)}
+        </text>
+      ))}
+      {/* X axis label */}
+      <text x={pad.left} y={h - 4} fill="#97a9c6" fontSize={10} fontFamily="monospace">{data[0].ts.slice(0, 10)}</text>
+      <text x={pad.left + chartW} y={h - 4} fill="#97a9c6" fontSize={10} fontFamily="monospace" textAnchor="end">{data[data.length - 1].ts.slice(0, 10)}</text>
+    </svg>
+  )
+}
 
 const colors = {
   bg: '#0d1726',
@@ -52,6 +116,7 @@ interface Props {
 const TradesPanel: React.FC<Props> = ({ calendar }) => {
   const [tradesRes, setTradesRes] = React.useState<TradesResponse | null>(null)
   const [summary, setSummary] = React.useState<TradeSummary | null>(null)
+  const [equity, setEquity] = React.useState<EquityCurveResponse | null>(null)
   const [loading, setLoading] = React.useState(true)
   const [offset, setOffset] = React.useState(0)
   const limit = 50
@@ -61,18 +126,21 @@ const TradesPanel: React.FC<Props> = ({ calendar }) => {
     const load = async () => {
       setLoading(true)
       try {
-        const [t, s] = await Promise.all([
+        const [t, s, e] = await Promise.all([
           fetchTrades({ limit: String(limit), offset: String(offset) }).catch(() => ({ trades: [], total: 0, limit, offset })),
           fetchTradesSummary().catch((): TradeSummary => ({ overall: {} as any, by_symbol: {} })),
+          fetchEquityCurve('all').catch((): EquityCurveResponse => ({ points: [], summary: { start_equity: 0, current_equity: 0, peak_equity: 0, max_drawdown_pct: 0, total_trades: 0 } })),
         ])
         if (!cancelled) {
           setTradesRes(t)
           setSummary(s)
+          setEquity(e)
         }
       } catch {
         if (!cancelled) {
           setTradesRes(null)
           setSummary(null)
+          setEquity(null)
         }
       } finally {
         if (!cancelled) setLoading(false)
@@ -112,6 +180,22 @@ const TradesPanel: React.FC<Props> = ({ calendar }) => {
         ))}
       </div>
 
+      {/* Equity Curve */}
+      {equity && equity.points.length > 0 && (
+        <div style={{ ...panelStyle, marginBottom: 16 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+            <h3 style={{ margin: 0, fontSize: 13, color: colors.cyan, fontWeight: 700 }}>Equity Curve</h3>
+            <div style={{ display: 'flex', gap: 12, fontSize: 11, fontFamily: 'monospace' }}>
+              <span style={{ color: colors.muted }}>Start: <span style={{ color: colors.text }}>${equity.summary.start_equity.toFixed(2)}</span></span>
+              <span style={{ color: colors.muted }}>Current: <span style={{ color: equity.summary.current_equity >= equity.summary.start_equity ? colors.green : colors.red }}>${equity.summary.current_equity.toFixed(2)}</span></span>
+              <span style={{ color: colors.muted }}>Peak: <span style={{ color: colors.text }}>${equity.summary.peak_equity.toFixed(2)}</span></span>
+              <span style={{ color: colors.muted }}>Max DD: <span style={{ color: colors.red }}>{equity.summary.max_drawdown_pct.toFixed(2)}%</span></span>
+            </div>
+          </div>
+          <EquityChart data={equity.points} />
+        </div>
+      )}
+
       {/* Calendar banner */}
       {calendar.length > 0 && (
         <div style={{ ...panelStyle, marginBottom: 16 }}>
@@ -136,9 +220,7 @@ const TradesPanel: React.FC<Props> = ({ calendar }) => {
         </div>
       )}
 
-      {loading && trades.length === 0 && (
-        <div style={{ ...panelStyle, color: colors.muted }}>Loading trades...</div>
-      )}
+      {loading && trades.length === 0 && <LoadingBar label="Loading trades..." />}
       {!loading && trades.length === 0 && (
         <div style={{ ...panelStyle, color: colors.muted }}>No trades found.</div>
       )}

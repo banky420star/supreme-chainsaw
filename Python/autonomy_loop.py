@@ -58,7 +58,7 @@ class AutonomyLoop:
         self._last_evaluated_candidate_by_symbol = {}
         self._last_train_ts = 0.0
         self._last_train_ts_by_symbol = {}
-        self._train_lock = asyncio.Lock()
+        self._train_locks = {}
         self._symbol_tasks = []
         self.training_state = {
             "active_canary": False,
@@ -308,7 +308,8 @@ class AutonomyLoop:
             logger.warning(f"Autonomy training skipped for {symbol}: champion_cycle lock is active")
             return
 
-        async with self._train_lock:
+        lock = self._train_locks.setdefault(symbol, asyncio.Lock())
+        async with lock:
             started = time.time()
             self._notify(f"Autonomy training started {symbol}: isolated LSTM + Dreamer + PPO")
 
@@ -338,8 +339,10 @@ class AutonomyLoop:
             self._notify(f"Autonomy training finished {symbol}. elapsed={elapsed}s")
 
     async def _train_candidate(self):
-        for symbol in self._load_symbols_cfg():
-            await self._train_symbol_candidate(symbol)
+        symbols = self._load_symbols_cfg()
+        if not symbols:
+            return
+        await asyncio.gather(*[self._train_symbol_candidate(s) for s in symbols])
 
     def _maybe_reload_brain(self):
         if hasattr(self.brain, "_load_ppo_from_registry"):
@@ -536,153 +539,182 @@ class AutonomyLoop:
                 logger.info(f"Symbol lane {symbol}: backing off {backoff}s before retry")
                 await asyncio.sleep(backoff)
 
-    def training_cycle(self, symbols):
+    def _run_symbol_cycle(self, symbol):
+        """Train, backtest and promote a single symbol. Called in parallel."""
+        if not self.enable_train:
+            return {"symbol": symbol, "skipped": True}
+
+        # ---- candle-count gate ----
+        try:
+            from Python.mt5_compat import mt5
+            rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 99999)
+            total_available = len(rates) if rates is not None else 0
+        except Exception as exc:
+            logger.warning(f"training_cycle: could not fetch candle count for {symbol}: {exc}")
+            total_available = 0
+
+        last_count = int(self._training_cycle_last_candles.get(str(symbol), 0))
+        new_candles = total_available - last_count
+        if new_candles < 1000:
+            logger.info(
+                f"training_cycle: {symbol} has only {new_candles} new 5m candles since last cycle; skipping"
+            )
+            return {"symbol": symbol, "skipped": True}
+        self._training_cycle_last_candles[str(symbol)] = total_available
+
+        self.training_state.update(
+            {
+                "status": f"training_{symbol}",
+                "lstm_epoch": None,
+                "ppo_timesteps": None,
+                "backtest_score": None,
+                "backtest_pnl": None,
+                "backtest_drawdown": None,
+                "promoted": False,
+                "error": None,
+            }
+        )
+        self._notify(f"Training cycle started {symbol}")
+
+        # ---- LSTM ----
+        try:
+            lstm_env = os.environ.copy()
+            lstm_env["AGI_LSTM_SYMBOLS"] = str(symbol)
+            subprocess.check_call(
+                [sys.executable, "training/train_lstm.py"],
+                cwd=PROJECT_ROOT,
+                env=lstm_env,
+            )
+            self.training_state["lstm_epoch"] = "completed"
+        except Exception as exc:
+            logger.warning(f"training_cycle LSTM failed for {symbol}: {exc}")
+            self.training_state["error"] = f"lstm_failed:{exc}"
+            return {"symbol": symbol, "error": f"lstm_failed:{exc}"}
+
+        # ---- PPO ----
+        try:
+            ppo_env = os.environ.copy()
+            ppo_env["AGI_DRL_SYMBOL"] = str(symbol)
+            subprocess.check_call(
+                [sys.executable, "training/train_ppo.py"],
+                cwd=PROJECT_ROOT,
+                env=ppo_env,
+            )
+            self.training_state["ppo_timesteps"] = "completed"
+        except Exception as exc:
+            logger.warning(f"training_cycle PPO failed for {symbol}: {exc}")
+            self.training_state["error"] = f"ppo_failed:{exc}"
+            return {"symbol": symbol, "error": f"ppo_failed:{exc}"}
+
+        # ---- locate candidate ----
+        candidate_dir = self._latest_candidate_dir(symbol=symbol)
+        if not candidate_dir:
+            logger.warning(f"training_cycle: no candidate found after training for {symbol}")
+            self.training_state["error"] = "no_candidate"
+            return {"symbol": symbol, "error": "no_candidate"}
+
+        # ---- backtest ----
+        try:
+            report = evaluate_candidate_vs_champion(
+                candidate_dir=candidate_dir,
+                champion_dir=self._get_champion_dir(symbol=symbol),
+                symbols=[symbol],
+                period="60d",
+                gates=self.eval_config,
+                interval="5m",
+            )
+            cand = report.get("candidate") or {}
+            pnl = float(cand.get("avg_return", -999.0))
+            dd = float(cand.get("worst_drawdown", 1.0))
+            score = float(cand.get("avg_score", 0.0))
+            self.training_state["backtest_pnl"] = pnl
+            self.training_state["backtest_drawdown"] = dd
+            self.training_state["backtest_score"] = score
+        except Exception as exc:
+            logger.warning(f"training_cycle backtest failed for {symbol}: {exc}")
+            self.training_state["error"] = f"backtest_failed:{exc}"
+            return {"symbol": symbol, "error": f"backtest_failed:{exc}"}
+
+        # ---- promotion gate ----
+        if pnl > 0 and dd <= self.max_eval_dd:
+            try:
+                self.registry.set_canary(
+                    candidate_dir,
+                    symbol=symbol,
+                    policy={
+                        "min_trades": 0,
+                        "min_realized_pnl": 0.0,
+                        "max_drawdown": self.max_eval_dd,
+                        "min_runtime_minutes": 0,
+                    },
+                )
+                self.registry.promote_canary_to_champion(symbol=symbol, force=True)
+                self.training_state["promoted"] = True
+                self.training_state["active_canary"] = bool(self._get_canary_dir(symbol=symbol))
+                self._notify(
+                    f"Training cycle promoted champion for {symbol}: {os.path.basename(candidate_dir)}"
+                )
+            except Exception as exc:
+                logger.warning(f"training_cycle promotion failed for {symbol}: {exc}")
+                self.training_state["error"] = f"promotion_failed:{exc}"
+        else:
+            logger.info(
+                f"training_cycle: candidate for {symbol} blocked by backtest gates pnl={pnl:.4f} dd={dd:.4f}"
+            )
+            self.training_state["error"] = f"backtest_gates:pnl={pnl:.4f},dd={dd:.4f}"
+
+        # ---- perpetual improvement log ----
+        try:
+            _append_perpetual_improvement(
+                symbol=symbol,
+                action="training_cycle_complete",
+                old_value=None,
+                new_value=self.training_state.get("backtest_score"),
+                reason=(
+                    f"pnl={self.training_state.get('backtest_pnl')}, "
+                    f"dd={self.training_state.get('backtest_drawdown')}, "
+                    f"promoted={self.training_state.get('promoted', False)}"
+                ),
+            )
+        except Exception:
+            pass
+
+        return {"symbol": symbol, "promoted": self.training_state.get("promoted", False)}
+
+    def training_cycle(self, symbols, shutdown_event=None):
         """
         Synchronous training orchestration invoked from Server_AGI main loop.
         Checks new 5m candle count, runs LSTM + PPO, backtests the resulting
         candidate, and promotes to champion if backtest gates pass.
+        Now runs all symbols in parallel using a thread pool.
         """
         now = time.time()
         self.training_state.update({"status": "checking", "last_check": now})
 
-        for symbol in symbols:
-            if not self.enable_train:
-                break
+        max_workers = max(1, int(os.environ.get("AGI_TRAIN_PARALLEL_WORKERS", "0")))
+        if max_workers == 0:
+            max_workers = max(1, min(len(symbols), 4))
 
-            # ---- candle-count gate ----
-            try:
-                from Python.mt5_compat import mt5
-                rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 99999)
-                total_available = len(rates) if rates is not None else 0
-            except Exception as exc:
-                logger.warning(f"training_cycle: could not fetch candle count for {symbol}: {exc}")
-                total_available = 0
-
-            last_count = int(self._training_cycle_last_candles.get(str(symbol), 0))
-            new_candles = total_available - last_count
-            if new_candles < 1000:
-                logger.info(
-                    f"training_cycle: {symbol} has only {new_candles} new 5m candles since last cycle; skipping"
-                )
-                continue
-            self._training_cycle_last_candles[str(symbol)] = total_available
-
-            self.training_state.update(
-                {
-                    "status": f"training_{symbol}",
-                    "lstm_epoch": None,
-                    "ppo_timesteps": None,
-                    "backtest_score": None,
-                    "backtest_pnl": None,
-                    "backtest_drawdown": None,
-                    "promoted": False,
-                    "error": None,
-                }
-            )
-            self._notify(f"Training cycle started {symbol}")
-
-            # ---- LSTM ----
-            try:
-                lstm_env = os.environ.copy()
-                lstm_env["AGI_LSTM_SYMBOLS"] = str(symbol)
-                subprocess.check_call(
-                    [sys.executable, "training/train_lstm.py"],
-                    cwd=PROJECT_ROOT,
-                    env=lstm_env,
-                )
-                self.training_state["lstm_epoch"] = "completed"
-            except Exception as exc:
-                logger.warning(f"training_cycle LSTM failed for {symbol}: {exc}")
-                self.training_state["error"] = f"lstm_failed:{exc}"
-                continue
-
-            # ---- PPO ----
-            try:
-                ppo_env = os.environ.copy()
-                ppo_env["AGI_DRL_SYMBOL"] = str(symbol)
-                subprocess.check_call(
-                    [sys.executable, "training/train_ppo.py"],
-                    cwd=PROJECT_ROOT,
-                    env=ppo_env,
-                )
-                self.training_state["ppo_timesteps"] = "completed"
-            except Exception as exc:
-                logger.warning(f"training_cycle PPO failed for {symbol}: {exc}")
-                self.training_state["error"] = f"ppo_failed:{exc}"
-                continue
-
-            # ---- locate candidate ----
-            candidate_dir = self._latest_candidate_dir(symbol=symbol)
-            if not candidate_dir:
-                logger.warning(f"training_cycle: no candidate found after training for {symbol}")
-                self.training_state["error"] = "no_candidate"
-                continue
-
-            # ---- backtest ----
-            try:
-                report = evaluate_candidate_vs_champion(
-                    candidate_dir=candidate_dir,
-                    champion_dir=self._get_champion_dir(symbol=symbol),
-                    symbols=[symbol],
-                    period="60d",
-                    gates=self.eval_config,
-                    interval="5m",
-                )
-                cand = report.get("candidate") or {}
-                pnl = float(cand.get("avg_return", -999.0))
-                dd = float(cand.get("worst_drawdown", 1.0))
-                score = float(cand.get("avg_score", 0.0))
-                self.training_state["backtest_pnl"] = pnl
-                self.training_state["backtest_drawdown"] = dd
-                self.training_state["backtest_score"] = score
-            except Exception as exc:
-                logger.warning(f"training_cycle backtest failed for {symbol}: {exc}")
-                self.training_state["error"] = f"backtest_failed:{exc}"
-                continue
-
-            # ---- promotion gate ----
-            if pnl > 0 and dd <= self.max_eval_dd:
-                try:
-                    self.registry.set_canary(
-                        candidate_dir,
-                        symbol=symbol,
-                        policy={
-                            "min_trades": 0,
-                            "min_realized_pnl": 0.0,
-                            "max_drawdown": self.max_eval_dd,
-                            "min_runtime_minutes": 0,
-                        },
-                    )
-                    self.registry.promote_canary_to_champion(symbol=symbol, force=True)
-                    self.training_state["promoted"] = True
-                    self.training_state["active_canary"] = bool(self._get_canary_dir(symbol=symbol))
-                    self._notify(
-                        f"Training cycle promoted champion for {symbol}: {os.path.basename(candidate_dir)}"
-                    )
-                except Exception as exc:
-                    logger.warning(f"training_cycle promotion failed for {symbol}: {exc}")
-                    self.training_state["error"] = f"promotion_failed:{exc}"
-            else:
-                logger.info(
-                    f"training_cycle: candidate for {symbol} blocked by backtest gates pnl={pnl:.4f} dd={dd:.4f}"
-                )
-                self.training_state["error"] = f"backtest_gates:pnl={pnl:.4f},dd={dd:.4f}"
-
-            # ---- perpetual improvement log ----
-            try:
-                _append_perpetual_improvement(
-                    symbol=symbol,
-                    action="training_cycle_complete",
-                    old_value=None,
-                    new_value=self.training_state.get("backtest_score"),
-                    reason=(
-                        f"pnl={self.training_state.get('backtest_pnl')}, "
-                        f"dd={self.training_state.get('backtest_drawdown')}, "
-                        f"promoted={self.training_state.get('promoted', False)}"
-                    ),
-                )
-            except Exception:
-                pass
+        if len(symbols) == 1 or max_workers == 1:
+            for symbol in symbols:
+                if shutdown_event is not None and shutdown_event.is_set():
+                    logger.info("training_cycle: shutdown requested, stopping early")
+                    break
+                self._run_symbol_cycle(symbol)
+        else:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {pool.submit(self._run_symbol_cycle, s): s for s in symbols}
+                for future in as_completed(futures):
+                    if shutdown_event is not None and shutdown_event.is_set():
+                        logger.info("training_cycle: shutdown requested, stopping early")
+                        break
+                    symbol = futures[future]
+                    try:
+                        result = future.result()
+                        logger.info(f"training_cycle completed for {symbol}: {result}")
+                    except Exception as exc:
+                        logger.warning(f"training_cycle exception for {symbol}: {exc}")
 
         self.training_state["status"] = "idle"
         self.training_state["cycles_completed"] = int(self.training_state.get("cycles_completed", 0)) + 1

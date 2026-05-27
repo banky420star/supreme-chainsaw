@@ -1,0 +1,50 @@
+#!/bin/bash
+# ═══════════════════════════════════════════════════════════════════════════════
+# Chain Gambler — One-Click Installer
+# Double-click to install Chain Gambler to /Applications
+# ═══════════════════════════════════════════════════════════════════════════════
+
+APP_NAME="Chain Gambler"
+SOURCE_DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
+SOURCE_APP="$SOURCE_DIR/ChainGambler.app"
+DEST_APP="/Applications/ChainGambler.app"
+
+# ── Check source app exists ──
+if [ ! -d "$SOURCE_APP" ]; then
+    osascript -e "display alert \"$APP_NAME\" message \"ChainGambler.app not found in project folder.\""
+    exit 1
+fi
+
+# ── Confirm install ──
+BUTTON=$(osascript <<EOF
+set d to display dialog "Install $APP_NAME to Applications?" \
+    buttons {"Cancel", "Install"} \
+    default button "Install" \
+    with icon note
+button returned of d
+EOF
+)
+
+if [ "$BUTTON" != "Install" ]; then
+    exit 0
+fi
+
+# ── Remove old copy ──
+if [ -d "$DEST_APP" ]; then
+    rm -rf "$DEST_APP"
+fi
+
+# ── Copy to Applications ──
+osascript -e "display notification \"Copying to Applications...\" with title \"$APP_NAME\""
+cp -R "$SOURCE_APP" "$DEST_APP"
+
+# ── Sign with ad-hoc signature ──
+codesign --force --deep --sign - "$DEST_APP" 2>/dev/null || true
+
+# ── Done ──
+osascript -e "display alert \"$APP_NAME Installed\" message \"You can now:\
+• Press Cmd+Space and type 'Chain Gambler'\
+• Drag the icon to the Dock for one-click launch\""
+
+# ── Open Applications folder ──
+open /Applications

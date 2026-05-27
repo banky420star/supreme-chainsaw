@@ -1,7 +1,10 @@
-﻿__pycache__/
+__pycache__/
 venv/
+.venv/
+.venv312/
+fixed_venv/
 
-# Models & training artifacts (all subdirectories)
+# Models & training artifacts
 models/**/*.zip
 models/**/*.pkl
 models/**/*.pt
@@ -10,24 +13,39 @@ models/**/*.h5
 models/**/*.onnx
 models/registry/
 models/best_eval_models/
+models/lstm_agi_trained*
+models/rainforest_*.pkl
 
-# Logs
+# Logs & runtime state
 logs/
-
-# Environment / secrets
-.env
-config.yaml
-
-.venv312/
 .tmp/
-
-# Node modules in nested frontend dirs
-ui_lab_app/node_modules/
-
-# Runtime state
 live_state.json
 models/registry/active.json
+risk_supervisor_state.json
 
-# OS files
+# Secrets / local config
+.env
+config.yaml
+*.local.yaml
+
+# Heavy / experimental UI
+ui_lab_app/node_modules/
+ui_lab_app/dist/
+ui_lab_app/.vite/
+
+# OS / editor
 .DS_Store
 Thumbs.db
+*.swp
+*~
+
+# Large archives
+*.zip
+*.tar.gz
+trades.db*
+*.bak
+
+# Temporary PRR babysit scripts (local only)
+scripts/prr_health_check.sh
+start_dryrun_mac.sh
+docs/PRODUCTION_READINESS_REPORT.md

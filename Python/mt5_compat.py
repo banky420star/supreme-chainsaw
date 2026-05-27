@@ -110,6 +110,8 @@ except Exception as exc:
         class _WineMT5Bridge:
             def __init__(self, conn):
                 self._conn = conn
+                self._host = _WINE_HOST
+                self._port = _WINE_PORT
 
             def _serialize(self, value):
                 """Serialize a value for remote eval; convert datetimes to ISO strings."""
@@ -118,26 +120,51 @@ except Exception as exc:
                     return f"datetime.datetime.fromisoformat({repr(value.astimezone().isoformat())})"
                 return repr(value)
 
+            def _reconnect(self):
+                """Reconnect to the RPyC bridge after a restart."""
+                import rpyc as _rpyc
+                self._conn = _rpyc.classic.connect(self._host, self._port)
+                self._conn._config["sync_request_timeout"] = 300
+                self._conn.execute("import MetaTrader5 as mt5")
+                self._conn.execute("import datetime")
+
+            def _call(self, remote_expr):
+                """Evaluate a remote expression, reconnecting once on stale connection."""
+                try:
+                    return self._conn.eval(remote_expr)
+                except (EOFError, ConnectionError, BrokenPipeError):
+                    self._reconnect()
+                    return self._conn.eval(remote_expr)
+
             def __getattr__(self, name):
-                return self._conn.eval(f"mt5.{name}")
+                return self._call(f"mt5.{name}")
 
             def initialize(self, *args, **kwargs):
-                path_kw = {"path": "C:\\\\Program Files\\\\MetaTrader 5\\\\terminal64.exe"}
+                # On Wine, passing path= forces process creation which often fails;
+                # prefer no-arg initialize so we connect to an already-running terminal.
                 if kwargs:
-                    path_kw.update(kwargs)
-                return self._conn.eval(f"mt5.initialize(*{args}, **{path_kw})")
+                    return self._call(f"mt5.initialize(*{args}, **{kwargs})")
+                return self._call(f"mt5.initialize(*{args})")
 
             def login(self, *args, **kwargs):
-                return self._conn.eval(f"mt5.login(*{args}, **{kwargs})")
+                return self._call(f"mt5.login(*{args}, **{kwargs})")
 
             def shutdown(self, *args, **kwargs):
-                return self._conn.eval(f"mt5.shutdown(*{args}, **{kwargs})")
+                return self._call(f"mt5.shutdown(*{args}, **{kwargs})")
 
             def version(self, *args, **kwargs):
-                return self._conn.eval(f"mt5.version(*{args}, **{kwargs})")
+                return self._call(f"mt5.version(*{args}, **{kwargs})")
 
             def last_error(self, *args, **kwargs):
-                return self._conn.eval(f"mt5.last_error(*{args}, **{kwargs})")
+                return self._call(f"mt5.last_error(*{args}, **{kwargs})")
+
+            def _obtain(self, remote_expr):
+                """Eval + obtain with automatic reconnect on stale connection."""
+                try:
+                    return rpyc.utils.classic.obtain(self._conn.eval(remote_expr))
+                except (EOFError, ConnectionError, BrokenPipeError):
+                    self._reconnect()
+                    return rpyc.utils.classic.obtain(self._conn.eval(remote_expr))
 
             def account_info(self, *args, **kwargs):
                 args_str = ", ".join(self._serialize(a) for a in args)
@@ -160,93 +187,101 @@ except Exception as exc:
                     "'trade_expert': getattr(ai, 'trade_expert', None),"
                     "})(mt5.account_info(" + all_args + "))"
                 )
-                raw = rpyc.utils.classic.obtain(self._conn.eval(remote_expr))
+                raw = self._obtain(remote_expr)
                 return _sanitize_account_info(raw)
 
             def terminal_info(self, *args, **kwargs):
-                return self._conn.eval(f"mt5.terminal_info(*{args}, **{kwargs})")
+                return self._call(f"mt5.terminal_info(*{args}, **{kwargs})")
 
             def symbols_total(self, *args, **kwargs):
-                return self._conn.eval(f"mt5.symbols_total(*{args}, **{kwargs})")
+                return self._call(f"mt5.symbols_total(*{args}, **{kwargs})")
 
             def symbols_get(self, *args, **kwargs):
-                return self._conn.eval(f"mt5.symbols_get(*{args}, **{kwargs})")
+                return self._call(f"mt5.symbols_get(*{args}, **{kwargs})")
 
             def symbol_info(self, *args, **kwargs):
-                return self._conn.eval(f"mt5.symbol_info(*{args}, **{kwargs})")
+                return self._call(f"mt5.symbol_info(*{args}, **{kwargs})")
 
             def symbol_info_tick(self, *args, **kwargs):
-                return self._conn.eval(f"mt5.symbol_info_tick(*{args}, **{kwargs})")
+                return self._call(f"mt5.symbol_info_tick(*{args}, **{kwargs})")
 
             def symbol_select(self, *args, **kwargs):
-                return self._conn.eval(f"mt5.symbol_select(*{args}, **{kwargs})")
+                return self._call(f"mt5.symbol_select(*{args}, **{kwargs})")
 
             def copy_rates_from(self, symbol, timeframe, date_from, count):
-                return rpyc.utils.classic.obtain(
-                    self._conn.eval(f"mt5.copy_rates_from('{symbol}', {timeframe}, {self._serialize(date_from.astimezone())}, {count})")
+                return self._obtain(
+                    f"mt5.copy_rates_from({repr(symbol)}, {timeframe}, {self._serialize(date_from.astimezone())}, {count})"
                 )
 
             def copy_rates_from_pos(self, symbol, timeframe, start_pos, count):
-                return rpyc.utils.classic.obtain(
-                    self._conn.eval(f"mt5.copy_rates_from_pos('{symbol}', {timeframe}, {start_pos}, {count})")
+                return self._obtain(
+                    f"mt5.copy_rates_from_pos({repr(symbol)}, {timeframe}, {start_pos}, {count})"
                 )
 
             def copy_rates_range(self, symbol, timeframe, date_from, date_to):
-                return rpyc.utils.classic.obtain(
-                    self._conn.eval(f"mt5.copy_rates_range('{symbol}', {timeframe}, {self._serialize(date_from.astimezone())}, {self._serialize(date_to.astimezone())})")
+                return self._obtain(
+                    f"mt5.copy_rates_range({repr(symbol)}, {timeframe}, {self._serialize(date_from.astimezone())}, {self._serialize(date_to.astimezone())})"
                 )
 
             def copy_ticks_from(self, symbol, date_from, count, flags):
-                return rpyc.utils.classic.obtain(
-                    self._conn.eval(f"mt5.copy_ticks_from('{symbol}', {self._serialize(date_from.astimezone())}, {count}, {flags})")
+                return self._obtain(
+                    f"mt5.copy_ticks_from({repr(symbol)}, {self._serialize(date_from.astimezone())}, {count}, {flags})"
                 )
 
             def copy_ticks_range(self, symbol, date_from, date_to, flags):
-                return rpyc.utils.classic.obtain(
-                    self._conn.eval(f"mt5.copy_ticks_range('{symbol}', {self._serialize(date_from.astimezone())}, {self._serialize(date_to.astimezone())}, {flags})")
+                return self._obtain(
+                    f"mt5.copy_ticks_range({repr(symbol)}, {self._serialize(date_from.astimezone())}, {self._serialize(date_to.astimezone())}, {flags})"
                 )
 
             def orders_total(self, *args, **kwargs):
-                return self._conn.eval(f"mt5.orders_total(*{args}, **{kwargs})")
+                return self._call(f"mt5.orders_total(*{args}, **{kwargs})")
 
             def orders_get(self, *args, **kwargs):
-                return self._conn.eval(f"mt5.orders_get(*{args}, **{kwargs})")
+                return self._call(f"mt5.orders_get(*{args}, **{kwargs})")
 
             def order_calc_margin(self, *args, **kwargs):
-                return self._conn.eval(f"mt5.order_calc_margin(*{args}, **{kwargs})")
+                return self._call(f"mt5.order_calc_margin(*{args}, **{kwargs})")
 
             def order_calc_profit(self, *args, **kwargs):
-                return self._conn.eval(f"mt5.order_calc_profit(*{args}, **{kwargs})")
+                return self._call(f"mt5.order_calc_profit(*{args}, **{kwargs})")
 
             def order_check(self, *args, **kwargs):
-                return self._conn.eval(f"mt5.order_check(*{args}, **{kwargs})")
+                return self._call(f"mt5.order_check(*{args}, **{kwargs})")
 
             def order_send(self, request):
-                return self._conn.eval(f"mt5.order_send({request})")
+                # Serialize request dict safely via JSON instead of raw f-string interpolation
+                import json
+                payload = json.dumps(
+                    request,
+                    default=lambda o: o.item() if hasattr(o, "item") else str(o),
+                )
+                return self._call(
+                    f"mt5.order_send(__import__('json').loads({repr(payload)}))"
+                )
 
             def positions_total(self, *args, **kwargs):
-                return self._conn.eval(f"mt5.positions_total(*{args}, **{kwargs})")
+                return self._call(f"mt5.positions_total(*{args}, **{kwargs})")
 
             def positions_get(self, *args, **kwargs):
-                return self._conn.eval(f"mt5.positions_get(*{args}, **{kwargs})")
+                return self._call(f"mt5.positions_get(*{args}, **{kwargs})")
 
             def history_orders_total(self, date_from, date_to):
-                return self._conn.eval(f"mt5.history_orders_total({self._serialize(date_from.astimezone())}, {self._serialize(date_to.astimezone())})")
+                return self._call(f"mt5.history_orders_total({self._serialize(date_from.astimezone())}, {self._serialize(date_to.astimezone())})")
 
             def history_orders_get(self, *args, **kwargs):
                 args_str = ", ".join(self._serialize(a) for a in args)
                 kwargs_str = ", ".join(f"{k}={self._serialize(v)}" for k, v in kwargs.items())
                 all_args = ", ".join(p for p in [args_str, kwargs_str] if p)
-                return self._conn.eval(f"mt5.history_orders_get({all_args})")
+                return self._call(f"mt5.history_orders_get({all_args})")
 
             def history_deals_total(self, date_from, date_to):
-                return self._conn.eval(f"mt5.history_deals_total({self._serialize(date_from.astimezone())}, {self._serialize(date_to.astimezone())})")
+                return self._call(f"mt5.history_deals_total({self._serialize(date_from.astimezone())}, {self._serialize(date_to.astimezone())})")
 
             def history_deals_get(self, *args, **kwargs):
                 args_str = ", ".join(self._serialize(a) for a in args)
                 kwargs_str = ", ".join(f"{k}={self._serialize(v)}" for k, v in kwargs.items())
                 all_args = ", ".join(p for p in [args_str, kwargs_str] if p)
-                return self._conn.eval(f"mt5.history_deals_get({all_args})")
+                return self._call(f"mt5.history_deals_get({all_args})")
 
         mt5 = _WineMT5Bridge(_conn)
         MT5_AVAILABLE = True
@@ -307,6 +342,12 @@ except Exception as exc:
                 raise RuntimeError(
                     "MetaTrader5 is required for live trading and is unavailable in this environment."
                 ) from (_MT5_IMPORT_ERROR or _WINE_BRIDGE_ERROR)
+
+            def account_info(self, *args, **kwargs):
+                return None
+
+            def terminal_info(self, *args, **kwargs):
+                return None
 
             def __getattr__(self, name):
                 raise AttributeError(

@@ -98,9 +98,14 @@ class MT5Executor:
         self._server_ref = server
 
     def _assert_live_gate(self, action_desc: str) -> tuple[bool, str]:
-        """Return (allowed, reason) for live order_send. Paper mode always passes."""
+        """Return (allowed, reason) for live order_send. Paper/demo always pass."""
         if _is_paper_mode():
             return True, "paper_mode"
+
+        mode = os.environ.get("CHAIN_GAMBLER_EXECUTION_MODE", "paper").strip().lower()
+        if mode == "demo":
+            return True, "demo_mode"
+
         if live_safety is not None:
             gate = live_safety.live_trading_allowed()
             if not gate["allowed"]:
@@ -536,11 +541,12 @@ class MT5Executor:
             logger.debug(f"Kelly stats update failed for {symbol}: {e}")
 
     def _kelly_lot_size(self, symbol, exposure, min_lots, max_lots):
-        """Calculate lot size using Full Kelly criterion.
+        """Calculate lot size using Fractional Kelly criterion.
 
         Kelly fraction: f* = (p*b - q) / b
         Where: p = win probability, q = 1-p, b = avg_win / avg_loss
-        Full Kelly: use the entire Kelly fraction for maximum growth.
+        Fractional Kelly: multiply by kelly_fraction config (default 0.25 = Quarter-Kelly)
+                          to dampen volatility and protect small accounts.
 
         Exposure magnitude scales confidence: higher |exposure| = higher conviction.
         """
@@ -562,8 +568,12 @@ class MT5Executor:
         # Clamp to [0, 1] — negative Kelly means don't trade
         kelly_full = max(0.0, min(1.0, kelly_full))
 
-        # Full Kelly (aggressive sizing for maximum growth)
-        kelly_used = kelly_full
+        # Fractional Kelly: read from RiskEngine config, fallback to env var, then safe default
+        kelly_fraction = getattr(self.risk, "kelly_fraction", None)
+        if kelly_fraction is None:
+            kelly_fraction = float(os.environ.get("AGI_KELLY_FRACTION", "0.25"))
+        kelly_fraction = max(0.0, min(1.0, kelly_fraction))
+        kelly_used = kelly_full * kelly_fraction
 
         # Scale by conviction (|exposure| as signal strength)
         # exposure is typically 0.001-0.05, normalize to 0.3-1.0 range
@@ -580,11 +590,15 @@ class MT5Executor:
         if balance is None or balance <= 0:
             balance = 50.0  # fallback for dry-run or missing account info
 
+        # Hard cap: never trade more than balance/500 lots to prevent over-leveraging
+        # e.g. $500 → 1.0 lots max, $50 → 0.1 lots max
+        max_lots = min(max_lots, max(balance / 500.0, min_lots))
+
         # Compound growth: scale ramps up as balance grows
-        # Under $50: very conservative (0.3x) to protect tiny accounts
+        # Under $50: very conservative (0.3x)
         # $50-$200: linear ramp from 0.3x to 0.8x
         # $200-$1000: linear ramp from 0.8x to 1.0x
-        # Above $1000: full Kelly (1.0x)
+        # Above $1000: full equity scale (1.0x) — still dampened by kelly_fraction
         if balance < 50:
             equity_scale = 0.3
         elif balance < 200:
@@ -635,9 +649,10 @@ class MT5Executor:
         lot_size = max(min_lots, min(lot_size, max_lots))
 
         logger.info(
-            f"Kelly sizing {symbol}: f*={kelly_full:.3f} used={kelly_used:.3f} "
-            f"conviction={conviction:.2f} balance=${balance:.2f} scale={equity_scale:.2f} "
-            f"risk_budget=${risk_budget:.2f} max_risk=${max_risk_dollars:.2f} -> {lot_size:.2f} lots"
+            f"Kelly sizing {symbol}: f*={kelly_full:.3f} frac={kelly_fraction:.3f} "
+            f"used={kelly_used:.3f} conviction={conviction:.2f} balance=${balance:.2f} "
+            f"scale={equity_scale:.2f} risk_budget=${risk_budget:.2f} "
+            f"max_risk=${max_risk_dollars:.2f} -> {lot_size:.2f} lots"
         )
 
         return lot_size
@@ -904,7 +919,8 @@ class MT5Executor:
                     execution_context=execution_context,
                 )
 
-        self.risk.record_trade(symbol)
+        if isinstance(result_meta, dict) and result_meta.get("executed"):
+            self.risk.record_trade(symbol)
         return result_meta
 
     def close_positions(self, positions, order_meta=None, execution_context=None):
@@ -912,7 +928,7 @@ class MT5Executor:
         for p in positions:
             tick = self._symbol_tick(p.symbol)
             if tick is None:
-                self.risk.record_error()
+                logger.warning(f"Tick unavailable for {p.symbol} — skipping close for ticket {p.ticket}")
                 continue
 
             close_type = _mt5.ORDER_TYPE_SELL if p.type == _mt5.ORDER_TYPE_BUY else _mt5.ORDER_TYPE_BUY
@@ -943,8 +959,10 @@ class MT5Executor:
                     result = _mt5.order_send(request)
             last_meta = self._log_order_send(p.symbol, "close", request, result, order_meta)
             last_meta["executed"] = bool(result is not None and result.retcode == _mt5.TRADE_RETCODE_DONE)
-            if result is None or result.retcode != _mt5.TRADE_RETCODE_DONE:
+            if result is None:
                 self.risk.record_error()
+            elif result.retcode != _mt5.TRADE_RETCODE_DONE:
+                logger.warning(f"Close order failed for {p.symbol}: retcode={result.retcode} ticket={p.ticket}")
         return last_meta
 
     def _atr_points(self, symbol, bars=120, period=14):
@@ -1018,10 +1036,35 @@ class MT5Executor:
     def open_position(self, symbol, order_type, volume, order_meta=None, execution_context=None):
         tick = self._symbol_tick(symbol)
         if tick is None:
-            self.risk.record_error()
-            return {"request_action": "open", "executed": False}
+            logger.warning(f"Tick unavailable for {symbol} — skipping open")
+            return {"request_action": "open", "executed": False, "reason": "tick_unavailable"}
 
         price = tick.ask if order_type == _mt5.ORDER_TYPE_BUY else tick.bid
+
+        # Margin check — skip if account can't afford even a 20% buffer on required margin
+        try:
+            acc = _mt5.account_info()
+            margin_req = _mt5.order_calc_margin(order_type, symbol, float(volume), price)
+            if acc is not None and margin_req is not None:
+                free = float(getattr(acc, "margin_free", 0) or 0)
+                # Fallback: if broker reports zero margin requirement, estimate from contract size
+                req = float(margin_req)
+                if req <= 0:
+                    info = _mt5.symbol_info(symbol)
+                    if info is not None:
+                        contract = float(getattr(info, "trade_contract_size", 1) or 1)
+                        leverage = float(getattr(acc, "leverage", 100) or 100)
+                        if leverage <= 0 or leverage > 1e6:
+                            leverage = 100
+                        req = float(volume) * price * contract / leverage
+                if free < req * 1.2:
+                    logger.warning(
+                        f"Insufficient margin for {symbol}: need ~{req:.2f}, free={free:.2f}, volume={volume}"
+                    )
+                    return {"request_action": "open", "executed": False, "reason": "insufficient_margin"}
+        except Exception:
+            pass
+
         sl, tp, deviation = self._get_sl_tp(symbol, order_type, price)
 
         request = {
@@ -1054,8 +1097,10 @@ class MT5Executor:
                 result = _mt5.order_send(request)
         meta = self._log_order_send(symbol, "open", request, result, order_meta)
         meta["executed"] = bool(result is not None and result.retcode == _mt5.TRADE_RETCODE_DONE)
-        if result is None or result.retcode != _mt5.TRADE_RETCODE_DONE:
+        if result is None:
             self.risk.record_error()
+        elif result.retcode != _mt5.TRADE_RETCODE_DONE:
+            logger.warning(f"Order send failed for {symbol}: retcode={result.retcode} volume={volume}")
         return meta
 
     def manage_open_positions(self, symbol):

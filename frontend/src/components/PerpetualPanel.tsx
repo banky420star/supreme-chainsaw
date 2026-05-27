@@ -1,6 +1,7 @@
 import React from 'react'
 import { PerpetualImprovementState, fetchPerpetualImprovement } from '../services/api'
 import TruthBadge from './TruthBadge'
+import LoadingBar from './LoadingBar'
 
 const colors = {
   bg: '#0d1726',
@@ -52,9 +53,7 @@ const PerpetualPanel: React.FC = () => {
         Perpetual Improvement
       </h2>
 
-      {loading && !state && (
-        <div style={{ ...panelStyle, color: colors.muted }}>Loading perpetual improvement...</div>
-      )}
+      {loading && !state && <LoadingBar label="Loading perpetual improvement..." />}
       {!loading && !state && (
         <div style={{ ...panelStyle, color: colors.muted }}>
           No perpetual improvement data available. The endpoint returned empty.

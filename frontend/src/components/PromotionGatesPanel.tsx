@@ -1,6 +1,7 @@
 import React from 'react'
 import { PromotionGateItem, fetchPromotionGates } from '../services/api'
 import TruthBadge from './TruthBadge'
+import LoadingBar from './LoadingBar'
 
 const colors = {
   bg: '#0d1726',
@@ -51,9 +52,7 @@ const PromotionGatesPanel: React.FC = () => {
         Promotion Gates
       </h2>
 
-      {loading && gates.length === 0 && (
-        <div style={{ ...panelStyle, color: colors.muted }}>Loading promotion gates...</div>
-      )}
+      {loading && gates.length === 0 && <LoadingBar label="Loading promotion gates..." />}
       {!loading && gates.length === 0 && (
         <div style={{ ...panelStyle, color: colors.muted }}>
           No promotion gates configured. The endpoint returned empty.

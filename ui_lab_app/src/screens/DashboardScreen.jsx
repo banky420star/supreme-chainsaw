@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { Activity, Brain, Shield, Zap, TrendingUp, Calendar, GitBranch, CandlestickChart, Play, Square, HeartPulse, Database, Gauge, TrendingDown, AlertTriangle } from "lucide-react";
+import { Activity, Brain, Shield, Zap, TrendingUp, Calendar, GitBranch, CandlestickChart, Play, Square, HeartPulse, Database, Gauge, TrendingDown, AlertTriangle, Trees } from "lucide-react";
 import { Panel, KpiCard, MetricTile, ProgressBar, LargeSparkline, Button, EventList, dollars, money } from "../components/Common";
 import { useData } from "../data/DataContext";
 
@@ -204,6 +204,15 @@ export default function DashboardScreen({ data, selectedSymbol }) {
                   </span>
                 </div>
                 <ProgressBar label="Alignment" value={training.dreamerV3?.alignment || 0} meta={`${(training.dreamerV3?.steps || 0).toLocaleString()} steps`} />
+              </div>
+              <div>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                  <span style={{ fontSize: "0.85rem", fontWeight: 600 }}>Rainforest</span>
+                  <span className={`training-stage-badge ${training.rainforest?.state === "idle" ? "idle" : "active"}`}>
+                    {training.rainforest?.state || "idle"}
+                  </span>
+                </div>
+                <ProgressBar label="Patterns" value={(training.rainforest?.classes || []).length / 8} tone="pass" meta={`${(training.rainforest?.rows || 0).toLocaleString()} rows`} />
               </div>
             </div>
           </Panel>

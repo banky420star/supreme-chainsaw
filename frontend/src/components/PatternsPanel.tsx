@@ -2,6 +2,7 @@ import React from 'react'
 import { PatternRecord, PatternVerification, fetchPatternsVerified } from '../services/api'
 import { LSTMExplanation } from '../services/api'
 import TruthBadge from './TruthBadge'
+import LoadingBar from './LoadingBar'
 
 const colors = {
   bg: '#0d1726',
@@ -76,9 +77,7 @@ const PatternsPanel: React.FC<Props> = ({ patterns, status, lstmExpl }) => {
 
       <div style={panelStyle}>
         <h3 style={{ margin: '0 0 12px', fontSize: 14, color: colors.muted, fontWeight: 600 }}>Verified Patterns</h3>
-        {loading && verified.length === 0 && (
-          <div style={{ color: colors.muted }}>Loading verified patterns...</div>
-        )}
+        {loading && verified.length === 0 && <LoadingBar label="Loading verified patterns..." />}
         {!loading && verified.length === 0 && (
           <div style={{ color: colors.muted }}>No verified patterns yet.</div>
         )}

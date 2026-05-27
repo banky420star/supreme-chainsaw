@@ -1,6 +1,7 @@
 import React from 'react'
 import { StatusPayload } from '../types'
 import { Trade, TradeSummary, fetchTrades, fetchTradesSummary, fetchLanes, LaneStatus } from '../services/api'
+import LoadingBar from './LoadingBar'
 
 interface Props {
   status: StatusPayload
@@ -97,13 +98,16 @@ const HFTHealthPanel: React.FC<Props> = ({ status }) => {
   const [hftSummary, setHftSummary] = React.useState<TradeSummary | null>(null)
   const [recentTrades, setRecentTrades] = React.useState<Trade[]>([])
   const [lanes, setLanes] = React.useState<LaneStatus[]>([])
+  const [loading, setLoading] = React.useState(true)
 
   React.useEffect(() => {
     const loadLanes = async () => {
+      setLoading(true)
       try {
         const data = await fetchLanes()
         setLanes(data.lanes || [])
       } catch { /* ignore */ }
+      setLoading(false)
     }
     loadLanes()
     const iv = setInterval(loadLanes, 30_000)
@@ -161,6 +165,7 @@ const HFTHealthPanel: React.FC<Props> = ({ status }) => {
       <h2 style={{ margin: '0 0 16px', fontSize: 18, color: colors.cyan, fontWeight: 700 }}>
         HFT Bot Health
       </h2>
+      {loading && <LoadingBar label="Loading HFT health..." />}
 
       {/* Magic Range Display */}
       <div style={panelStyle}>
