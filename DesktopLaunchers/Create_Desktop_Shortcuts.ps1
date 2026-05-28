@@ -5,9 +5,17 @@ param(
     [switch]$Force
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 $repoRoot = "C:\supreme-chainsaw"
 Set-Location $repoRoot
+
+trap {
+    Write-Host ""
+    Write-Host "[ERROR] Desktop shortcut creation had a problem: $_" -ForegroundColor Red
+    Write-Host "You can still run the launchers manually from DesktopLaunchers\ folder." -ForegroundColor Yellow
+    Write-Host ""
+    pause
+}
 
 $desktop = [Environment]::GetFolderPath("Desktop")
 $assetsDir = Join-Path $repoRoot "assets"
@@ -26,41 +34,39 @@ $iconMini   = Join-Path $assetsDir "icon_mini_tui.ico"
 $iconFull   = Join-Path $assetsDir "icon_full_stack.ico"
 $iconReact  = Join-Path $assetsDir "icon_react_ui.ico"
 
+$iconMiniPath = $iconMini -replace '\\', '/'
+$iconFullPath = $iconFull -replace '\\', '/'
+$iconReactPath = $iconReact -replace '\\', '/'
+
 $iconScript = @"
 from PIL import Image, ImageDraw, ImageFont
 import sys
 
-def create_icon(output_path, color, letter, label):
+def create_icon(output_path, color, letter):
     img = Image.new('RGBA', (256, 256), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    
-    # Rounded rectangle background
     draw.rounded_rectangle([20, 20, 236, 236], radius=40, fill=color)
-    
-    # Big letter in center
     try:
         font = ImageFont.truetype("arial.ttf", 140)
     except:
         font = ImageFont.load_default()
-    
     bbox = draw.textbbox((0, 0), letter, font=font)
     w = bbox[2] - bbox[0]
     h = bbox[3] - bbox[1]
     x = (256 - w) // 2
     y = (256 - h) // 2 - 10
     draw.text((x, y), letter, fill="white", font=font)
-    
     img.save(output_path, format='ICO', sizes=[(256,256),(128,128),(64,64),(48,48),(32,32),(16,16)])
     print(f"Created: {output_path}")
 
-# Mini TUI - Purple / Magenta (compact watcher)
-create_icon(r"$iconMini", (139, 92, 246), "M", "Mini TUI")
+# Mini TUI - Purple
+create_icon(r"$iconMiniPath", (139, 92, 246), "M")
 
-# Full Stack - Green (complete system)
-create_icon(r"$iconFull", (34, 197, 94), "F", "Full Stack")
+# Full Stack - Green
+create_icon(r"$iconFullPath", (34, 197, 94), "F")
 
-# React UI - Blue (frontend)
-create_icon(r"$iconReact", (59, 130, 246), "R", "React UI")
+# React UI - Blue
+create_icon(r"$iconReactPath", (59, 130, 246), "R")
 
 print("All icons generated successfully.")
 "@
@@ -75,12 +81,22 @@ if (Test-Path $venvPython) {
 
 if ($hasPillow) {
     Write-Host "Generating distinct colored icons using Pillow..." -ForegroundColor Green
-    & $venvPython -c $iconScript
+    try {
+        $tmpPy = Join-Path $env:TEMP "gen_icons_$(Get-Random).py"
+        $iconScript | Out-File -FilePath $tmpPy -Encoding UTF8 -Force
+        & $venvPython $tmpPy 2>&1
+        Remove-Item $tmpPy -ErrorAction SilentlyContinue
+    } catch {
+        Write-Host "Pillow icon generation failed ($_) - falling back to system icons for shortcuts." -ForegroundColor Yellow
+        $iconMini  = "%SystemRoot%\System32\imageres.dll,109"
+        $iconFull  = "%SystemRoot%\System32\imageres.dll,101"
+        $iconReact = "%SystemRoot%\System32\imageres.dll,104"
+    }
 } else {
-    Write-Host "Pillow not available in venv. Using system icons instead." -ForegroundColor Yellow
-    $iconMini  = "%SystemRoot%\System32\imageres.dll,109"   # Purple-ish / document
-    $iconFull  = "%SystemRoot%\System32\imageres.dll,101"   # Green / system
-    $iconReact = "%SystemRoot%\System32\imageres.dll,104"   # Blue / network
+    Write-Host "Pillow not available in .venv312. Using reliable system icons for the desktop shortcuts." -ForegroundColor Yellow
+    $iconMini  = "%SystemRoot%\System32\imageres.dll,109"
+    $iconFull  = "%SystemRoot%\System32\imageres.dll,101"
+    $iconReact = "%SystemRoot%\System32\imageres.dll,104"
 }
 
 # ============================================================

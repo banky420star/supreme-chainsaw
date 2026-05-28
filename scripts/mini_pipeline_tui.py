@@ -200,6 +200,17 @@ def _load_latest_full_cycle_report() -> Optional[Dict[str, Any]]:
         return None
 
 
+def _safe_text(val: Any, max_len: int = 58, default: str = "—") -> str:
+    """Safely convert value to string and truncate. Handles None and missing data from JSON artifacts."""
+    if val is None:
+        return default
+    try:
+        s = str(val)
+        return s[:max_len] if len(s) > max_len else s
+    except Exception:
+        return default
+
+
 def _get_training_progress() -> Dict[str, Any]:
     """Extract live decision_ppo progress from health + recent log tails."""
     prog: Dict[str, Any] = {"status": "NO ACTIVE RUN", "step": 0, "pct": 0, "symbol": "XAUUSDm", "timesteps": 50000}
@@ -325,7 +336,7 @@ def _render_execution_panel(reports: List[Dict[str, Any]], harness: Optional[Dic
         for r in reports:
             ts = r.get("_mtime", "?")
             dec = r.get("decision") or r.get("trade_decision") or {}
-            did = dec.get("decision_id", r.get("_file","")[:12])
+            did = _safe_text(dec.get("decision_id") or r.get("_file",""), 12)
             side = dec.get("side", "?")
             size_spec = dec.get("size", {}) or {}
             size = size_spec.get("risk_pct_equity") or size_spec.get("fixed_lots") or dec.get("size", 0.01)
@@ -385,7 +396,7 @@ def _render_swarm_panel(statuses: List[Dict[str, Any]]) -> Panel:
         t.add_row("-", "NO AGENTS", "-", "Spawn agents via swarm or they auto-write on task start")
     else:
         for s in statuses:
-            name = s.get("_file", "?")[:26]
+            name = _safe_text(s.get("_file", "?"), 26)
             st = str(s.get("status", s.get("state", "-")))[:11]
             mt = s.get("_mtime", "?")
             note = ""
@@ -421,7 +432,7 @@ def _render_validation_panel(val: Optional[Dict[str, Any]]) -> Panel:
     txt.append(f"Status: {status}  |  Tests: {tests}  Promoted: {promoted}\n", style="bold")
     txt.append(f"Latest: {sym} | Beats champion: {beats} | Promote: {promote} | Δret={delta:+.2%}\n", style="green" if beats else "red")
     if latest:
-        txt.append(f"Report: {latest.get('rich_report_path', '—')[:58]}\n", style="dim")
+        txt.append(f"Report: {_safe_text(latest.get('rich_report_path'), 58)}\n", style="dim")
     txt.append("Rich outputs: pattern profitability • timing windows • TimeExitSpec effectiveness • standardized for retrainer", style="dim")
     return Panel(txt, title="VALIDATION HARNESS (FastBacktester A/B + Pattern+Timing)", box=box.ROUNDED, style="green")
 
@@ -461,11 +472,11 @@ def _render_self_evolution_panel(meta: Optional[Dict[str, Any]], cycle: Optional
         prom = ab.get("recommend_for_promotion", "?")
         dpnl = cycle.get("artifact_summary", {}).get("key_deltas", {}).get("pnl_delta", 0)
         t.add_row("Last Cycle", f"Beats={beats} Promote={prom} Δpnl={dpnl:+.0f}")
-        verdict = cycle.get("artifact_summary", {}).get("verdict", "")[:55]
-        if verdict:
+        verdict = _safe_text(cycle.get("artifact_summary", {}).get("verdict"), 55)
+        if verdict and verdict != "—":
             t.add_row("Verdict", verdict)
-        next_act = cycle.get("clear_next_action_recommendation", "")[:75]
-        if next_act:
+        next_act = _safe_text(cycle.get("clear_next_action_recommendation"), 75)
+        if next_act and next_act != "—":
             t.add_row("Action", next_act + "...")
 
     return Panel(t, title="SELF-EVOLUTION / META OVERRIDES (real artifact → hardened + pattern/timing boost)", box=box.ROUNDED, style="magenta")
