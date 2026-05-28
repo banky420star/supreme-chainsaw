@@ -1,0 +1,18 @@
+{
+  "data_sources": [
+    "runtime/agent_status/*.json (data_reliability, decision_ppo_*, timing_obs, training_monitor, handoff_watcher etc)",
+    "logs/PIPELINE_DECISIONS.jsonl + execution_feedback.jsonl",
+    "runtime/execution_reports + mql5_commands + last_handoff.json",
+    "configs/best_features_per_symbol.yaml + data/test caches",
+    "training_health.json + timing insights JSONs"
+  ],
+  "focus": "full pipeline in high detail: data_ingest (MTF XAU/BTC bars+timing) + feature (MTF+best+session/news/open) + models (PPO/Dreamer/Rainforest/pattern) + rich_DecisionPPO (TimeExitSpec) + ExecutionAgent (pure-py orders/partials/trailing/telemetry) + autonomous_loop (watcher/cand/prom/harness) + timing_insights + alerts",
+  "integration": "reuses _load_recent_rich_decisions, _load_timing_analyzer_insights, get_model_brains_data, compute_loop_closure_score etc + new dense loaders",
+  "last_action": "once_snapshot_complete",
+  "last_updated": "2026-05-28T14:32:47.800286+00:00",
+  "name": "TUI Mini Pipeline Watcher Agent",
+  "platform": "Windows VPS (msvcrt keys + Rich Live)",
+  "refresh_s": 5,
+  "status": "RUNNING",
+  "view_mode": "mini"
+}

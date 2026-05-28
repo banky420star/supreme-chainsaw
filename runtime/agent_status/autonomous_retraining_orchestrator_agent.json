@@ -1,0 +1,63 @@
+{
+  "agent": "Autonomous Retraining Orchestrator",
+  "role": "Tactical closed-loop self-improvement: trigger -> async train launch (PPO/Dreamer/Rainforest) -> FastBacktester OOS eval (pattern+timing) -> PromotionGates -> promote marker/handoff",
+  "status": "CYCLE_COMPLETE",
+  "last_update": "2026-05-28T14:51:52.491206+00:00",
+  "config": {
+    "performance_degradation_threshold": -0.6,
+    "min_trades_for_eval": 50,
+    "backtest_weeks": 4,
+    "check_interval_seconds": 99999,
+    "max_concurrent_jobs": 2,
+    "training_timesteps": 50000,
+    "symbols": [
+      "XAUUSDm",
+      "BTCUSDm"
+    ],
+    "require_fast_bt_for_promote": true,
+    "promotion_sharpe_min": 0.9,
+    "promotion_dd_max": 0.08,
+    "enable_continual_learner": true,
+    "log_level": "INFO"
+  },
+  "state": {
+    "last_check": "2026-05-28T14:51:52.491206+00:00",
+    "current_champion": "promoted_from_C:\\supreme-chainsaw\\models\\best_eval_models\\best_model.zip",
+    "retraining_in_progress": false,
+    "last_retrain_reason": "no_trigger",
+    "active_job_count": 2,
+    "last_successful_retrain": null
+  },
+  "active_jobs": {
+    "retrain_decision_ppo_1779979835_a9ecbc": {
+      "job_id": "retrain_decision_ppo_1779979835_a9ecbc",
+      "model_type": "decision_ppo",
+      "pid": 8876,
+      "started": "2026-05-28T14:50:35.588081+00:00",
+      "status": "running",
+      "cmd": "python C:\\supreme-chainsaw\\launch_decision_ppo_training.py --symbol XAUUSDm --timesteps 50000"
+    },
+    "retrain_dreamer_1779979835_a4607f": {
+      "job_id": "retrain_dreamer_1779979835_a4607f",
+      "model_type": "dreamer",
+      "pid": 5260,
+      "started": "2026-05-28T14:50:35.604165+00:00",
+      "status": "running",
+      "cmd": "python C:\\supreme-chainsaw\\Python\\training\\train_dreamer.py --symbol XAUUSDm"
+    }
+  },
+  "integration_points": {
+    "fast_backtester": true,
+    "experience_memory": true,
+    "retraining_trigger": false,
+    "promotion_gates": true,
+    "model_registry": false,
+    "continual_learner": true
+  },
+  "end_to_end_flow": "retraining_trigger (or supervisor) -> should_retrain -> launch_async (subprocess Popen on launch_decision_ppo_training.py + train_*.py) -> poll + parse metrics/logs -> _evaluate_with_fast_bt -> PromotionGates.evaluate -> promote / handoff marker",
+  "artifacts": {
+    "log": "C:\\supreme-chainsaw\\runtime\\agent_status\\retraining_orchestrator_log.jsonl",
+    "status": "C:\\supreme-chainsaw\\runtime\\agent_status\\autonomous_retraining_orchestrator_agent.json",
+    "jobs": "C:\\supreme-chainsaw\\runtime\\retraining_jobs\\active_jobs.json"
+  }
+}
