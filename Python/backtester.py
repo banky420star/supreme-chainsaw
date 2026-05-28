@@ -253,6 +253,8 @@ def run_multi(
     per_symbol = []
     errors = []
     tf = _normalize_interval(interval)
+    if not symbols:
+        symbols = ["BTCUSDm"]
     for sym in symbols:
         try:
             r = run_ppo_backtest(

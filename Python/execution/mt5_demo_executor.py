@@ -10,11 +10,18 @@ Enforces demo-only constraints:
 
 from __future__ import annotations
 
+import os
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Union
 
 from loguru import logger
+
+# Rich Decision support (additive, no breakage)
+try:
+    from Python.execution.trade_decision import TradeDecision
+except Exception:
+    TradeDecision = None  # type: ignore
 
 
 class MT5DemoExecutor:
@@ -63,7 +70,14 @@ class MT5DemoExecutor:
         symbol = intent.get("symbol", "")
         size = float(intent.get("size", 0.0) or 0.0)
 
-        # 1. Lot cap
+        # 1. Lot cap (also respect AGI_PAPER_FIXED_LOT env for harness consistency)
+        fixed = os.environ.get("AGI_PAPER_FIXED_LOT", "").strip()
+        if fixed:
+            try:
+                if size > float(fixed):
+                    size = float(fixed)
+            except Exception:
+                pass
         if size > self.MAX_LOT:
             return False, f"lot_cap ({size} > {self.MAX_LOT})"
 
@@ -87,8 +101,25 @@ class MT5DemoExecutor:
 
         return True, "guards_passed"
 
-    def execute(self, intent: dict[str, Any]) -> dict[str, Any]:
-        """Execute a gated trade intent through the wrapped MT5Executor."""
+    def execute(self, intent: Union[dict[str, Any], "TradeDecision"]) -> dict[str, Any]:
+        """Execute a gated trade intent or rich TradeDecision through the wrapped MT5Executor.
+        Supports Decision PPO full specs via normalization (legacy paths unchanged).
+        """
+        # Normalize TradeDecision for guards + downstream (adapter)
+        if TradeDecision is not None and isinstance(intent, TradeDecision):
+            td = intent
+            intent = {
+                "symbol": td.symbol,
+                "side": td.side.value if hasattr(td.side, "value") else str(td.side),
+                "size": td.size.value if hasattr(td.size, "value") else 0.01,
+                "price": 0.0,
+                "sl": getattr(getattr(td, "sl", None), "price", None) or getattr(getattr(td, "sl", None), "value", None),
+                "tp": getattr(getattr(td, "tp", None), "price", None) or getattr(getattr(td, "tp", None), "value", None),
+                "magic": td.magic,
+                "comment": td.comment,
+                "decision_id": getattr(td, "decision_id", None),
+                "rich": True,
+            }
         allowed, reason = self._enforce_guards(intent)
         if not allowed:
             logger.warning(f"[DEMO GATE] Blocked intent: {reason}")
@@ -162,3 +193,15 @@ class MT5DemoExecutor:
             except Exception as exc:
                 logger.warning(f"[DEMO] get_positions failed: {exc}")
         return []
+
+    def force_rollback_flatten(self, reason: str = "harness_trigger") -> dict:
+        """Harness safety hook: delegate flatten to wrapped MT5Executor and record risk."""
+        logger.critical(f"[DEMO HARNESS] Rollback flatten: {reason}")
+        if self.risk is not None:
+            try:
+                self.risk.record_pnl_with_equity(-9999, getattr(self.risk, "_current_equity", 10000))  # force consideration
+            except Exception:
+                pass
+        if self._mt5 is not None and hasattr(self._mt5, "force_flatten_all"):
+            return self._mt5.force_flatten_all(reason)
+        return {"closed": 0, "note": "no_mt5_executor_wired"}

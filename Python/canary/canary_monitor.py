@@ -69,6 +69,15 @@ class CanaryMonitor:
         if self.canary.risk_violations > 0:
             reasons.append(f"risk_violations={self.canary.risk_violations} > 0")
 
+        # 4. Timing degradation rollback trigger (rich Decision PPO news/open window behavior)
+        # If too many trades in news proximity relative to avoided, or negative timing score, rollback
+        prox = getattr(self.canary, "timing_news_prox_trades", 0)
+        avoided = getattr(self.canary, "timing_news_avoided_trades", 0)
+        timing_score = getattr(self.canary, "timing_news_avoidance_score", 0.0) if hasattr(self.canary, "timing_news_avoidance_score") else 0.0
+        total_timed = prox + avoided
+        if total_timed >= 5 and (prox / max(1, total_timed) > 0.6 or timing_score < -0.5):
+            reasons.append(f"timing_degradation: news_prox_ratio={prox/max(1,total_timed):.2f} score={timing_score:.2f} (poor news avoidance / open window perf from rich decisions)")
+
         if reasons:
             self.stopped = True
             self.stop_reason = "; ".join(reasons)
@@ -88,6 +97,11 @@ class CanaryMonitor:
             "risk_violations": self.canary.risk_violations,
             "stopped": self.stopped,
             "stop_reason": self.stop_reason,
+            # Timing-specific for rich Decision PPO TimeExitSpec (open vs news avoidance)
+            "timing_open_window_trades": getattr(self.canary, "timing_open_window_trades", 0),
+            "timing_news_avoided_trades": getattr(self.canary, "timing_news_avoided_trades", 0),
+            "timing_news_prox_trades": getattr(self.canary, "timing_news_prox_trades", 0),
+            "timing_news_avoidance_score": getattr(self.canary, "timing_news_avoidance_score", 0.0) if hasattr(self.canary, "timing_news_avoidance_score") else round((getattr(self.canary, "timing_news_avoid_pnl", 0.0)) / max(1.0, self.canary.notional_balance) * 100, 4),
         }
 
         with open(self.log_path, "a", encoding="utf-8") as f:

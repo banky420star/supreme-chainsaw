@@ -1188,10 +1188,7 @@ class FastBacktester:
         open_win = timing.get("major_open_window", 0.0) > 0.4
         strong_pat = pat.get("strength", 0.0) > 0.55 and pat.get("direction") in ("bullish", "bearish")
 
-        # For validation campaigns, enter on moderate pattern or timing to produce rich attribution telemetry
-        if not (strong_pat or open_win or pat.get("strength", 0.0) > 0.30):
-            return None
-
+        # For validation campaigns: always enter (PPO-like) so that pattern_context + timing_context can drive differentiated TimeExitSpec outcomes and rich attribution
         side = Side.LONG if (pat.get("direction") != "bearish") else Side.SHORT
         max_hold = 70 if news else (195 if open_win or strong_pat else 120)
 
@@ -1284,10 +1281,8 @@ def make_champion_policy():
             return None
         pat = obs.get("pattern_context", {})
         tim = obs.get("timing_context", {})
-        # Baseline: enter on any detectable pattern direction or open window (for attribution data)
-        has_signal = pat.get("strength", 0.0) > 0.25 or tim.get("major_open_window", 0.0) > 0.25
-        if not has_signal:
-            return None
+        # For meaningful validation telemetry: always consider entry (PPO-like frequency); rich context still tags for attribution
+        # Baseline uses fixed conservative TimeExit regardless of pattern strength/timing
         side = Side.LONG if pat.get("direction") != "bearish" else Side.SHORT
         return TradeDecision(
             symbol=obs.get("symbol", "XAUUSDm"),
@@ -1311,15 +1306,12 @@ def make_pattern_timing_candidate_policy():
         news_p = tim.get("news_proximity", 0.0)
         open_w = tim.get("major_open_window", 0.0)
         strength = pat.get("strength", 0.0)
-        # Validation-friendly: enter on moderate signals to generate attribution data for edge proof
-        has_signal = (strength > 0.28 and pat.get("direction") in ("bullish", "bearish")) or open_w > 0.25 or news_p < 0.2
-        if not has_signal:
-            return None
 
         side = Side.LONG if pat.get("direction") != "bearish" else Side.SHORT
-        # Rich modulation: favorable pattern+timing -> larger size, longer hold, skip news close (trust the runner)
-        # Adverse (high news) -> smaller, short hold, force news avoidance
-        favorable = strength > 0.55 and news_p < 0.40 and open_w > 0.15
+        # Rich modulation from context (the core "pattern+timing edge" for TimeExitSpec):
+        # Favorable -> aggressive size + long runner (skip forced news exit)
+        # High news proximity -> defensive short hold + force close before news
+        favorable = strength > 0.45 and news_p < 0.42 and open_w > 0.12
         if favorable:
             size_v = 0.014
             hold = 195
@@ -1327,9 +1319,9 @@ def make_pattern_timing_candidate_policy():
             conf = 0.78
         else:
             size_v = 0.0075
-            hold = 65 if news_p > 0.5 else 105
-            close_news = news_p > 0.35
-            conf = 0.62 if strength > 0.35 else 0.48
+            hold = 55 if news_p > 0.55 else 100
+            close_news = news_p > 0.32
+            conf = 0.62 if strength > 0.30 else 0.48
 
         return TradeDecision(
             symbol=obs.get("symbol", "XAUUSDm"),
@@ -1351,9 +1343,7 @@ def make_simple_baseline_policy():
             return None
         pat = obs.get("pattern_context", {})
         tim = obs.get("timing_context", {})
-        # Enter frequently on weak signals for baseline volume
-        if pat.get("strength", 0.0) < 0.15 and tim.get("major_open_window", 0.0) < 0.15:
-            return None
+        # Simple baseline: frequent entries, fixed exits (no rich context modulation) — contrast for edge validation
         side = Side.LONG if pat.get("direction") != "bearish" else Side.SHORT
         return TradeDecision(
             symbol=obs.get("symbol", "XAUUSDm"),

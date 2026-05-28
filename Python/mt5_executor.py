@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import time
@@ -165,8 +166,8 @@ class MT5Executor:
                 max_lots = sym_cfg.get("risk", {}).get("max_lots", 1.0)
                 if lots > max_lots:
                     return False, f"lot_size_exceeds_cap ({lots} > {max_lots})"
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(f"Per-symbol lot cap check failed for {symbol} (using default): {exc}")
 
         # 5. Verify margin is sufficient (live mode only)
         if self._is_live and _mt5 is not None:
@@ -192,8 +193,8 @@ class MT5Executor:
 
                         if account.margin_free < required_margin:
                             return False, f"insufficient_margin (free={account.margin_free:.2f}, required={required_margin:.2f})"
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(f"Margin sufficiency check failed for {symbol} (allowing with caution): {exc}")
 
         return True, "ok"
 
@@ -267,8 +268,8 @@ class MT5Executor:
                 with open(config_path, "r") as f:
                     sym_cfg = yaml.safe_load(f)
                 max_spread_bps = sym_cfg.get("risk", {}).get("max_spread_bps", 50)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"Symbol config spread read failed for {symbol} (using default): {exc}")
 
         if not self._is_live or _mt5 is None:
             return True, "ok"
@@ -306,8 +307,8 @@ class MT5Executor:
                 # Two-tone alert: 800Hz for 300ms, then 1000Hz for 300ms
                 winsound.Beep(800, 300)
                 winsound.Beep(1000, 300)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug(f"Trade alert beep failed (non-critical on VPS): {exc}")
 
     @staticmethod
     def _pip_value_per_lot(symbol: str) -> float:
@@ -339,8 +340,8 @@ class MT5Executor:
                 _info = _mt5.account_info()
                 if _info and _info.equity > 0:
                     equity = float(_info.equity)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug(f"MT5 account_info equity refresh failed (using cached): {exc}")
 
         # Get ATR-based SL distance
         atr = self._get_raw_atr(symbol)
@@ -442,8 +443,8 @@ class MT5Executor:
                 with open(config_path, "r") as f:
                     sym_cfg = yaml.safe_load(f)
                 return float(sym_cfg.get("risk", {}).get("max_lots", 1.0))
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"_get_max_lots config read failed for {symbol} (default 1.0): {exc}")
         return 1.0
 
     def _get_lot_step(self, symbol: str) -> float:
@@ -453,8 +454,8 @@ class MT5Executor:
                 info = _mt5.symbol_info(symbol)
                 if info and getattr(info, "volume_step", 0) > 0:
                     return float(info.volume_step)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"_get_lot_step failed for {symbol}: {exc}")
         return self._default_lot_step
 
     def _get_symbol_sl_mult(self, symbol: str) -> float:
@@ -468,8 +469,8 @@ class MT5Executor:
                 with open(config_path, "r") as f:
                     sym_cfg = yaml.safe_load(f)
                 return float(sym_cfg.get("risk", {}).get("sl_atr_mult", 2.0))
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"_get_sl_atr_mult config failed for {symbol} (default 2.0): {exc}")
         return 2.0
 
     def _get_tick_pip_value(self, symbol: str) -> float:
@@ -482,7 +483,8 @@ class MT5Executor:
                 return 0.0
             tick_value = getattr(info, 'trade_tick_value', 0)
             return float(tick_value) if tick_value else 0.0
-        except Exception:
+        except Exception as exc:
+            logger.debug(f"_get_tick_pip_value failed for {symbol}: {exc}")
             return 0.0
 
     def _get_tick_size(self, symbol: str) -> float:
@@ -676,18 +678,19 @@ class MT5Executor:
         profile = {}
         try:
             profile = self.risk.get_symbol_profile(symbol) or {}
-        except Exception:
+        except Exception as exc:
+            logger.debug(f"risk.get_symbol_profile failed for magic: {exc}")
             profile = {}
         if "magic_base" in profile:
             try:
                 return int(profile.get("magic_base"))
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug(f"magic_base parse failed: {exc}")
         if "magic" in profile:
             try:
                 return int(profile.get("magic"))
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug(f"magic parse failed: {exc}")
         return int(MAGIC_BY_SYMBOL.get(str(symbol), 59000))
 
     def _lane_for_order(self, order_meta: dict | None) -> str:
@@ -733,8 +736,57 @@ class MT5Executor:
                 return int(value)
         return None
 
+    def _safe_order_send(self, request: dict, max_retries: int = 1) -> Any:
+        """Production retry for transient MT5 retcodes (requote/price change). Refreshes price on retry."""
+        if not self._is_live or _mt5 is None:
+            return None
+        for attempt in range(max_retries + 1):
+            try:
+                res = _mt5.order_send(request)
+                if res is None:
+                    return None
+                rc = int(getattr(res, "retcode", 0) or 0)
+                # Transient retcodes worth one retry with fresh price
+                if rc in (10004, 10006, 10018, 10021) and attempt < max_retries:
+                    # refresh price for market order
+                    sym = request.get("symbol")
+                    if sym:
+                        tick = self._symbol_tick(sym)
+                        if tick:
+                            if request.get("type") in (_mt5.ORDER_TYPE_BUY, 0):
+                                request["price"] = tick.ask
+                            else:
+                                request["price"] = tick.bid
+                    time.sleep(0.15)
+                    continue
+                return res
+            except Exception as exc:
+                if attempt == max_retries:
+                    logger.warning(f"_safe_order_send final fail: {exc}")
+                    return None
+                time.sleep(0.1)
+        return None
+
     def _log_order_send(self, symbol: str, request_action: str, request: dict, result, order_meta: dict | None):
         meta = order_meta or {}
+        requested_price = float(request.get("price", 0.0) or 0.0)
+        executed_price = 0.0
+        slippage_points = 0.0
+        if result is not None:
+            try:
+                executed_price = float(getattr(result, "price", 0.0) or 0.0)
+                if requested_price > 0 and executed_price > 0:
+                    # Approximate slippage in points (broker dependent, best effort)
+                    point = 0.00001
+                    try:
+                        sinfo = self._symbol_info(symbol)
+                        if sinfo and getattr(sinfo, "point", 0):
+                            point = float(sinfo.point)
+                    except Exception:
+                        pass
+                    slippage_points = abs(executed_price - requested_price) / max(point, 1e-10)
+            except Exception:
+                pass
         payload = {
             "action": str(request_action),
             "request_action": str(request_action),
@@ -749,9 +801,12 @@ class MT5Executor:
             "comment": request.get("comment"),
             "retcode": getattr(result, "retcode", None) if result is not None else None,
             "ticket": self._result_ticket(result),
+            "requested_price": requested_price,
+            "executed_price": executed_price,
+            "slippage_points": round(slippage_points, 1),
         }
         logger.info(
-            "ORDER_SEND {} | action={} side={} lots={:.2f} target={:.4f} ppo={:.4f} dreamer={:.4f} agi={:.4f} magic={} comment={} retcode={} ticket={}",
+            "ORDER_SEND {} | action={} side={} lots={:.2f} target={:.4f} ppo={:.4f} dreamer={:.4f} agi={:.4f} magic={} comment={} retcode={} ticket={} req_price={} exec_price={} slip_pts={}",
             symbol,
             payload["action"],
             payload["side"],
@@ -764,7 +819,22 @@ class MT5Executor:
             payload["comment"],
             payload["retcode"],
             payload["ticket"],
+            payload["requested_price"],
+            payload["executed_price"],
+            payload["slippage_points"],
         )
+        # Also append to dedicated slippage audit for harness/monitoring
+        try:
+            _base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            slip_log = os.path.join(_base, "logs", "slippage_audit.jsonl")
+            os.makedirs(os.path.dirname(slip_log), exist_ok=True)
+            with open(slip_log, "a", encoding="utf-8") as f:
+                rec = {k: payload[k] for k in ["action", "symbol", "lots", "requested_price", "executed_price", "slippage_points", "retcode", "ticket"] if k in payload}
+                rec["symbol"] = symbol
+                rec["ts"] = datetime.now(timezone.utc).isoformat()
+                f.write(json.dumps(rec, default=str) + "\n")
+        except Exception:
+            pass
         return payload
 
     def _select_filling_mode(self, symbol):
@@ -956,7 +1026,7 @@ class MT5Executor:
                     self.risk.record_error()
                     result = None
                 else:
-                    result = _mt5.order_send(request)
+                    result = self._safe_order_send(request)
             last_meta = self._log_order_send(p.symbol, "close", request, result, order_meta)
             last_meta["executed"] = bool(result is not None and result.retcode == _mt5.TRADE_RETCODE_DONE)
             if result is None:
@@ -1034,6 +1104,16 @@ class MT5Executor:
         return sl, tp, deviation
 
     def open_position(self, symbol, order_type, volume, order_meta=None, execution_context=None):
+        # Harness / paper controlled mode override: force tiny fixed lots for safety (ignores Kelly/ATR)
+        fixed_lot_env = os.environ.get("AGI_PAPER_FIXED_LOT", "").strip()
+        if fixed_lot_env:
+            try:
+                fixed = float(fixed_lot_env)
+                if fixed > 0:
+                    volume = fixed
+                    logger.info(f"[HARNESS] Using AGI_PAPER_FIXED_LOT={fixed} for {symbol} (bypassed dynamic sizing)")
+            except Exception:
+                pass
         tick = self._symbol_tick(symbol)
         if tick is None:
             logger.warning(f"Tick unavailable for {symbol} — skipping open")
@@ -1062,8 +1142,8 @@ class MT5Executor:
                         f"Insufficient margin for {symbol}: need ~{req:.2f}, free={free:.2f}, volume={volume}"
                     )
                     return {"request_action": "open", "executed": False, "reason": "insufficient_margin"}
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.error(f"Margin/execute precheck failed for {symbol} (proceeding to order with risk): {exc}")
 
         sl, tp, deviation = self._get_sl_tp(symbol, order_type, price)
 
@@ -1094,7 +1174,7 @@ class MT5Executor:
                 self.risk.record_error()
                 result = None
             else:
-                result = _mt5.order_send(request)
+                result = self._safe_order_send(request)
         meta = self._log_order_send(symbol, "open", request, result, order_meta)
         meta["executed"] = bool(result is not None and result.retcode == _mt5.TRADE_RETCODE_DONE)
         if result is None:
@@ -1202,8 +1282,64 @@ class MT5Executor:
                     self.risk.record_error()
                     result = None
                 else:
-                    result = _mt5.order_send(req)
+                    result = self._safe_order_send(req)
             self._log_order_send(symbol, "manage", req, result, {"symbol": symbol})
             if result is None or result.retcode != _mt5.TRADE_RETCODE_DONE:
                 self.risk.record_error()
 
+    def force_flatten_all(self, reason: str = "harness_rollback") -> dict:
+        """Production safety: close every open position across all symbols. Used by paper harness rollback triggers.
+        Returns summary of actions.
+        """
+        logger.critical(f"MT5Executor FORCE_FLATTEN_ALL triggered: {reason}")
+        summary = {"closed": 0, "failed": 0, "symbols": []}
+        if not self._is_live or _mt5 is None:
+            # In paper or dry, delegate to paper layer if present
+            try:
+                if _is_paper_mode():
+                    # best effort: nothing to do or paper handles
+                    pass
+            except Exception:
+                pass
+            return summary
+        try:
+            positions = _mt5.positions_get() or []
+            for p in positions:
+                try:
+                    tick = self._symbol_tick(p.symbol)
+                    if tick is None:
+                        summary["failed"] += 1
+                        continue
+                    close_type = _mt5.ORDER_TYPE_SELL if p.type == _mt5.ORDER_TYPE_BUY else _mt5.ORDER_TYPE_BUY
+                    close_price = tick.bid if close_type == _mt5.ORDER_TYPE_SELL else tick.ask
+                    req = {
+                        "action": _mt5.TRADE_ACTION_DEAL,
+                        "symbol": p.symbol,
+                        "volume": p.volume,
+                        "type": close_type,
+                        "position": p.ticket,
+                        "price": close_price,
+                        "deviation": 50,  # wider for emergency close
+                        "type_time": _mt5.ORDER_TIME_GTC,
+                        "type_filling": self._select_filling_mode(p.symbol),
+                        "magic": self._magic_for_order(p.symbol, {"lane": "history"}, request_kind="close"),
+                        "comment": f"FLATTEN|{reason}"[:31],
+                    }
+                    allowed, gate_reason = self._assert_live_gate("flatten")
+                    if not allowed:
+                        logger.error(f"Flatten blocked by gate for {p.symbol}: {gate_reason}")
+                        summary["failed"] += 1
+                        continue
+                    res = _mt5.order_send(req)
+                    self._log_order_send(p.symbol, "flatten_close", req, res, {"reason": reason})
+                    if res is not None and res.retcode == _mt5.TRADE_RETCODE_DONE:
+                        summary["closed"] += 1
+                        summary["symbols"].append(p.symbol)
+                    else:
+                        summary["failed"] += 1
+                except Exception as e:
+                    logger.warning(f"Flatten error on {p.symbol}: {e}")
+                    summary["failed"] += 1
+        except Exception as exc:
+            logger.error(f"force_flatten_all top level error: {exc}")
+        return summary

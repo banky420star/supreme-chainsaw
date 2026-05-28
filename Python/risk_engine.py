@@ -4,6 +4,12 @@ from datetime import datetime, timezone
 import yaml
 from loguru import logger
 
+# Timing awareness for rich Decision PPO TimeExitSpec / news windows (production hardening)
+try:
+    from Python.event_guard import EventGuard
+except Exception:
+    EventGuard = None  # type: ignore
+
 _CFG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml")
 
 
@@ -74,6 +80,18 @@ class RiskEngine:
             self.halt = True
             self._halt_reason = "daily_loss"
 
+    def record_pnl_with_equity(self, pnl: float, equity: float | None = None) -> bool:
+        """Enhanced: support % daily loss guard. Returns True if halt triggered."""
+        self.record_pnl(pnl)
+        if equity and equity > 50:  # avoid tiny account false triggers
+            loss_pct = abs(min(0.0, self.realized_pnl_today)) / equity * 100.0
+            max_pct = 1.5  # production paper harness default
+            if loss_pct >= max_pct:
+                self.halt = True
+                self._halt_reason = f"daily_loss_pct_{loss_pct:.1f}"
+                return True
+        return self.halt
+
     def record_trade_result(self, symbol, pnl):
         self.maybe_roll_day()
         self.record_pnl(pnl)
@@ -125,3 +143,56 @@ class RiskEngine:
         if isinstance(sym_prof, dict):
             prof.update(sym_prof)
         return prof
+
+    # --- Production hardening: timing-aware safety for rich TimeExitSpec decisions ---
+    def is_high_impact_news_window(self, symbol: str = None) -> bool:
+        """Basic + EventGuard-aware check for high-impact news proximity (respects TimeExitSpec intent).
+        Used by daily loss / flatten to honor news avoidance windows instead of blind force-close.
+        Real deployments wire full EventIntel; this provides safe fallback + integration.
+        """
+        try:
+            if EventGuard is not None:
+                # Best effort: instantiate lightweight guard (config optional)
+                guard = EventGuard({"event_guard": {"enabled": True, "high_impact_only": True}})
+                phase, _, _ = guard._get_phase(symbol or "XAUUSDm") if hasattr(guard, "_get_phase") else ("normal", None, None)
+                if phase in ("pre_event", "event_live"):
+                    return True
+        except Exception:
+            pass
+        # Fallback heuristic: major session overlaps + typical high-impact UTC windows (FX/XAU)
+        # (London open 7-10, NY 13-16, typical news 12-16, 20-22 UTC etc.)
+        utc_h = datetime.now(timezone.utc).hour
+        if utc_h in (8, 9, 13, 14, 15, 20, 21):
+            return True
+        return False
+
+    def should_respect_time_exit_for_loss_limit(self, active_time_exits: list = None) -> bool:
+        """Returns True if daily loss enforcement should defer to TimeExitSpec news/session logic.
+        E.g., if any active rich decision has close_before_high_impact_news, honor the managed close instead of emergency.
+        """
+        if not active_time_exits:
+            # If no context, still respect global news window to avoid bad slippage on flatten during news
+            return self.is_high_impact_news_window()
+        for te in active_time_exits:
+            try:
+                if getattr(te, "close_before_high_impact_news", False):
+                    if self.is_high_impact_news_window():
+                        return True
+            except Exception:
+                continue
+        return False
+
+    def record_pnl_with_equity_timing_aware(self, pnl: float, equity: float | None = None, active_time_exits: list = None) -> bool:
+        """Timing-aware variant for rich decisions: daily loss still recorded, but halt decision respects news windows per TimeExitSpec.
+        Prevents emergency flatten during protected news windows when decisions specified avoidance.
+        """
+        triggered = self.record_pnl_with_equity(pnl, equity)
+        if triggered and self.should_respect_time_exit_for_loss_limit(active_time_exits):
+            # Downgrade to warning; let time_exit management + OrderManager/EA handle close_before_news
+            logger.warning(f"RiskEngine: daily loss breach detected but respecting TimeExitSpec news window (defer emergency flatten)")
+            # Do not set halt for flatten purposes; new trades still blocked via other paths
+            self.halt = False  # allow managed time exits to proceed cleanly; supervisor/harness can still decide
+            if hasattr(self, "_halt_reason"):
+                self._halt_reason = "daily_loss_deferred_for_news_timing"
+            return False
+        return triggered

@@ -72,6 +72,18 @@ class RiskSupervisor:
         self._engine.record_pnl(pnl)
         self._sync_from_engine()
 
+    def record_pnl_with_equity(self, pnl: float, equity: float | None = None) -> bool:
+        triggered = self._engine.record_pnl_with_equity(pnl, equity)
+        self._sync_from_engine()
+        return triggered
+
+    def trigger_rollback(self, reason: str = "harness") -> None:
+        # Mirror to engine halt
+        self.halt = True
+        self._halt_reason = f"rollback:{reason}"
+        if hasattr(self._engine, "_halt_reason"):
+            self._engine._halt_reason = self._halt_reason
+
     def record_trade_result(self, symbol: str | None, pnl: float) -> None:
         self._engine.record_trade_result(symbol, pnl)
         self._sync_from_engine()
@@ -104,6 +116,16 @@ class RiskSupervisor:
                 return False
         return True
 
+    # Delegate timing-aware daily loss for rich Decision + TimeExitSpec (production hardening)
+    def is_high_impact_news_window(self, symbol: str = None) -> bool:
+        return self._engine.is_high_impact_news_window(symbol) if hasattr(self._engine, "is_high_impact_news_window") else False
+
+    def should_respect_time_exit_for_loss_limit(self, active_time_exits: list = None) -> bool:
+        return self._engine.should_respect_time_exit_for_loss_limit(active_time_exits) if hasattr(self._engine, "should_respect_time_exit_for_loss_limit") else False
+
+    def record_pnl_with_equity_timing_aware(self, pnl: float, equity: float | None = None, active_time_exits: list = None) -> bool:
+        return self._engine.record_pnl_with_equity_timing_aware(pnl, equity, active_time_exits) if hasattr(self._engine, "record_pnl_with_equity_timing_aware") else self.record_pnl_with_equity(pnl, equity)
+
     def get_symbol_profile(self, symbol: str) -> dict:
         return self._engine.get_symbol_profile(symbol) if hasattr(self._engine, "get_symbol_profile") else self.default_symbol_profile.copy()
 
@@ -123,3 +145,5 @@ class RiskSupervisor:
         self.last_reset_day = self._engine.last_reset_day
         if hasattr(self._engine, "_halt_reason"):
             self._halt_reason = self._engine._halt_reason
+        # expose for harness
+        self._halt_reason = getattr(self._engine, "_halt_reason", self._halt_reason)

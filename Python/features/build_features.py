@@ -90,20 +90,54 @@ class FeatureBuilder:
         feats["spread"] = spread
         feats["spread_zscore"] = ((spread - spread_ma20) / (spread_std20 + eps)).fillna(0.0)
 
-        # ── Session (UTC) ──
+        # ── Enhanced Session & Market Timing (critical for Decision PPO around opens/news) ──
         if isinstance(out.index, pd.DatetimeIndex):
             hour = out.index.hour.astype(int)
+            minute = out.index.minute.astype(int)
+            hour_frac = hour + minute / 60.0
+
+            # Basic session flags (kept for compatibility)
             feats["session_london"] = ((hour >= 8) & (hour < 17)).astype(float)
             feats["session_new_york"] = ((hour >= 13) & (hour < 22)).astype(float)
             feats["session_london_ny_overlap"] = ((hour >= 13) & (hour < 17)).astype(float)
+
+            # Cyclical time features (better for neural nets / Decision PPO)
+            feats["hour_sin"] = np.sin(2 * np.pi * hour_frac / 24)
+            feats["hour_cos"] = np.cos(2 * np.pi * hour_frac / 24)
+
+            # Minutes since major session opens (very useful for "how bot deals with market open")
+            feats["mins_since_london_open"] = np.maximum(0, (hour_frac - 8) * 60)
+            feats["mins_since_ny_open"] = np.maximum(0, (hour_frac - 13) * 60)
+
+            # High-volatility windows around opens (London 7:30-9:30 UTC, NY 12:30-14:30)
+            london_open = ((hour_frac >= 7.5) & (hour_frac <= 9.5)).astype(float)
+            ny_open = ((hour_frac >= 12.5) & (hour_frac <= 14.5)).astype(float)
+            feats["london_open_window"] = london_open
+            feats["ny_open_window"] = ny_open
+            feats["major_open_window"] = ((london_open + ny_open) > 0).astype(float)
         else:
-            feats["session_london"] = pd.Series(0.0, index=out.index)
-            feats["session_new_york"] = pd.Series(0.0, index=out.index)
-            feats["session_london_ny_overlap"] = pd.Series(0.0, index=out.index)
+            for k in ["session_london", "session_new_york", "session_london_ny_overlap",
+                      "hour_sin", "hour_cos", "mins_since_london_open", "mins_since_ny_open",
+                      "london_open_window", "ny_open_window", "major_open_window"]:
+                feats[k] = pd.Series(0.0, index=out.index)
 
         # ── Market structure ──
         feats["distance_to_swing_high"] = self._distance_to_swing(close, high, low, kind="high")
         feats["distance_to_swing_low"] = self._distance_to_swing(close, high, low, kind="low")
+
+        # ── News & Event Proximity (injected when available during training / live) ──
+        # These are critical for the user's requirement: "how the bot deals with ... new based events"
+        # During training we can backfill from trade_journal or ForexFactory calendar.
+        # Values default to neutral (999 = far away) if no news data is attached.
+        if "news_distance_minutes" in out.columns:
+            nd = out["news_distance_minutes"].fillna(999.0)
+            feats["news_proximity"] = np.clip(1.0 / (1.0 + nd / 60.0), 0, 1)  # closer = higher
+            feats["has_high_impact_news_soon"] = (nd < 60).astype(float)     # within 1 hour
+            feats["news_avoidance_zone"] = (nd < 30).astype(float)           # within 30 min
+        else:
+            feats["news_proximity"] = 0.0
+            feats["has_high_impact_news_soon"] = 0.0
+            feats["news_avoidance_zone"] = 0.0
 
         # ── Fibonacci rolling features ──
         for win in self.FIB_WINDOWS:

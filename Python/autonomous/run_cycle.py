@@ -1179,13 +1179,51 @@ class PipelineOrchestrator:
 
     def stage_retraining_trigger(self) -> dict:
         def _run() -> dict:
-            retraining_trigger = _safe_import("Python.autonomous.retraining_trigger")
-            if retraining_trigger is None:
+            retraining_trigger_mod = _safe_import("Python.autonomous.retraining_trigger")
+            if retraining_trigger_mod is None:
                 logger.warning("retraining_trigger module not found — stub")
                 return {"ok": True, "stub": True, "reason": "module_not_found"}
 
             try:
-                return {"ok": True, "stub": True, "reason": "signature_unknown"}
+                # Real execution: use aggregator (scans harness/execution/risk/canary logs) + direct evaluate
+                RetrainingTrigger = getattr(retraining_trigger_mod, "RetrainingTrigger", None)
+                run_agg = getattr(retraining_trigger_mod, "run_aggregator_and_log", None)
+                if RetrainingTrigger is None:
+                    return {"ok": True, "stub": True, "reason": "no_class"}
+
+                # Run aggregator (emits RETRAIN RECOMMENDED log if warranted)
+                art = None
+                if run_agg:
+                    art = run_agg(data_dir="logs")
+
+                # Direct with any live signals (canary artifacts if present in artifacts/)
+                trig = RetrainingTrigger(data_dir="logs")
+                # Try to pick up latest canary artifact from artifacts or logs for canary_artifact param
+                canary_sig = None
+                try:
+                    from pathlib import Path
+                    import json as _json
+                    can_files = sorted(Path("artifacts/demo_canary").glob("canary_*.json"), reverse=True) if Path("artifacts/demo_canary").exists() else []
+                    if not can_files:
+                        can_files = sorted(Path("logs").glob("canary_*.json"), reverse=True)
+                    if can_files:
+                        c = _json.loads(can_files[0].read_text())
+                        canary_sig = {
+                            "approved_for_champion": c.get("approved_for_champion", False),
+                            "approved_for_real_live": c.get("approved_for_real_live", False),
+                        }
+                except Exception:
+                    pass
+
+                art2 = trig.evaluate(canary_artifact=canary_sig)
+                return {
+                    "ok": True,
+                    "triggered": bool((art or art2) and (art or art2).triggered),
+                    "reasons": (art or art2).reasons if (art or art2) else [],
+                    "next_cycle_command": (art or art2).next_cycle_command if (art or art2) else "",
+                    "last_artifact_id": (art or art2).retraining_trigger_id if (art or art2) else None,
+                    "aggregated_from_logs": True,
+                }
             except Exception as exc:
                 return {"ok": False, "error": str(exc)}
 

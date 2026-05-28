@@ -106,8 +106,8 @@ def _rotate_jsonl_if_needed(path: str) -> None:
             if os.path.exists(backup):
                 os.remove(backup)
             os.rename(path, backup)
-    except Exception:
-        pass  # Never let rotation failure block a write
+    except Exception as exc:
+        logger.warning(f"JSONL rotation failed for {path} (non-fatal): {exc}")
 
 
 def _append_jsonl(path: str, row: dict):
@@ -169,7 +169,8 @@ def _read_active_models():
         if not isinstance(d, dict):
             return {"champion": None, "canary": None}
         return {"champion": d.get("champion"), "canary": d.get("canary")}
-    except Exception:
+    except Exception as exc:
+        logger.warning(f"Failed to read active models registry (using defaults): {exc}")
         return {"champion": None, "canary": None}
 
 
@@ -219,8 +220,8 @@ def _write_live_state(risk, symbols, last_symbol_state, models, training_state=N
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(snap, f, default=_json_default)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning(f"Failed to persist live_state.json (non-fatal): {exc}")
 
 
 def _training_state():
@@ -255,8 +256,8 @@ def _training_state():
         out["lstm_running"] = any("training/train_lstm.py" in x for x in lines)
         out["drl_running"] = any("training/train_drl.py" in x for x in lines)
         out["cycle_running"] = any(("tools/champion_cycle.py" in x or "tools/champion_cycle_loop.py" in x) for x in lines)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug(f"Training process scan failed (non-fatal, using fallbacks): {exc}")
 
     # ── Fallback: infer running from recent log activity ──
     now = time.time()
@@ -264,20 +265,20 @@ def _training_state():
         lstm_log = os.path.join(LOG_DIR, "lstm_training.log")
         if os.path.exists(lstm_log) and (now - os.path.getmtime(lstm_log)) < 180:
             out["lstm_running"] = True
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug(f"lstm log mtime check failed: {exc}")
     try:
         ppo_log = os.path.join(LOG_DIR, "ppo_training.log")
         if os.path.exists(ppo_log) and (now - os.path.getmtime(ppo_log)) < 180:
             out["drl_running"] = True
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug(f"ppo log mtime check failed: {exc}")
     try:
         cycle_log = os.path.join(LOG_DIR, "champion_cycle.log")
         if os.path.exists(cycle_log) and (now - os.path.getmtime(cycle_log)) < 180:
             out["cycle_running"] = True
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug(f"cycle log mtime check failed: {exc}")
 
     # ── Parse LSTM log for progress metadata ──
     try:
@@ -693,8 +694,8 @@ def _account_snapshot():
         for d in deals or []:
             if int(getattr(d, "entry", -1)) == int(mt5.DEAL_ENTRY_OUT):
                 pnl_today += float(getattr(d, "profit", 0.0) + getattr(d, "commission", 0.0) + getattr(d, "swap", 0.0))
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning(f"Failed to compute today's realized PnL from history (using 0): {exc}")
 
     balance = None
     equity = None
@@ -735,7 +736,8 @@ def _expected_usd(symbol: str, side: str, entry: float, tp: float, sl: float, lo
             tp_outcome = (float(entry) - float(tp)) * usd_per_price * float(lots)
             sl_outcome = (float(entry) - float(sl)) * usd_per_price * float(lots)
         return tp_outcome, sl_outcome
-    except Exception:
+    except Exception as exc:
+        logger.debug(f"_expected_usd calc failed for {symbol}: {exc}")
         return None, None
 
 
@@ -750,7 +752,8 @@ def _tick_spread_bps(symbol: str) -> float | None:
         if bid <= 0.0 or ask <= 0.0 or mid <= 0.0:
             return None
         return float(((ask - bid) / mid) * 10000.0)
-    except Exception:
+    except Exception as exc:
+        logger.debug(f"_tick_spread_bps failed for {symbol}: {exc}")
         return None
 
 
@@ -818,7 +821,8 @@ def _scan_trade_events(alerter, risk, known_open_tickets, seen_closed_deals, las
 
     try:
         deals = mt5.history_deals_get(last_deal_check, now_utc) or []
-    except Exception:
+    except Exception as exc:
+        logger.warning(f"MT5 history_deals_get failed (deals=[]): {exc}")
         deals = []
 
     for d in deals:
@@ -844,8 +848,8 @@ def _scan_trade_events(alerter, risk, known_open_tickets, seen_closed_deals, las
             closed_events.append(payload)
             try:
                 risk.record_trade_result(payload["symbol"], pnl)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(f"risk.record_trade_result failed for {payload.get('symbol')}: {exc}")
             alerter.trade_closed(
                 symbol=payload["symbol"],
                 ticket=payload["ticket"],
@@ -855,7 +859,8 @@ def _scan_trade_events(alerter, risk, known_open_tickets, seen_closed_deals, las
                 reason=payload.get("comment"),
                 deal_id=deal_id,
             )
-        except Exception:
+        except Exception as exc:
+            logger.debug(f"Deal processing error (skipped): {exc}")
             continue
 
     if len(seen_closed_deals) > 20000:
@@ -961,7 +966,8 @@ def main(live=False):
                 f"Equity={0.0 if snap['equity'] is None else snap['equity']:.2f} | "
                 f"Open={int(snap['open_positions'])}"
             )
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"Failed to build detailed offline snapshot: {exc}")
             alerter.offline("Runtime exited")
 
     atexit.register(_notify_offline)

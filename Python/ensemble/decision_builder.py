@@ -14,7 +14,10 @@ except ImportError:
 
 @dataclass
 class TradeIntent:
-    """Structured trade intent emitted by DecisionBuilder."""
+    """Structured trade intent emitted by DecisionBuilder.
+    Now enriched with pattern + timing context for the full ensemble to produce
+    rich TradeDecisions (bias TimeExitSpec, risk sizing, partial ladders for favorable states e.g. engulfing at open/low-news).
+    """
 
     intent_id: str
     decision_id: str
@@ -27,6 +30,9 @@ class TradeIntent:
     confidence: float
     source_bundle_id: str
     metadata: dict = field(default_factory=dict)
+    # NEW: pattern+timing edge for rich decisions
+    pattern_context: dict = field(default_factory=dict)  # e.g. {"dominant": "bullish_engulfing", "strength":0.9, "timing_favorable":True}
+    time_exit_hints: dict = field(default_factory=dict)  # hints for TimeExitSpec e.g. {"close_before_news": True, "max_hold_minutes": 90}
 
 
 class DecisionBuilder:
@@ -55,16 +61,17 @@ class DecisionBuilder:
         symbol: str,
         source_bundle_id: str,
         regime: str = "ranging",
+        pattern_context: Optional[dict] = None,
+        timing_context: Optional[dict] = None,
+        dreamer_sim: Optional[dict] = None,  # e.g. simulated pattern outcome rewards from Dreamer imagination
     ) -> Optional[TradeIntent]:
         """Build a TradeIntent from raw model votes.
+        Now consumes Rainforest pattern+regime + Dreamer simulated pattern outcomes
+        to bias rich parameters (for downstream conversion to full TradeDecision with TimeExitSpec etc).
 
-        Raw vote object:
-          {
-            lstm: {vote, confidence, expected_return},
-            rainforest: {regime, vote, confidence},
-            dreamer: {vote, expected_reward, ruin_probability, confidence},
-            ppo: {vote, target_exposure, confidence}
-          }
+        Raw vote object + new keys:
+          ...
+          rainforest may include "patterns": {...}
         """
         ppo_vote = self._extract_vote(raw_votes.get("ppo", {}))
         lstm_vote = self._extract_vote(raw_votes.get("lstm", {}))
@@ -91,6 +98,39 @@ class DecisionBuilder:
         elif regime in ("breakout_up", "breakout_down"):
             target_exposure *= 0.8
 
+        # NEW: Pattern + timing + dreamer sim bias for rich edge
+        pat_ctx = pattern_context or raw_votes.get("rainforest", {}).get("patterns", {}) or {}
+        t_ctx = timing_context or {}
+        d_sim = dreamer_sim or raw_votes.get("dreamer", {}).get("pattern_sim", {}) or {}
+        favorable = self._is_favorable_pattern_timing(pat_ctx, t_ctx, regime, d_sim)
+        max_hold = self.max_hold_bars
+        stop_atr = self.stop_atr
+        tp_atr = self.take_profit_atr
+        time_hints = {}
+
+        if favorable:
+            # Favorable pattern (e.g. engulfing/hammer/flag/breakout) + good timing (open or low news) + positive dreamer sim
+            # -> bias toward runner (longer hold, wider TP, tighter risk? or scaled)
+            target_exposure = min(self.MAX_EXPOSURE_PCT, target_exposure * 1.25)
+            max_hold = int(self.max_hold_bars * 1.4)  # allow more time for follow-through
+            tp_atr = self.take_profit_atr * 1.2
+            time_hints = {
+                "close_before_high_impact_news": False,  # let it run if pattern strong
+                "max_hold_minutes": 180,
+                "partials_aggressive": True,  # hint for ladder in rich TradeDecision
+            }
+            # dreamer sim can further modulate
+            if d_sim.get("simulated_reward", 0) > 0.8:
+                tp_atr *= 1.1
+        else:
+            # Caution: tight time exit, smaller size already handled
+            time_hints = {
+                "close_before_high_impact_news": bool(t_ctx.get("news_proximity", 0) > 0.3),
+                "max_hold_minutes": 75,
+            }
+            if "ranging" in regime or pat_ctx.get("has_doji", 0) > 0.6:
+                max_hold = max(8, int(self.max_hold_bars * 0.6))
+
         # Clamp exposure
         target_exposure = max(0.0, min(target_exposure, self.MAX_EXPOSURE_PCT))
 
@@ -103,9 +143,9 @@ class DecisionBuilder:
             symbol=symbol,
             side=side,
             target_exposure_pct=round(target_exposure, 4),
-            stop_atr=self.stop_atr,
-            take_profit_atr=self.take_profit_atr,
-            max_hold_bars=self.max_hold_bars,
+            stop_atr=round(stop_atr, 3),
+            take_profit_atr=round(tp_atr, 3),
+            max_hold_bars=max_hold,
             confidence=round(confidence, 4),
             source_bundle_id=source_bundle_id,
             metadata={
@@ -116,9 +156,18 @@ class DecisionBuilder:
                     "rainforest": rainforest_vote,
                 },
                 "regime": regime,
+                "pattern_context": pat_ctx,
+                "dreamer_sim": d_sim,
             },
+            pattern_context={
+                "dominant": pat_ctx.get("dominant_pattern", regime),
+                "strength": float(pat_ctx.get("strength", 0.0)),
+                "timing_favorable": bool(favorable),
+                "has_engulfing_or_reversal": bool(pat_ctx.get("has_bullish_engulfing", 0) > 0.4 or pat_ctx.get("has_hammer", 0) > 0.4),
+            },
+            time_exit_hints=time_hints,
         )
-        logger.debug(f"DecisionBuilder emitted intent {intent.intent_id} side={intent.side} exp={intent.target_exposure_pct}")
+        logger.debug(f"DecisionBuilder emitted intent {intent.intent_id} side={intent.side} exp={intent.target_exposure_pct} pattern_fav={favorable}")
         return intent
 
     @staticmethod
@@ -190,3 +239,34 @@ class DecisionBuilder:
         if lstm_conf >= 0.50:
             return 0.10
         return 0.05
+
+    def _is_favorable_pattern_timing(self, pat_ctx: dict, t_ctx: dict, regime: str, dreamer_sim: dict) -> bool:
+        """Core logic: favorable when classical pattern + supportive timing + dreamer sim positive."""
+        score = 0.0
+        # Strong reversal/continuation patterns
+        if pat_ctx.get("has_bullish_engulfing", 0) > 0.5 or pat_ctx.get("has_hammer", 0) > 0.55:
+            score += 1.0
+        if pat_ctx.get("has_bull_flag", 0) > 0.5 or pat_ctx.get("has_breakout_up", 0) > 0.6:
+            score += 0.9
+        if pat_ctx.get("has_bearish_engulfing", 0) > 0.5 or pat_ctx.get("has_shooting_star", 0) > 0.55:
+            score += 1.0
+        if pat_ctx.get("has_bear_flag", 0) > 0.5 or pat_ctx.get("has_breakout_down", 0) > 0.6:
+            score += 0.9
+
+        # Timing edge (opens or away from news)
+        if t_ctx.get("major_open_window", 0) > 0.4:
+            score += 0.6
+        if t_ctx.get("news_proximity", 1.0) < 0.25:
+            score += 0.7
+        if t_ctx.get("has_high_impact_news_soon", 0) > 0.5:
+            score -= 0.8
+
+        # Dreamer imagination simulation (pattern-conditioned rollout reward)
+        if dreamer_sim.get("simulated_reward", 0.0) > 0.15 or dreamer_sim.get("expected_reward", 0.0) > 0.1:
+            score += 0.8
+
+        # Regime alignment
+        if ("bull" in regime and score > 0) or ("bear" in regime and score > 0):
+            score += 0.3
+
+        return score >= 1.4

@@ -45,6 +45,13 @@ class CanaryArtifact:
     passed: bool
     approved_for_champion: bool
     approved_for_real_live: bool
+    # Timing-aware metrics for Decision PPO rich TimeExitSpec monitoring (production hardening)
+    timing_open_window_trades: int = 0
+    timing_news_avoided_trades: int = 0
+    timing_news_prox_trades: int = 0
+    timing_window_pnl: float = 0.0
+    timing_news_avoid_pnl: float = 0.0
+    timing_news_avoidance_score: float = 0.0  # positive good (avoid pnl - prox pnl normalized)
 
 
 class DemoCanary:
@@ -85,6 +92,13 @@ class DemoCanary:
         self._start_date: datetime = datetime.now(timezone.utc)
         self._hourly_trade_counts: Dict[str, int] = {}
         self._daily_trade_counts: Dict[str, int] = {}
+
+        # Timing-specific metrics for rich Decision PPO + TimeExitSpec (production hardening)
+        self.timing_open_window_trades: int = 0
+        self.timing_news_avoided_trades: int = 0
+        self.timing_news_prox_trades: int = 0  # within 30min high impact (should be low/negative for good policy)
+        self.timing_window_pnl: float = 0.0
+        self.timing_news_avoid_pnl: float = 0.0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -172,6 +186,19 @@ class DemoCanary:
             self._update_profit_factor()
             self._check_daily_loss(day_key)
 
+            # Timing metrics extension (Decision PPO rich timing-aware)
+            nd = float(trade.get("news_distance_minutes", trade.get("news_proximity", 999)))
+            sess = str(trade.get("session", trade.get("timing_session", ""))).lower()
+            is_open_win = any(h in sess or ("open" in sess) for h in ["london", "ny", "open"]) or (7 <= datetime.now(timezone.utc).hour <= 10) or (13 <= datetime.now(timezone.utc).hour <= 16)
+            if is_open_win:
+                self.timing_open_window_trades += 1
+                self.timing_window_pnl += net
+            if nd < 30:
+                self.timing_news_prox_trades += 1
+            else:
+                self.timing_news_avoided_trades += 1
+                self.timing_news_avoid_pnl += net
+
         self.days_active = max(1, (now - self._start_date).days)
 
     def _update_profit_factor(self) -> None:
@@ -232,6 +259,18 @@ class DemoCanary:
             and self.profit_factor > 1.2
         )
 
+        # Timing safety gate: if poor news avoidance (high prox ratio or negative score), block live approval
+        timing_prox_ratio = getattr(self, "timing_news_prox_trades", 0) / max(1, (getattr(self, "timing_news_prox_trades", 0) + getattr(self, "timing_news_avoided_trades", 0)))
+        timing_score = getattr(self, "timing_news_avoidance_score", 0.0)
+        if timing_prox_ratio > 0.5 or timing_score < -0.3:
+            approved_for_real_live = False
+            approved_for_champion = approved_for_champion and timing_prox_ratio < 0.4  # still allow champ review with caution
+
+        # Compute timing avoidance score (higher = better news avoidance / open window edge from rich decisions)
+        avoid_pnl = getattr(self, "timing_news_avoid_pnl", 0.0)
+        prox_pnl = sum(max(0.0, -float(t.get("pnl", 0))) for t in self.trades if float(t.get("news_distance_minutes", 999)) < 30)  # proxy penalty
+        timing_score = round((avoid_pnl - prox_pnl) / max(1.0, self.notional_balance) * 100.0, 4)
+
         artifact = CanaryArtifact(
             canary_id=self.canary_id,
             bundle_id=self.bundle_id,
@@ -246,6 +285,12 @@ class DemoCanary:
             passed=passed,
             approved_for_champion=approved_for_champion,
             approved_for_real_live=approved_for_real_live,
+            timing_open_window_trades=getattr(self, "timing_open_window_trades", 0),
+            timing_news_avoided_trades=getattr(self, "timing_news_avoided_trades", 0),
+            timing_news_prox_trades=getattr(self, "timing_news_prox_trades", 0),
+            timing_window_pnl=round(getattr(self, "timing_window_pnl", 0.0), 4),
+            timing_news_avoid_pnl=round(getattr(self, "timing_news_avoid_pnl", 0.0), 4),
+            timing_news_avoidance_score=timing_score,
         )
 
         path = self.data_dir / f"canary_{self.canary_id}.json"

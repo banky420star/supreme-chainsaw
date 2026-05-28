@@ -175,6 +175,16 @@ except Exception:
     SignalOptimizer = None  # type: ignore
     SignalQuality = None  # type: ignore
 
+# Primary autonomous Meta-Optimizer (core self-evolution of reward profiles, PPO/Dreamer/Rainforest/classical ensemble weights, risk params, pattern/feature importance).
+# Called by supervisor in focus_meta_tuning + after large_validation_campaign (reads StandardizedValidationResult artifacts via harness integration).
+try:
+    from Python.autonomous.meta_optimizer import MetaOptimizer, MetaConfig
+    META_OPT_AVAILABLE = True
+except Exception:
+    MetaOptimizer = None  # type: ignore
+    MetaConfig = None  # type: ignore
+    META_OPT_AVAILABLE = False
+
 # Continual / Feedback / Replay
 try:
     from Python.feedback.replay_builder import ReplayBuilder
@@ -789,6 +799,14 @@ class MasterSelfEvolutionSupervisor:
                 exp = self.run_safe_backtest_experiment(f"campaign_{sym}", symbol=sym, weeks=8)
                 experiments.append(exp)
             actions.append({"type": "validation_campaign_executed", "count": len(experiments)})
+            # Post-campaign: wire MetaOptimizer to derive reward/ensemble/fi suggestions from the just-run harness results (pattern profitability etc.)
+            if META_OPT_AVAILABLE and MetaOptimizer:
+                try:
+                    mo = MetaOptimizer(verbose=False)
+                    tune_res = mo.apply_harness_suggested_tuning()  # auto-loads recent (including just-produced)
+                    actions.append({"type": "post_validation_meta_tuning", "applied": tune_res.get("applied"), "profile": tune_res.get("notes")})
+                except Exception:
+                    pass
 
         elif strategy == "full_retrain_backtest":
             if retrain_orch:
@@ -814,6 +832,22 @@ class MasterSelfEvolutionSupervisor:
             meta = self._get_component("meta_controller")
             sig_opt = self._get_component("signal_optimizer")
             actions.append({"type": "meta_parameter_sweep", "components": ["meta_controller", "signal_optimizer"]})
+            # NEW: Delegate to autonomous MetaOptimizer for harness-driven objective tuning (reward profiles, ensemble, feature importance from pattern/timing/TimeExit)
+            if META_OPT_AVAILABLE and MetaOptimizer:
+                try:
+                    mo = MetaOptimizer(verbose=False)
+                    arts = mo.load_recent_validation_artifacts()
+                    harness_sug = mo.integrate_validation_harness_results(arts)
+                    apply_res = mo.apply_harness_suggested_tuning(harness_sug)
+                    actions.append({
+                        "type": "meta_optimizer_harness_tuning",
+                        "applied": apply_res.get("applied"),
+                        "suggested_overrides": harness_sug.get("suggested_training_overrides"),
+                        "reasoning": harness_sug.get("proposed_delta", {}).get("reasoning", [])[:2],
+                    })
+                    self.log_evolution_event("meta_optimizer_invoked_for_objective_tuning", {"applied": apply_res.get("applied")})
+                except Exception as mo_e:
+                    actions.append({"type": "meta_optimizer_tuning_failed", "error": str(mo_e)[:140]})
             exp = self.run_safe_backtest_experiment("meta_weight_tuning", weeks=5)
             experiments.append(exp)
 
@@ -980,6 +1014,22 @@ class MasterSelfEvolutionSupervisor:
                 winning = [e for e in experiments[0].get("items", []) if e.get("success")]
                 self.apply_winning_changes(winning)
 
+            # Always-available lightweight MetaOptimizer pass (even outside explicit strategies):
+            # Ensures RetrainingOrchestrator / training launchers always have fresh suggested_config_changes (reward/ensemble/fi) derived from latest validation artifacts.
+            if META_OPT_AVAILABLE and MetaOptimizer:
+                try:
+                    mo = MetaOptimizer(verbose=False)
+                    meta_sug = mo.suggest_for_retrain()
+                    result.actions_taken.append({
+                        "type": "meta_optimizer_suggest_for_retrain",
+                        "recommended_profile": meta_sug.get("recommended_reward_profile"),
+                        "has_harness_driven": bool(meta_sug.get("harness_driven_suggestions")),
+                        "suggested_overrides_for_training": meta_sug.get("suggested_config_changes_for_next_training"),
+                        "note": "Consumed by orchestrator training launches for intelligent objective/architecture evolution"
+                    })
+                except Exception:
+                    pass
+
             # Update goals progress (very simple heuristic)
             for g in self.goals:
                 if g.name == "max_drawdown" and telemetry.get("current_drawdown", 1) <= g.target:
@@ -1038,6 +1088,7 @@ class MasterSelfEvolutionSupervisor:
                     "FastBacktester (primary experimentation engine — minutes-scale OOS)",
                     "RegimeAdaptiveController (full Rainforest + PatternDetector + Dreamer + timing regime adaptation)",
                     "MetaController + SignalOptimizer (meta layer)",
+                    "MetaOptimizer (autonomous/meta_optimizer.py: harness pattern_profitability + timing + TimeExitSpec -> reward_profile/ensemble_weights/feature_importance self-tuning for training)",
                     "ReplayBuilder + feedback (continual learner)",
                     "ModelRegistry + PromotionGates",
                     "live_safety / RiskSupervisor / BackupManager (self-monitor/recovery)",

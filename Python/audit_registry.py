@@ -75,6 +75,18 @@ def audit():
     candidates_dir = registry.candidates_dir
     active = registry._read_active()
 
+    # Hardened integrity audit (sprint improvement)
+    integrity_report = registry.audit_integrity()
+    print("=" * 80)
+    print("CHAIN GAMBLER MODEL REGISTRY AUDIT (with hardened integrity + promotion trail)")
+    print("=" * 80)
+    print(f"Integrity audit @ {integrity_report.get('timestamp')}")
+    print(f"  Lock timeout: {integrity_report.get('lock_timeout')}s")
+    if integrity_report.get("failures"):
+        print(f"  FAILURES DETECTED: {integrity_report['failures']}")
+    else:
+        print("  All known champion/canary entries passed integrity (hash+size).")
+
     # Discover all candidates
     candidate_dirs = []
     if os.path.isdir(candidates_dir):

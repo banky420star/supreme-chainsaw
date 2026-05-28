@@ -19,6 +19,7 @@ import time
 import threading
 from collections import deque
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 # ── Path Setup for Standalone Mode ─────────────────────────────────
 # Add project root to path so 'Python' module imports work
@@ -2738,8 +2739,20 @@ def api_health():
     else:
         try:
             import subprocess
-            procs = subprocess.check_output(["ps", "-eo", "command"], text=True, timeout=3)
-            _server_process_running = "Server_AGI" in procs
+            import platform
+            if platform.system().lower().startswith("win"):
+                # Windows: use PowerShell (consistent with other detection in this file)
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "Get-Process python* -ErrorAction SilentlyContinue | "
+                     "Where-Object { $_.CommandLine -match 'Server_AGI' } | "
+                     "Select-Object -First 1 -ExpandProperty Id"],
+                    capture_output=True, text=True, timeout=8
+                )
+                _server_process_running = bool(result.stdout.strip())
+            else:
+                procs = subprocess.check_output(["ps", "-eo", "command"], text=True, timeout=3)
+                _server_process_running = "Server_AGI" in procs
         except Exception:
             pass
     checks = {
@@ -2775,8 +2788,19 @@ def api_health():
         if not checks["brain_initialized"]:
             try:
                 import subprocess
-                procs = subprocess.check_output(["ps", "-eo", "command"], text=True, timeout=3)
-                checks["brain_initialized"] = "Server_AGI" in procs
+                import platform
+                if platform.system().lower().startswith("win"):
+                    result = subprocess.run(
+                        ["powershell", "-NoProfile", "-Command",
+                         "Get-Process python* -ErrorAction SilentlyContinue | "
+                         "Where-Object { $_.CommandLine -match 'Server_AGI' } | "
+                         "Select-Object -First 1 -ExpandProperty Id"],
+                        capture_output=True, text=True, timeout=8
+                    )
+                    checks["brain_initialized"] = bool(result.stdout.strip())
+                else:
+                    procs = subprocess.check_output(["ps", "-eo", "command"], text=True, timeout=3)
+                    checks["brain_initialized"] = "Server_AGI" in procs
             except Exception:
                 pass
 
@@ -3348,6 +3372,17 @@ def api_training_metrics():
         result["current_symbol"] = progress["ppo"].get("symbol")
         result["current_timesteps"] = progress["ppo"].get("timesteps", 0)
         result["target_timesteps"] = progress["ppo"].get("target_timesteps", 100000)
+
+    # Surface explicit training health signal (robustness & recovery)
+    try:
+        hpath = os.path.join(ROOT, "logs", "training_health.json")
+        if os.path.exists(hpath):
+            with open(hpath, "r", encoding="utf-8") as f:
+                th = json.load(f)
+            result["training_health"] = th
+            result["training_active"] = result["training_active"] or (th.get("status") in ("running", "recovering"))
+    except Exception:
+        pass
 
     # Load combined training results file (contains per-symbol metrics)
     # Note: Must NOT match per-symbol files like enhanced_training_results_BTCUSDm_*.json
@@ -4417,6 +4452,117 @@ def start_api_server(agi_server=None, host: str = "0.0.0.0", port: int = API_POR
     t.start()
     logger.info(f"API server thread started (port {port}, threaded=True)")
     return t
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Rich Decision PPO + Execution Observability Endpoints (for React + external UIs)
+# Mirrors TUI readers: execution_reports + mql5_commands + feedback + live agent_status
+# Works identically whether primary exec is Python OrderManager or MQL5 bridge.
+# ═══════════════════════════════════════════════════════════════════════════
+import glob as _glob  # local alias to avoid conflicts
+
+@app.get("/api/execution/decisions")
+def api_execution_decisions():
+    """Recent rich TradeDecision + execution reports (with full specs for PPO attribution)."""
+    limit = int(request.params.get("limit", 15))
+    items = []
+    try:
+        base = Path(__file__).resolve().parent.parent
+        reports_dir = base / "runtime" / "execution_reports"
+        cmds_dir = base / "runtime" / "mql5_commands"
+        for p in sorted(reports_dir.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True)[:limit*2]:
+            try:
+                rep = json.loads(p.read_text(encoding="utf-8", errors="ignore"))
+                did = rep.get("decision_id", p.stem)
+                # Enrich full spec from mql5 command if present (MQL5 path fidelity)
+                if not rep.get("decision"):
+                    for cp in cmds_dir.glob(f"decision_{did}_*.json"):
+                        try:
+                            rep["decision"] = json.loads(cp.read_text(encoding="utf-8", errors="ignore"))
+                            break
+                        except Exception:
+                            pass
+                items.append({"file": p.name, **rep})
+            except Exception:
+                continue
+    except Exception:
+        pass
+    # Dedup
+    deduped = []
+    seen = set()
+    for it in items:
+        did = it.get("decision_id")
+        if did and did not in seen:
+            seen.add(did)
+            deduped.append(it)
+    return _json({"decisions": deduped[:limit], "count": len(deduped), "sources": ["execution_reports", "mql5_commands"]})
+
+
+@app.get("/api/execution/live")
+def api_execution_live():
+    """Live managed positions + ExecutionAgent status (from agent_status live file or reports)."""
+    try:
+        base = Path(__file__).resolve().parent.parent
+        live_path = base / "runtime" / "agent_status" / "decision_ppo_execution_live.json"
+        data = {"active": [], "status": "no_live_agent_status"}
+        if live_path.exists():
+            try:
+                data = json.loads(live_path.read_text(encoding="utf-8", errors="ignore"))
+                data["status"] = "live_from_agent"
+            except Exception:
+                pass
+        # Fallback enrichment
+        if not data.get("active_decisions"):
+            reports = sorted((base / "runtime" / "execution_reports").glob("*.json"), key=lambda x:x.stat().st_mtime, reverse=True)[:5]
+            data["fallback_reports"] = [json.loads(r.read_text(errors="ignore")) for r in reports if r.exists()]
+        return _json(data)
+    except Exception:
+        return _json({"status": "error", "active": []})
+
+
+@app.get("/api/execution/feedback")
+def api_execution_feedback():
+    limit = int(request.params.get("limit", 20))
+    try:
+        base = Path(__file__).resolve().parent.parent
+        fb_path = base / "logs" / "execution_feedback.jsonl"
+        recs = []
+        if fb_path.exists():
+            for ln in fb_path.read_text(encoding="utf-8", errors="ignore").strip().splitlines()[-limit:]:
+                if ln.strip():
+                    recs.append(json.loads(ln))
+        return _json({"feedback": list(reversed(recs)), "count": len(recs)})
+    except Exception:
+        return _json({"feedback": [], "count": 0})
+
+
+@app.get("/api/timing/insights")
+def api_timing_insights():
+    """Profitable trade timing analyzer insights (news, opens, sessions) for UI visibility.
+    Powers React/TUI panels for Decision PPO timing awareness.
+    """
+    try:
+        base = Path(__file__).resolve().parent.parent
+        logs = base / "logs"
+        # Prefer latest saved insights from Decision PPO launchers
+        cands = sorted(logs.glob("*timing_insights*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if cands:
+            data = json.loads(cands[0].read_text(encoding="utf-8", errors="ignore"))
+            data["source"] = cands[0].name
+            return _json(data)
+        # Live compute fallback
+        try:
+            from Python.analysis.trade_timing_analyzer import analyze_profitable_trade_timing
+            journal = logs / "trade_journal" / "trade_journal.jsonl"
+            ins = analyze_profitable_trade_timing(journal_path=journal, top_n=40)
+            if "error" not in ins:
+                ins["source"] = "live_analyzer"
+                return _json(ins)
+        except Exception:
+            pass
+        return _json({"error": "no timing insights yet (run Decision PPO training to populate)", "source": "none"})
+    except Exception as e:
+        return _json({"error": str(e)})
 
 
 # ═══════════════════════════════════════════════════════════════════════════

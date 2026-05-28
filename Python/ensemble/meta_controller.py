@@ -12,6 +12,10 @@ except ImportError:
     logger = _logging.getLogger("meta_controller")  # type: ignore
 
 from Python.ensemble.decision_builder import DecisionBuilder, TradeIntent
+try:
+    from Python.patterns.pattern_detector import PatternDetector
+except Exception:
+    PatternDetector = None
 
 
 @dataclass
@@ -68,8 +72,12 @@ class MetaController:
         ppo_output: dict,
         risk_state: dict,
         execution_state: dict,
+        pattern_state: Optional[dict] = None,  # NEW: from PatternDetector or rainforest enriched
     ) -> EnsembleDecision:
-        """Evaluate all model outputs and return a final EnsembleDecision."""
+        """Evaluate all model outputs and return a final EnsembleDecision.
+        Now fully consumes Rainforest pattern+regime + Dreamer simulated pattern outcomes
+        (via pattern_state + dreamer_output) to bias rich TradeDecisions (TimeExitSpec etc).
+        """
         decision_id = f"dec_{uuid.uuid4().hex[:12]}"
 
         # --- unpack inputs ---
@@ -83,10 +91,17 @@ class MetaController:
         rainforest_vote = self._rainforest_vote(regime)
         allowed_behaviors = self._regime_allowed_behaviors(regime)
 
+        # Extract pattern context (from Rainforest or explicit)
+        pat_ctx = pattern_state or rainforest_output.get("patterns", {}) or rainforest_output.get("top_patterns", {})
+        if isinstance(pat_ctx, list):
+            pat_ctx = {"top": pat_ctx[:3]}  # normalize
+
         dreamer_exp_reward = float(dreamer_output.get("expected_reward", 0.0))
         dreamer_ruin = float(dreamer_output.get("ruin_probability", 0.0))
         dreamer_conf = float(dreamer_output.get("confidence", 0.0))
         dreamer_vote = self._dreamer_vote(dreamer_exp_reward, dreamer_ruin)
+        # Dreamer pattern sim (if imagination provided conditioned rollouts)
+        dreamer_sim = dreamer_output.get("pattern_simulated_outcomes", {}) or {"simulated_reward": dreamer_exp_reward}
 
         ppo_vote_raw = str(ppo_output.get("vote", "FLAT")).upper()
         ppo_target_exposure = float(ppo_output.get("target_exposure", 0.0))
@@ -109,12 +124,14 @@ class MetaController:
                 "regime": regime,
                 "vote": rainforest_vote,
                 "confidence": rainforest_conf,
+                "patterns": pat_ctx,  # NEW: classical patterns passed through
             },
             "dreamer": {
                 "vote": dreamer_vote,
                 "expected_reward": dreamer_exp_reward,
                 "ruin_probability": dreamer_ruin,
                 "confidence": dreamer_conf,
+                "pattern_simulated_outcomes": dreamer_sim,  # NEW: Dreamer imagination on pattern+timing states
             },
             "ppo": {
                 "vote": ppo_vote_raw,
@@ -203,6 +220,9 @@ class MetaController:
                 symbol=self.symbol,
                 source_bundle_id=self.bundle_id,
                 regime=regime,
+                pattern_context=pat_ctx,
+                timing_context=execution_state.get("timing", {}),
+                dreamer_sim=dreamer_sim,
             )
             if intent is None:
                 final_action = "NO_TRADE"
@@ -225,6 +245,9 @@ class MetaController:
                 symbol=self.symbol,
                 source_bundle_id=self.bundle_id,
                 regime=regime,
+                pattern_context=pat_ctx,
+                timing_context=execution_state.get("timing", {}),
+                dreamer_sim=dreamer_sim,
             )
             if intent:
                 # Override with meta-controller sizing

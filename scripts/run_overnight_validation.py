@@ -58,11 +58,20 @@ def main():
     print("\n" + "=" * 70)
     print("CAMPAIGN COMPLETE — STANDARDIZED RESULTS READY FOR RETRAINING")
     print("=" * 70)
-    for r in results:
-        verdict = r.overall_recommendation
-        beats = r.ab_comparison.get("candidate_beats_champion")
-        print(f"  {r.symbols[0]} {r.period}: {verdict} | beats_champion={beats}")
-        print(f"    → Report: {r.rich_report_path}")
+    if isinstance(results, (list, tuple)):
+        for r in results:
+            if hasattr(r, 'overall_recommendation'):
+                verdict = r.overall_recommendation
+                beats = getattr(r, 'ab_comparison', {}).get("candidate_beats_champion") if hasattr(r, 'ab_comparison') else None
+                period = getattr(r, 'period', 'N/A')
+                sym = getattr(r, 'symbols', ['?'])[0] if hasattr(r, 'symbols') else '?'
+                print(f"  {sym} {period}: {verdict} | beats_champion={beats}")
+                rp = getattr(r, 'rich_report_path', 'N/A')
+                print(f"    → Report: {rp}")
+            else:
+                print(f"  Result: {r}")
+    else:
+        print(f"  Result object: {results}")
 
     print(f"\nAgent status: runtime/agent_status/validation_harness_agent.json")
     print(f"Artifacts:    runtime/validation_results/ + reports/validation/")

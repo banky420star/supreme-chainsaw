@@ -9,9 +9,15 @@ import json
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Union
 
 from loguru import logger
+
+# Support rich Decision path (additive)
+try:
+    from Python.execution.trade_decision import TradeDecision
+except Exception:
+    TradeDecision = None  # type: ignore
 
 
 _PROJECT_ROOT = os.path.dirname(
@@ -55,12 +61,28 @@ class PaperExecutor:
         except Exception as exc:
             logger.warning(f"PaperExecutor journal write failed: {exc}")
 
-    def execute(self, intent: dict[str, Any]) -> dict[str, Any]:
-        """Simulate execution of a gated trade intent.
+    def execute(self, intent: Union[dict[str, Any], "TradeDecision"]) -> dict[str, Any]:
+        """Simulate execution of a gated trade intent or rich TradeDecision.
 
-        Intent fields:
-          symbol, side, size, price, sl, tp, magic, comment
+        Supports both legacy simple dict and new Decision PPO TradeDecision (via to_dict or direct).
+        Zero breakage for simple paths.
         """
+        # Normalize rich Decision to dict for legacy handling inside (adapter path)
+        if TradeDecision is not None and isinstance(intent, TradeDecision):
+            td = intent
+            intent = {
+                "symbol": td.symbol,
+                "side": td.side.value if hasattr(td.side, "value") else str(td.side),
+                "size": td.size.value if hasattr(td.size, "value") else float(getattr(td.size, "value", 0.01)),
+                "price": 0.0,
+                "sl": getattr(td.sl, "price", None) or getattr(td.sl, "value", None),
+                "tp": getattr(td.tp, "price", None) or getattr(td.tp, "value", None),
+                "magic": td.magic,
+                "comment": td.comment,
+                "decision_id": td.decision_id,
+                "source": td.source,
+                "rich": True,
+            }
         symbol = intent.get("symbol", "")
         side = str(intent.get("side", "")).upper()
         size = float(intent.get("size", 0.0) or 0.0)
@@ -123,6 +145,18 @@ class PaperExecutor:
             positions = [p for p in positions if p["symbol"] == symbol]
         return positions
 
+    def force_flatten_all(self, reason: str = "paper_executor_flatten") -> dict[str, Any]:
+        """Emergency flatten for rollback / supervisor (DecisionPPO + legacy paths)."""
+        count = len(self._positions)
+        for pos in list(self._positions):
+            try:
+                self._journal({"action": "force_flatten", "ticket": pos["ticket"], "symbol": pos["symbol"], "reason": reason})
+            except Exception:
+                pass
+        self._positions.clear()
+        logger.warning(f"[PAPER-EXEC] force_flatten_all: {count} positions closed ({reason})")
+        return {"executed": True, "closed": count, "reason": reason}
+
     def close_position(self, ticket: int, price: float) -> dict[str, Any]:
         """Close a paper position by ticket."""
         for i, pos in enumerate(self._positions):
@@ -161,3 +195,22 @@ class PaperExecutor:
                 }
 
         return {"executed": False, "mode": "paper_sim", "reason": "ticket_not_found"}
+
+    def force_flatten_all(self, reason: str = "supervisor_trigger") -> dict[str, Any]:
+        """Force close all open paper positions (for rollback / safety). Compatible with new execution layer."""
+        closed = 0
+        total_pnl = 0.0
+        for pos in list(self._positions):
+            # Use mid price 0 for sim close (journal will note)
+            close_res = self.close_position(pos["ticket"], pos.get("open_price", 0.0))
+            if close_res.get("executed"):
+                closed += 1
+                total_pnl += close_res.get("pnl", 0.0)
+        self._journal({
+            "action": "force_flatten_all",
+            "reason": reason,
+            "closed_count": closed,
+            "total_pnl": total_pnl,
+        })
+        logger.warning(f"[PAPER] force_flatten_all: closed {closed} positions (reason={reason})")
+        return {"executed": True, "mode": "paper_sim", "closed": closed, "pnl": total_pnl, "reason": reason}

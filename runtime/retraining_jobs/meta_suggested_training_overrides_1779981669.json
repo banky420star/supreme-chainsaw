@@ -1,0 +1,28 @@
+{
+  "reward_profile": "hardened",
+  "penalty_scale": 0.90,
+  "ensemble_weight_deltas": {
+    "classical": 0.04,
+    "rainforest": 0.02,
+    "ppo": -0.03
+  },
+  "feature_importance_overrides": {
+    "patterns": 1.29,
+    "timing": 1.38,
+    "news_proximity": 1.15
+  },
+  "top_boost_patterns": [
+    "double_bottom",
+    "double_top",
+    "breakout_up",
+    "bullish_engulfing"
+  ],
+  "apply_notes": [
+    "HARDENED REWARD (penalty_scale 0.90): From real val_20260528_145148_overnight_1m XAUUSDm 4w: news_forced ~-44k losses indicate need for stronger exit discipline via TimeExitSpec.",
+    "BOOST PATTERNS+TIMING: Candidate delivered +5824 pnl / winrate lift on double_bottom (18k+ trades), +7758 on low_news_prox, +64.13 on new max_hold exits. Direct from pattern_profitability + timing_analysis + time_exit_effectiveness.",
+    "ENHANCED CLASSICAL/RAINFOREST: Pattern edges strongest when combined with timing windows; increase their weight for next Decision PPO ensemble.",
+    "Produced by full_cycle demo using real StandardizedValidationResult + AutonomousRetrainingOrchestrator.post_campaign_meta_tuning + MetaOptimizer (synthesized actionable overrides beyond auto parser limits)."
+  ],
+  "source_artifact": "C:\\supreme-chainsaw\\runtime\\validation_results\\standardized_validation_XAUUSDm_4w_val_20260528_145148_overnight_1m.json",
+  "generated_by": "full_cycle_with_real_overnight_artifact_20260528"
+}

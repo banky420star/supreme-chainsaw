@@ -109,6 +109,15 @@ except Exception:
     ContinualLearner = None
     ContinualConfig = None
 
+# Meta-Optimizer Integration (post-campaign objective / architecture self-tuning from harness results)
+try:
+    from Python.autonomous.meta_optimizer import MetaOptimizer, MetaConfig
+    META_OPTIMIZER_AVAILABLE = True
+except Exception:
+    MetaOptimizer = None  # type: ignore
+    MetaConfig = None  # type: ignore
+    META_OPTIMIZER_AVAILABLE = False
+
 @dataclass
 class RetrainingConfig:
     """Configuration for the Autonomous Retraining Orchestrator."""
@@ -207,8 +216,9 @@ class AutonomousRetrainingOrchestrator:
                 "promotion_gates": self.promotion_gates is not None,
                 "model_registry": self.model_registry is not None,
                 "continual_learner": ContinualLearner is not None,
+                "meta_optimizer": META_OPTIMIZER_AVAILABLE,  # post-campaign: harness pattern+timing+TimeExit -> reward/ensemble/feature suggestions for next train
             },
-            "end_to_end_flow": "retraining_trigger (or supervisor) -> should_retrain -> launch_async (subprocess Popen on launch_decision_ppo_training.py + train_*.py) -> poll + parse metrics/logs -> _evaluate_with_fast_bt -> PromotionGates.evaluate -> promote / handoff marker",
+            "end_to_end_flow": "retraining_trigger (or supervisor) -> should_retrain -> launch_async (...) -> _evaluate_with_fast_bt (or ValidationHarness campaign) -> post_campaign_meta_tuning (MetaOptimizer: pattern_profitability/timing/TimeExitSpec -> propose new reward_profile/ensemble/feature_importance) -> PromotionGates -> promote. Suggested training overrides persisted for next cycle.",
             "artifacts": {
                 "log": str(self.log_path),
                 "status": str(self.status_path),
@@ -636,10 +646,82 @@ class AutonomousRetrainingOrchestrator:
             except Exception as e:
                 self.log("post_eval_error", {"err": str(e)})
 
+            # META-OPTIMIZER WIRING: after retrain/eval (or harness campaign inside), run post-campaign objective tuning
+            # This uses pattern profitability / timing / TimeExitSpec to suggest reward/ensemble/fi for NEXT training
+            try:
+                if META_OPTIMIZER_AVAILABLE:
+                    meta_tune_res = self.post_campaign_meta_tuning()
+                    self.log("meta_tuning_invoked_from_cycle", {"applied": meta_tune_res.get("applied"), "has_suggestions": bool(meta_tune_res.get("suggested_for_next_training"))})
+            except Exception as mt_e:
+                self.log("meta_tuning_from_cycle_warn", {"err": str(mt_e)[:120]})
+
         self.state["last_check"] = datetime.now(timezone.utc).isoformat()
         self._write_status("cycle_complete")
         self.log("cycle_end", {"state": self.state})
         return {"retrained": needed or force, "reason": reason}
+
+    def post_campaign_meta_tuning(self, campaign_results: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+        """
+        NEW INTEGRATION POINT (Meta-Optimizer Integration Agent):
+        Called by orchestrator (or supervisor) AFTER a ValidationHarness campaign completes.
+        Loads recent harness artifacts (pattern_profitability, timing_analysis, time_exit_effectiveness),
+        runs MetaOptimizer.integrate... + suggest, optionally applies light tuning via apply_harness_suggested_tuning,
+        and returns suggested config changes consumable by the *next* training launch.
+        This closes the intelligent self-evolution of objectives (reward) + architecture (ensemble + fi) loop.
+        """
+        result = {
+            "meta_tuning_run": True,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "meta_available": META_OPTIMIZER_AVAILABLE,
+            "suggestions": None,
+            "applied": False,
+            "suggested_for_next_training": {},
+        }
+        if not META_OPTIMIZER_AVAILABLE or MetaOptimizer is None:
+            result["note"] = "MetaOptimizer not importable; skipping objective tuning"
+            self.log("post_campaign_meta_skipped", result)
+            return result
+
+        try:
+            mo = MetaOptimizer(symbol=self.config.symbols[0] if self.config.symbols else "XAUUSDm", verbose=False)
+            # Prefer passed results; else auto-discover from disk (standardized + ab)
+            arts = []
+            if campaign_results:
+                arts = [{"data": r} for r in campaign_results if isinstance(r, dict)]
+            if not arts:
+                arts = mo.load_recent_validation_artifacts()
+
+            harness_sug = mo.integrate_validation_harness_results(arts)
+            retrain_sug = mo.suggest_for_retrain()
+
+            # Light auto-apply of high-signal objective changes (safe; only reward/ensemble/fi, no full model)
+            apply_res = mo.apply_harness_suggested_tuning(harness_sug)
+
+            result["suggestions"] = harness_sug
+            result["full_retrain_suggestion"] = retrain_sug
+            result["applied"] = apply_res.get("applied", False)
+            result["suggested_for_next_training"] = retrain_sug.get("suggested_config_changes_for_next_training", harness_sug.get("suggested_training_overrides", {}))
+            result["meta_config_id"] = mo.current_config.config_id
+            result["overrides_written"] = True
+
+            self.log("post_campaign_meta_tuning_complete", {
+                "applied": result["applied"],
+                "profile": result["suggested_for_next_training"].get("reward_profile"),
+                "reasoning_sample": (harness_sug.get("proposed_delta", {}).get("reasoning") or [])[:2],
+            })
+
+            # Persist a dedicated suggestion artifact for training launchers
+            sug_path = RETRAIN_JOBS_DIR / f"meta_suggested_training_overrides_{int(time.time())}.json"
+            with open(sug_path, "w", encoding="utf-8") as f:
+                json.dump(result["suggested_for_next_training"], f, indent=2, default=str)
+            result["suggestion_artifact"] = str(sug_path)
+
+        except Exception as e:
+            result["error"] = str(e)[:200]
+            self.log("post_campaign_meta_error", {"err": result["error"]})
+
+        self._write_status("post_campaign_meta_tuning", {"last_meta_tune": result})
+        return result
 
     def start(self):
         """Long-running loop."""

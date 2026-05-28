@@ -9,6 +9,9 @@ Reward = pnl_after_spread_commission_slippage
          - excessive_hold_penalty
 
 Rejects raw price_change as reward.
+
+NEW (v5+): penalty_scale (default 1.0) multiplies all penalty terms for training stability via lighter early profiles
+(controlled by AGI_PENALTY_SCALE / AGI_REWARD_PROFILE / config). Defaults preserve all hardened modeling.
 """
 import numpy as np
 from typing import Dict, Any
@@ -32,6 +35,7 @@ class TradingReward:
         max_hold_steps: int = 200,
         max_drawdown_threshold: float = 0.15,
         max_risk_per_trade: float = 0.02,
+        penalty_scale: float = 1.0,  # NEW: Reward Scale & Signal Improvement (v5+): <1.0 for lighter early-training profiles; default preserves hardened
     ):
         self.commission_rate = float(commission_rate)
         self.spread_bps = float(spread_bps)
@@ -44,6 +48,7 @@ class TradingReward:
         self.max_hold_steps = int(max_hold_steps)
         self.max_drawdown_threshold = float(max_drawdown_threshold)
         self.max_risk_per_trade = float(max_risk_per_trade)
+        self.penalty_scale = float(penalty_scale)
 
     def compute(
         self,
@@ -82,7 +87,16 @@ class TradingReward:
         risk_violation_penalty = self.risk_violation_penalty_coeff * max(0.0, risk_used - self.max_risk_per_trade)
         excessive_hold_penalty = self.excessive_hold_penalty_coeff * max(0.0, hold_steps - self.max_hold_steps) / max(1, self.max_hold_steps)
 
-        # Total reward
+        # NEW (Reward Scale & Signal Improvement): apply penalty_scale for optional lighter profiles during early training (v5/v6)
+        # Default=1.0 fully preserves hardened risk modeling (DD, costs, overtrading, risk violation).
+        # Set <1.0 via AGI_PENALTY_SCALE or config only for training stability; evaluation gates unaffected.
+        drawdown_penalty *= self.penalty_scale
+        overtrading_penalty *= self.penalty_scale
+        spread_penalty *= self.penalty_scale
+        risk_violation_penalty *= self.penalty_scale
+        excessive_hold_penalty *= self.penalty_scale
+
+        # Total reward (core)
         reward = (
             pnl_after_costs / (prev_equity + 1e-12)
             - drawdown_penalty
@@ -91,6 +105,27 @@ class TradingReward:
             - risk_violation_penalty
             - excessive_hold_penalty
         )
+
+        # ── Market Timing Awareness (user request: profitable timing + market open / news events) ──
+        # These signals come from enriched observations (news_proximity, major_open_window, etc.)
+        timing_bonus = 0.0
+        news_proximity = float(kwargs.get("news_proximity", 0.0))
+        in_open_window = float(kwargs.get("major_open_window", 0.0))
+        news_avoidance = float(kwargs.get("news_avoidance_zone", 0.0))
+
+        # Reward good behavior around news (avoiding high-impact windows when not in a strong position)
+        if news_avoidance > 0 and current_position == 0:
+            timing_bonus += 0.0008 * self.penalty_scale   # small positive for staying flat near news
+
+        # Small bonus for participating in high-volatility open windows when conditions are good
+        if in_open_window > 0 and abs(current_position) > 0:
+            timing_bonus += 0.0005 * self.penalty_scale
+
+        # Penalty for holding through very close high-impact news without justification
+        if news_proximity > 0.7 and abs(current_position) > 0:
+            timing_bonus -= 0.0015 * self.penalty_scale
+
+        reward += timing_bonus
 
         # Reject raw price_change: if the reward is essentially just price_ret with no position scaling, zero it
         # This prevents the agent from getting rewarded for market movement without position

@@ -4,9 +4,10 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from datetime import datetime, timezone
 
-from filelock import FileLock
+from filelock import FileLock, Timeout as FileLockTimeout
 from loguru import logger
 
 from Python.config_utils import load_project_config
@@ -53,7 +54,18 @@ class ModelRegistry:
         self.registry_config = registry_config or self._load_registry_config()
 
         self.active_path = os.path.join(self.root, "active.json")
-        self._lock = FileLock(f"{self.active_path}.lock")
+        # Hardened locking: configurable timeout (env > config > 30s default for VPS contention safety)
+        # Prevents indefinite blocks on inference/API during slow training writes or disk hiccups.
+        raw_timeout = (
+            os.environ.get("AGI_REGISTRY_LOCK_TIMEOUT")
+            or (self.registry_config.get("lock_timeout") if isinstance(self.registry_config, dict) else None)
+            or 30.0
+        )
+        try:
+            self._lock_timeout = float(raw_timeout)
+        except Exception:
+            self._lock_timeout = 30.0
+        self._lock = FileLock(f"{self.active_path}.lock", timeout=self._lock_timeout)
         self.champion_dir = os.path.join(self.root, "champion")
         self.canary_dir = os.path.join(self.root, "canary")
         self.candidates_dir = os.path.join(self.root, "candidates")
@@ -118,8 +130,49 @@ class ModelRegistry:
             out["symbols"][sym] = cfg
         return out
 
+    def _safe_acquire_lock(self, operation: str = "registry_op") -> None:
+        """Acquire the FileLock with bounded retries + backoff + clear logging.
+
+        This is the core file locking hardening: tolerates transient contention on VPS
+        (e.g. training write + live inference load + API read overlapping) without
+        hanging the caller forever. Logs on each retry for observability.
+        """
+        max_retries = 4
+        base_backoff = 0.2
+        for attempt in range(1, max_retries + 1):
+            try:
+                # acquire() honors the timeout set on the FileLock instance
+                self._lock.acquire()
+                return
+            except FileLockTimeout as exc:
+                if attempt == max_retries:
+                    logger.error(
+                        f"Registry lock timeout after {max_retries} attempts for {operation} "
+                        f"(timeout={self._lock_timeout}s). Possible long-held writer or disk stall."
+                    )
+                    raise RuntimeError(
+                        f"Failed to acquire model registry lock for {operation} after retries"
+                    ) from exc
+                backoff = base_backoff * (2 ** (attempt - 1))
+                logger.warning(
+                    f"Registry lock contended ({operation}); retry {attempt}/{max_retries} "
+                    f"in {backoff:.2f}s (timeout={self._lock_timeout}s)"
+                )
+                time.sleep(backoff)
+            except Exception as exc:
+                logger.error(f"Unexpected registry lock error during {operation}: {exc}")
+                raise
+
+    def _release_lock(self) -> None:
+        try:
+            if self._lock.is_locked:
+                self._lock.release()
+        except Exception:
+            pass  # best effort
+
     def _read_active(self):
-        with self._lock:
+        self._safe_acquire_lock("read_active")
+        try:
             try:
                 with open(self.active_path, "r", encoding="utf-8") as f:
                     payload = json.load(f)
@@ -130,6 +183,8 @@ class ModelRegistry:
             except Exception as exc:
                 logger.warning(f"Failed to read active.json ({exc}); using empty registry state")
                 return self._normalize_active({})
+        finally:
+            self._release_lock()
 
     def _load_registry_config(self) -> dict:
         try:
@@ -139,7 +194,8 @@ class ModelRegistry:
             return {}
 
     def _write_active(self, payload: dict):
-        with self._lock:
+        self._safe_acquire_lock("write_active")
+        try:
             normalized = self._normalize_active(payload)
             normalized["registry_metadata"] = self._build_registry_metadata(normalized)
 
@@ -157,6 +213,8 @@ class ModelRegistry:
                     logger.warning("Unable to backup active registry file.")
 
             shutil.move(tmp.name, self.active_path)
+        finally:
+            self._release_lock()
 
     def _build_registry_metadata(self, active: dict) -> dict:
         meta = {
@@ -199,6 +257,11 @@ class ModelRegistry:
             return {}
 
     def _integrity_snapshot(self, candidate_dir: str | None) -> dict:
+        """Capture sha256 + size for defense-in-depth integrity (improved check).
+
+        Size + hash makes tampering or partial writes far more detectable on real
+        VPS disk scenarios (e.g. interrupted training writes).
+        """
         targets = INTEGRITY_TARGETS
         snapshot = {}
         if not candidate_dir:
@@ -206,7 +269,12 @@ class ModelRegistry:
         for label, fname in targets.items():
             path = os.path.join(candidate_dir, fname)
             if os.path.exists(path):
-                snapshot[label] = self._file_hash(path)
+                try:
+                    size = os.path.getsize(path)
+                    h = self._file_hash(path)
+                    snapshot[label] = {"hash": h, "size": size}
+                except Exception:
+                    snapshot[label] = {"hash": self._file_hash(path), "size": None}
         return snapshot
 
     def _clear_active_entry(self, active: dict, role_key: str, symbol: str | None = None):
@@ -222,28 +290,62 @@ class ModelRegistry:
         active[normalized_role] = None
 
     def _validate_candidate_integrity(self, candidate_dir: str | None) -> bool:
+        """Validate integrity using recorded hash (+ size if present in new snapshots).
+
+        Improved checks: supports legacy string-hash snapshots and new {hash,size} format.
+        On mismatch, logs detailed reason (file, expected vs actual) for auditability
+        before any promotion or load in live conditions.
+        """
         if not candidate_dir or not os.path.isdir(candidate_dir):
             return False
         recorded = self.read_metadata(candidate_dir).get("integrity")
         if not isinstance(recorded, dict) or not recorded:
+            # No integrity recorded (older artifacts) — allow but warn at call sites
             return True
+
         for label, expected in recorded.items():
             if not expected:
                 continue
             fname = INTEGRITY_TARGETS.get(label)
             if not fname:
-                # Unknown label from older snapshot — skip gracefully
-                continue
+                continue  # Unknown from older snapshot — skip gracefully
             path = os.path.join(candidate_dir, fname)
             if not os.path.exists(path):
+                logger.warning(f"Integrity fail: missing file {label}={fname} for {candidate_dir}")
                 return False
-            actual = self._file_hash(path)
-            if not actual or str(actual) != str(expected):
-                return False
-        # Also validate that all known target files exist (not just recorded ones)
+
+            actual_hash = self._file_hash(path)
+            actual_size = os.path.getsize(path) if os.path.exists(path) else None
+
+            # Support legacy (str) and new (dict) recorded formats
+            if isinstance(expected, dict):
+                exp_hash = expected.get("hash")
+                exp_size = expected.get("size")
+                if exp_hash and str(actual_hash) != str(exp_hash):
+                    logger.error(
+                        f"Integrity HASH mismatch for {label} in {candidate_dir}: "
+                        f"expected={exp_hash[:16]}... actual={actual_hash[:16] if actual_hash else 'None'}..."
+                    )
+                    return False
+                if exp_size is not None and actual_size != exp_size:
+                    logger.error(
+                        f"Integrity SIZE mismatch for {label} in {candidate_dir}: "
+                        f"expected={exp_size} actual={actual_size}"
+                    )
+                    return False
+            else:
+                # Legacy string hash only
+                if not actual_hash or str(actual_hash) != str(expected):
+                    logger.error(
+                        f"Integrity (legacy) HASH mismatch for {label} in {candidate_dir}"
+                    )
+                    return False
+
+        # Full presence check for all current targets (stricter than recorded only)
         for label, fname in INTEGRITY_TARGETS.items():
             path = os.path.join(candidate_dir, fname)
             if not os.path.exists(path):
+                logger.warning(f"Integrity fail: required target {label}={fname} missing in {candidate_dir}")
                 return False
         return True
 
@@ -440,6 +542,13 @@ class ModelRegistry:
             symbols[symbol] = cur
             self._write_active(active)
             logger.warning(f"Canary set for {symbol}: {version_dir} bundle={bundle_id}")
+            self._append_promotion_audit("set_canary", self._enrich_promotion_details({
+                "symbol": symbol,
+                "role": "canary",
+                "path": version_dir,
+                "bundle_id": bundle_id,
+                "policy": merged,
+            }))
             return
 
         active["canary"] = version_dir
@@ -448,6 +557,13 @@ class ModelRegistry:
         active["canary_state"] = {"passed": False, "reason": "no_metrics"}
         self._write_active(active)
         logger.warning(f"Canary set: {version_dir} bundle={bundle_id}")
+        self._append_promotion_audit("set_canary", self._enrich_promotion_details({
+            "symbol": None,
+            "role": "canary",
+            "path": version_dir,
+            "bundle_id": bundle_id,
+            "policy": merged,
+        }))
 
     def update_canary_metrics(
         self,
@@ -527,6 +643,13 @@ class ModelRegistry:
             symbols[symbol] = cur
             self._write_active(active)
             logger.success(f"Promoted {symbol} champion: {cur['champion']} bundle={cur['champion_bundle_id']}")
+            self._append_promotion_audit("promote_canary_to_champion", self._enrich_promotion_details({
+                "symbol": symbol,
+                "old_champion": old_champion,
+                "new_champion": cur["champion"],
+                "bundle_id": cur.get("champion_bundle_id"),
+                "forced": force,
+            }))
             return
 
         if not active.get("canary"):
@@ -544,6 +667,13 @@ class ModelRegistry:
         active["canary_state"] = {}
         self._write_active(active)
         logger.success(f"Promoted champion: {active['champion']} bundle={active['champion_bundle_id']}")
+        self._append_promotion_audit("promote_canary_to_champion", self._enrich_promotion_details({
+            "symbol": None,
+            "old_champion": old_champion,
+            "new_champion": active["champion"],
+            "bundle_id": active.get("champion_bundle_id"),
+            "forced": force,
+        }))
 
     def clear_canary(self, symbol: str | None = None):
         active = self._read_active()
@@ -555,12 +685,14 @@ class ModelRegistry:
             symbols[symbol] = cur
             self._write_active(active)
             logger.warning(f"Canary cleared for {symbol}")
+            self._append_promotion_audit("clear_canary", self._enrich_promotion_details({"symbol": symbol}))
             return
 
         active["canary"] = None
         active["canary_state"] = {}
         self._write_active(active)
         logger.warning("Canary cleared")
+        self._append_promotion_audit("clear_canary", self._enrich_promotion_details({"symbol": None}))
 
     def rollback_to_champion(self, symbol: str | None = None):
         self.clear_canary(symbol=symbol)
@@ -662,6 +794,11 @@ class ModelRegistry:
             symbols[symbol] = cur
             self._write_active(active)
             logger.success(f"Promoted {symbol} champion with gates: {candidate_dir}")
+            self._append_promotion_audit("promote_with_gates", self._enrich_promotion_details({
+                "symbol": symbol,
+                "candidate": candidate_dir,
+                "via": "gates",
+            }))
             return True, "ok"
 
         # Global champion promotion
@@ -669,6 +806,11 @@ class ModelRegistry:
         active["champion"] = candidate_dir
         self._write_active(active)
         logger.success(f"Promoted global champion with gates: {candidate_dir}")
+        self._append_promotion_audit("promote_with_gates", self._enrich_promotion_details({
+            "symbol": None,
+            "candidate": candidate_dir,
+            "via": "gates",
+        }))
         return True, "ok"
 
     # ── Per-symbol accessors (added to satisfy test suite) ───────────────
@@ -766,3 +908,80 @@ class ModelRegistry:
                 return symbols[symbol].get("canary_bundle_id")
             return active.get("canary_bundle_id")
         return active.get("canary_bundle_id")
+
+    # ── Hardened integrity audit + promotion logging (sprint improvements) ─
+
+    def audit_integrity(self, symbol: str | None = None) -> dict:
+        """Public self-audit for registry integrity (callable pre-cycle or from audit_registry.py).
+
+        Returns summary with per-role status and any failures. Safe to call anytime.
+        """
+        active = self._read_active()
+        report = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "root": self.root,
+            "lock_timeout": self._lock_timeout,
+            "symbols_checked": [],
+            "global": {},
+            "failures": [],
+        }
+
+        def _check_role(role: str, path: str | None, sym: str | None = None) -> dict:
+            if not path:
+                return {"present": False}
+            ok = self._validate_candidate_integrity(path)
+            meta = self._gather_candidate_metadata(path)  # includes integrity + scorecard
+            entry = {"path": path, "valid": bool(ok), "meta_summary": {k: meta.get(k) for k in ("symbol", "training_timesteps", "integrity") if k in meta}}
+            if not ok:
+                report["failures"].append(f"{role}{f'[{sym}]' if sym else ''}:{path}")
+            return entry
+
+        # Global
+        report["global"]["champion"] = _check_role("global_champion", active.get("champion"))
+        report["global"]["canary"] = _check_role("global_canary", active.get("canary"))
+
+        # Per symbol
+        for sym, entry in (active.get("symbols") or {}).items():
+            sym_report = {
+                "champion": _check_role("champion", entry.get("champion"), sym),
+                "canary": _check_role("canary", entry.get("canary"), sym),
+            }
+            report["symbols_checked"].append({"symbol": sym, "entries": sym_report})
+
+        if report["failures"]:
+            logger.warning(f"Registry integrity audit found failures: {report['failures']}")
+        else:
+            logger.info("Registry integrity audit passed for all known entries")
+        return report
+
+    _PROMOTION_AUDIT_LOG = os.path.join(
+        # Lazy init in method to avoid import-time side effects
+        "",  # placeholder; resolved at runtime in _append_promotion_audit
+    )
+
+    def _append_promotion_audit(self, event: str, details: dict) -> None:
+        """Structured promotion audit trail (clearer logging improvement).
+
+        Appends one JSON line per promotion/canary transition for easy forensics on
+        first real MT5 cycles and post-incident review. Complements (does not replace)
+        loguru logs and bundle promotion jsonl.
+        """
+        try:
+            log_dir = os.path.join(self.root)
+            log_path = os.path.join(log_dir, "promotion_audit.jsonl")
+            os.makedirs(log_dir, exist_ok=True)
+            entry = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "event": event,
+                "details": details,
+                "git_commit": self._current_git_commit_hash(),
+            }
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+        except Exception as exc:
+            logger.warning(f"Failed to append promotion audit log: {exc}")
+
+    def _enrich_promotion_details(self, base: dict, active_before: dict | None = None) -> dict:
+        d = dict(base or {})
+        d.setdefault("lock_timeout", self._lock_timeout)
+        return d

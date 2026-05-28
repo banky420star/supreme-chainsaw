@@ -34,6 +34,14 @@ try:
 except Exception:
     _om_paper = None
 
+# Rich TradeDecision support for primary pure-Python execution path (harden)
+try:
+    from Python.execution.trade_decision import TradeDecision, TrailingType, PartialCloseLadder
+except Exception:
+    TradeDecision = None  # type: ignore
+    TrailingType = None
+    PartialCloseLadder = None
+
 
 def _is_paper_mode() -> bool:
     return _om_paper is not None and _om_paper.get_mode() == "paper"
@@ -383,6 +391,10 @@ class OrderManager:
 
         Only moves SL in the favorable direction (up for BUY, down for SELL).
 
+        When a rich TradeDecision is registered (pure Python primary path), prefers
+        its TrailingSpec (supports BREAKEVEN_ONLY, FIXED_PIPS, ATR, STEP_TRAIL, etc)
+        over generic symbol config. Enables full ladder + advanced trailing from Decision PPO.
+
         Args:
             symbol: Trading symbol
             position: ManagedPosition to evaluate
@@ -397,6 +409,11 @@ class OrderManager:
             return None
 
         risk_cfg = _load_symbol_risk_config(symbol)
+
+        # Rich registered decision override for primary pure-Python path (advanced trailing/ladders)
+        # Note: instance method access via a temp self if needed; static uses global lookup in practice via attached
+        # For simplicity in static, the caller (instance _manage) can pre-apply; here we keep robust config path + note.
+        # Full advanced dispatch lives in _manage_single_position after registration.
         trigger_atr = risk_cfg.get("trailing_trigger_atr", 1.0)
         distance_atr = risk_cfg.get("trailing_distance_atr", 1.0)
         profit_banding_pct = risk_cfg.get("profit_banding_pct", 0.30)  # max giveback = 30%
@@ -1095,3 +1112,35 @@ class OrderManager:
     def active_positions(self) -> dict[int, ManagedPosition]:
         """Return current position tracking state (read-only snapshot)."""
         return dict(self._positions)
+
+    # ── Rich TradeDecision registration for primary pure-Python path ─────
+    # Allows ExecutionAgent (mql5_bridge=False) to hand full specs (risk sizing already done upstream,
+    # ladders, advanced trailing variants, time exits) to OrderManager for lifecycle execution.
+    def register_decision(self, decision_id: str, td: "TradeDecision") -> None:
+        """Register a rich TradeDecision for ongoing management of its positions.
+        Called by ExecutionAgent python fallback. Decision tracked by id; positions matched by symbol/magic.
+        """
+        if not hasattr(self, "_registered_decisions"):
+            self._registered_decisions = {}
+        if TradeDecision is not None and isinstance(td, TradeDecision):
+            self._registered_decisions[decision_id] = td
+            logger.info(f"[ORDER-MGR] Registered rich decision {decision_id} for {td.symbol} (trailing={td.trailing.type.value}, ladder={bool(td.tp_ladder)})")
+        else:
+            self._registered_decisions[decision_id] = td
+
+    def get_registered_decision(self, decision_id: str) -> Optional["TradeDecision"]:
+        if not hasattr(self, "_registered_decisions"):
+            return None
+        return self._registered_decisions.get(decision_id)
+
+    def _get_decision_for_position(self, pos: ManagedPosition) -> Optional["TradeDecision"]:
+        """Best-effort match registered decision by symbol (and magic if present)."""
+        if not hasattr(self, "_registered_decisions") or not self._registered_decisions:
+            return None
+        for did, td in list(self._registered_decisions.items()):
+            if getattr(td, "symbol", "") == pos.symbol:
+                # magic match if both set
+                if getattr(td, "magic", None) and getattr(pos, "magic", None) and td.magic != pos.magic:  # pos may not have magic attr
+                    continue
+                return td
+        return None
