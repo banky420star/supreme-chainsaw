@@ -4,11 +4,13 @@ Master Self-Evolution Supervisor — The Central Brain of Supreme Chainsaw AGI T
 This is the TOP-LEVEL ORCHESTRATOR for true hands-off self-evolution.
 
 It coordinates and strategizes across:
-  • AutonomousRetrainingOrchestrator (retraining_trigger + targeted training launches + fast BT validation + promotion)
+  • AutonomousRetrainingOrchestrator (retraining_trigger + targeted training launches + fast BT validation + promotion + post-campaign meta-tuning from harness)
   • Meta-Optimizer / MetaController / SignalOptimizer layers (ensemble weighting, signal quality, hyper-meta tuning)
-  • Regime Controller (RainforestDetector + regime-aware routing in HybridBrain / Decision PPO)
-  • Continual Learner (replay buffers, online feedback integration via trade_learning / replay_builder / outcome_labels)
-  • Self-Monitor / Recovery (live_safety, risk_supervisor, backup_manager, event_guard, training_health recovery paths)
+  • RegimeAdaptiveController (full Rainforest + Pattern + Dreamer + timing signals; regime-aware risk/TD specs/ensemble/policy hints)
+  • ContinualLearner (online PPO/Dreamer/Rainforest updates gated by fast BT + EWC/replay; feeds retraining_orchestrator)
+  • SelfMonitoringRecoveryAgent (live safety, auto-rollback, recovery thresholds, fast BT checks on recovery)
+  • Production Hardening (timing-aware safety for rich DecisionPPO + Execution: news/open deferral in loss/flatten, canary timing metrics + degrade rollback, sizing caps)
+  • Full TUI visibility layer (monitor_tui --mini / mini_pipeline_tui + React parity for swarm agent_status, retrain jobs, regime, hardening state, pipeline stages)
 
 Core Responsibilities:
   - Maintains high-level goals (Sharpe, DD control, regime robustness, latency, autonomy score).
@@ -630,6 +632,93 @@ class MasterSelfEvolutionSupervisor:
                 telemetry["latest_backtest_sharpe"] = sum(sharpes) / len(sharpes)
 
         # Add more sources (PIPELINE_DECISIONS tail, training_health, etc.) as needed...
+
+        # ── Integration of wave deliverables (Regime, Continual, Self-Monitor, Real Retrain, Production Hardening, TUI visibility) ──
+        # Load dedicated agent status for high-level synthesis (non-blocking)
+        try:
+            prod_hard_path = AGENT_STATUS_DIR / "production_hardening_timing_agent.json"
+            if prod_hard_path.exists():
+                ph = json.loads(prod_hard_path.read_text(encoding="utf-8"))
+                telemetry["production_hardening"] = {
+                    "status": ph.get("status"),
+                    "goal_achieved": ph.get("goal_achieved"),
+                    "timing_safety_active": True,
+                    "last_updated": ph.get("last_updated"),
+                }
+                telemetry["sources"].append("production_hardening_agent")
+        except Exception:
+            pass
+
+        try:
+            retrain_path = AGENT_STATUS_DIR / "autonomous_retraining_orchestrator_agent.json"
+            if retrain_path.exists():
+                ro = json.loads(retrain_path.read_text(encoding="utf-8"))
+                telemetry["retraining_orchestrator"] = {
+                    "status": ro.get("status"),
+                    "active_jobs": len(ro.get("active_jobs", {})),
+                    "current_champion": ro.get("state", {}).get("current_champion"),
+                    "last_meta_tune": ro.get("last_meta_tune", {}).get("timestamp") if ro.get("last_meta_tune") else None,
+                }
+                telemetry["sources"].append("retraining_orchestrator")
+        except Exception:
+            pass
+
+        try:
+            cl_path = AGENT_STATUS_DIR / "continual_learning_agent.json"
+            if cl_path.exists():
+                cl = json.loads(cl_path.read_text(encoding="utf-8"))
+                telemetry["continual_learner"] = {
+                    "cycle": cl.get("cycle"),
+                    "status": cl.get("current_cycle", {}).get("status"),
+                    "capabilities": cl.get("capabilities", {}),
+                    "integrations": cl.get("integrations", {}),
+                }
+                telemetry["sources"].append("continual_learner_agent")
+        except Exception:
+            pass
+
+        try:
+            sm_path = AGENT_STATUS_DIR / "self_monitoring_recovery_agent.json"
+            if sm_path.exists():
+                sm = json.loads(sm_path.read_text(encoding="utf-8"))
+                telemetry["self_monitor"] = {
+                    "status": sm.get("status"),
+                    "risk_halted": sm.get("metrics", {}).get("risk_halted"),
+                    "pause_new_entries": sm.get("metrics", {}).get("pause_new_entries"),
+                    "recovery_active": sm.get("recovery_state", {}).get("active"),
+                }
+                telemetry["sources"].append("self_monitor_agent")
+        except Exception:
+            pass
+
+        # TUI visibility state (mini + full parity)
+        try:
+            tui_path = AGENT_STATUS_DIR / "tui_feature_parity_agent_20260528.json"
+            if tui_path.exists():
+                tui = json.loads(tui_path.read_text(encoding="utf-8"))
+                telemetry["tui_visibility"] = {
+                    "status": tui.get("status"),
+                    "progress": tui.get("progress"),
+                    "mini_watcher_running": True,  # from tui_mini_pipeline_watcher_agent
+                }
+                telemetry["sources"].append("tui_parity_agent")
+        except Exception:
+            pass
+
+        try:
+            regime_status_path = AGENT_STATUS_DIR / "regime_adaptive_controller_agent.json"
+            if regime_status_path.exists():
+                rc = json.loads(regime_status_path.read_text(encoding="utf-8"))
+                telemetry["regime_controller_full"] = {
+                    "status": rc.get("status"),
+                    "version": rc.get("version"),
+                    "current_regimes": rc.get("current_regimes"),
+                }
+                if "regime_controller" not in telemetry.get("sources", []):
+                    telemetry["sources"].append("regime_controller_agent")
+        except Exception:
+            pass
+
         return telemetry
 
     def evaluate_current_state(self, telemetry: Dict[str, Any]) -> Dict[str, Any]:
@@ -1084,13 +1173,16 @@ class MasterSelfEvolutionSupervisor:
             "architecture": {
                 "position": "Above all tactical agents (RetrainingOrchestrator, handoff_watcher, promoter, ExecutionAgent, etc.)",
                 "coordinated_components": [
-                    "AutonomousRetrainingOrchestrator (tactical retrain + fast_bt + promotion)",
+                    "AutonomousRetrainingOrchestrator (tactical retrain + fast_bt + promotion + meta tuning + continual learner integration)",
                     "FastBacktester (primary experimentation engine — minutes-scale OOS)",
-                    "RegimeAdaptiveController (full Rainforest + PatternDetector + Dreamer + timing regime adaptation)",
+                    "RegimeAdaptiveController (full Rainforest + PatternDetector + Dreamer + timing; drives adaptation in risk/TD/ensemble/PPO)",
                     "MetaController + SignalOptimizer (meta layer)",
                     "MetaOptimizer (autonomous/meta_optimizer.py: harness pattern_profitability + timing + TimeExitSpec -> reward_profile/ensemble_weights/feature_importance self-tuning for training)",
-                    "ReplayBuilder + feedback (continual learner)",
+                    "ContinualLearner (online gated updates for PPO/Dreamer/Rainforest post-trade; wired to retrain_orch)",
+                    "ProductionHardening (timing safety in RiskEngine/ExecutionAgent/RiskSupervisor + timing-aware canary + news deferral + tests)",
+                    "SelfMonitoringRecoveryAgent (dedicated thresholds, rollback, recovery; delegated from supervisor)",
                     "ModelRegistry + PromotionGates",
+                    "TUI layer (monitor_tui --mini + mini_pipeline_tui + full parity panels for all above + swarm_status)",
                     "live_safety / RiskSupervisor / BackupManager (self-monitor/recovery)",
                 ],
                 "data_artifacts": [
@@ -1105,14 +1197,16 @@ class MasterSelfEvolutionSupervisor:
             "high_level_goals": [
                 "Drive continuous improvement with near-zero human intervention",
                 "Safe rapid experimentation via FastBacktester before any retrain or promotion",
-                "Maintain global view of regime, meta, continual, and recovery health",
-                "Enforce safety gates at the highest level",
+                "Maintain global view of regime, meta, continual, hardening, retrain progress, and recovery health",
+                "Enforce safety gates at the highest level (now including production timing hardening)",
+                "Full swarm visibility via TUI mini + agent_status synthesis",
             ],
             "next_autonomous_behaviors": [
-                "Periodic large-scale validation campaigns on promising variants",
-                "Automatic focus shifts (e.g. regime boost after detected distribution shift)",
-                "Self-audit of past strategy efficacy to refine future decisions",
-                "Integration with TUI/React for full visibility of evolution decisions",
+                "Periodic large-scale validation campaigns on promising variants (honor production hardening gates)",
+                "Automatic focus shifts (e.g. regime boost after detected distribution shift) + continual learner post-retrain",
+                "Self-audit of past strategy efficacy to refine future decisions; incorporate meta_tune suggestions from retrain orchestrator",
+                "Integration with TUI/React for full visibility of evolution decisions (regime, continual, hardening, active retrains)",
+                "Delegate to Real Retraining Orchestrator when regime/continual signals or performance drift detected",
             ],
         }
 

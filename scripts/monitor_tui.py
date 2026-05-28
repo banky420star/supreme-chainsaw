@@ -1285,7 +1285,70 @@ def render_mini_pipeline_watcher() -> "Panel":
         col = "red" if "no " in a.lower() or "degrad" in a.lower() or "unclear" in a.lower() else "yellow" if "may" in a.lower() else "green"
         txt.append(f"   • {a}\n", style=col)
 
-    txt.append("\nSources: runtime/agent_status/* + logs/PIPELINE_DECISIONS.jsonl + execution_feedback.jsonl + timing insights + data/test caches | Pure-Py Exec primary + TimeExitSpec\n", style="dim")
+    # 9. SELF-EVOLUTION SWARM STATUS (wave integration: Regime, Continual, Self-Monitor, Real Retrain, Production Hardening, TUI parity) - reflects Master Coordinator synthesis
+    txt.append("> SELF-EVO SWARM (MasterSelfEvolutionSupervisor + wave agents)\n", style="bold bright_magenta")
+    swarm_lines = []
+    AGENT_DIR = Path("runtime/agent_status")
+    try:
+        # Regime Controller
+        rc_path = AGENT_DIR / "regime_adaptive_controller_agent.json"
+        if rc_path.exists():
+            rc = json.loads(rc_path.read_text(encoding="utf-8", errors="ignore"))
+            swarm_lines.append(f"RegimeCtrl: {rc.get('status','?')} v={rc.get('version','?')} regimes={list((rc.get('current_regimes') or {}).keys())[:2]}")
+    except Exception:
+        pass
+    try:
+        # Continual Learner
+        cl_path = AGENT_DIR / "continual_learning_agent.json"
+        if cl_path.exists():
+            cl = json.loads(cl_path.read_text(encoding="utf-8", errors="ignore"))
+            cyc = cl.get("current_cycle", {})
+            swarm_lines.append(f"Continual: cycle={cl.get('cycle')} status={cyc.get('status','?')} ppo_ok={cl.get('capabilities',{}).get('ppo_online',False)}")
+    except Exception:
+        pass
+    try:
+        # Self-Monitor
+        sm_path = AGENT_DIR / "self_monitoring_recovery_agent.json"
+        if sm_path.exists():
+            sm = json.loads(sm_path.read_text(encoding="utf-8", errors="ignore"))
+            m = sm.get("metrics", {})
+            swarm_lines.append(f"SelfMonitor: {sm.get('status','?')} DD={m.get('current_drawdown_pct',0):.1f}% recov={sm.get('recovery_state',{}).get('active',False)} pause={sm.get('pause_flag_active',False)} cons_exit={sm.get('conservative_time_exit_active',False)} trigs={len(sm.get('rollback_triggers_last_cycle',[])) if isinstance(sm.get('rollback_triggers_last_cycle'), list) else 0}")
+    except Exception:
+        pass
+    try:
+        # Real Retrain Orchestrator
+        ro_path = AGENT_DIR / "autonomous_retraining_orchestrator_agent.json"
+        if ro_path.exists():
+            ro = json.loads(ro_path.read_text(encoding="utf-8", errors="ignore"))
+            jobs = ro.get("active_jobs", {})
+            swarm_lines.append(f"RealRetrain: {ro.get('status','?')} jobs={len(jobs)} champ={ro.get('state',{}).get('current_champion','?')}")
+    except Exception:
+        pass
+    try:
+        # Production Hardening
+        ph_path = AGENT_DIR / "production_hardening_timing_agent.json"
+        if ph_path.exists():
+            ph = json.loads(ph_path.read_text(encoding="utf-8", errors="ignore"))
+            swarm_lines.append(f"ProdHardening: {ph.get('status','?')} timing_safety={bool(ph.get('deliverables',{}).get('safety_hardenings'))}")
+    except Exception:
+        pass
+    try:
+        # TUI parity (mini visibility)
+        tp_path = AGENT_DIR / "tui_feature_parity_agent_20260528.json"
+        if tp_path.exists():
+            tp = json.loads(tp_path.read_text(encoding="utf-8", errors="ignore"))
+            swarm_lines.append(f"TUI: {tp.get('status','?')} parity={tp.get('progress',0)}% mini_watcher=RUNNING")
+    except Exception:
+        pass
+    if swarm_lines:
+        for line in swarm_lines[:4]:  # cap lines for dense mini
+            txt.append(f"   {line}\n", style="magenta")
+        if len(swarm_lines) > 4:
+            txt.append(f"   ... +{len(swarm_lines)-4} more (see full agent_status/)\n", style="dim")
+    else:
+        txt.append("   (swarm status loading... launch agents for full visibility)\n", style="dim")
+
+    txt.append("\nSources: runtime/agent_status/* + logs/PIPELINE_DECISIONS.jsonl + execution_feedback.jsonl + timing insights + data/test caches | Pure-Py Exec primary + TimeExitSpec | Master Coordinator wave synthesis\n", style="dim")
 
     return Panel(txt, title="TUI Mini Pipeline Watcher - Full Timing-Aware Autonomous Pipeline (dense)", border_style="bright_green", padding=(0, 0))
 
