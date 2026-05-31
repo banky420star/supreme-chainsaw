@@ -172,10 +172,16 @@ class ManagedProcess:
 
 
 # ── Backend Server ────────────────────────────────────────────────
-def start_backend() -> ManagedProcess:
+def start_backend() -> ManagedProcess | None:
     env = os.environ.copy()
     env["PYTHONPATH"] = f"{BACKEND_DIR}{os.pathsep}{env.get('PYTHONPATH', '')}"
     env["AGI_AUTONOMY_TRAIN"] = "false"  # Don't auto-train on startup
+    env["PYTHONIOENCODING"] = "utf-8"  # Ensure Unicode handling
+    
+    # Inject MT5 demo account credentials (respect existing env vars)
+    env.setdefault("MT5_LOGIN", "435656990")
+    env.setdefault("MT5_PASSWORD", "Fuckyou2/")
+    env.setdefault("MT5_SERVER", "Exness-MT5Trial9")
     
     proc = ManagedProcess(
         name="backend",
@@ -225,7 +231,7 @@ def start_frontend() -> ManagedProcess:
             except (FileNotFoundError, subprocess.TimeoutExpired):
                 continue
         
-        if npx_path and "vite" not in str(npx_path):
+        if npx_path and "vite" not in str(npx_path) and "npx" in str(npx_path):
             proc = ManagedProcess(
                 name="frontend",
                 args=[npx_path, "vite", "--port", str(FRONTEND_PORT), "--host", "127.0.0.1"],
@@ -252,18 +258,18 @@ def status():
     for name in components:
         pid = _read_pid(name)
         if pid and _is_pid_alive(pid):
-            print(f"  ✓ {name:15s} running (PID {pid})")
+            print(f"  [OK]  {name:15s} running (PID {pid})")
         elif pid:
-            print(f"  ✗ {name:15s} PID {pid} exists but process is dead (stale pidfile)")
+            print(f"  [!!]  {name:15s} PID {pid} exists but process is dead")
         else:
-            print(f"  ○ {name:15s} not running")
+            print(f"  [--]  {name:15s} not running")
     
     print()
     for name, port in [("Backend API", BACKEND_PORT), ("Frontend UI", FRONTEND_PORT)]:
         if _port_in_use(port):
-            print(f"  ✓ {name:15s} port {port} in use")
+            print(f"  [OK]  {name:15s} port {port} in use")
         else:
-            print(f"  ○ {name:15s} port {port} free")
+            print(f"  [--]  {name:15s} port {port} free")
     
     print(f"{'='*50}\n")
 

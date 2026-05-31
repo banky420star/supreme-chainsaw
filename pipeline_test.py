@@ -151,7 +151,7 @@ try:
         symbol="EURUSD",
         timeframe="H1",
         mode="paper",
-        require_mt5=False,
+        require_mt5=True,
         timesteps=100,
         feature_set_id="ULTIMATE_150",
         dataset_id="test"
