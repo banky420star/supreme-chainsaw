@@ -289,7 +289,7 @@ class RegimeAdaptiveController:
         self.config = {**DEFAULT_ADAPTATION_CONFIG, **(config or {})}
         self.rf_detectors: Dict[str, Any] = {}
         self.pattern_detector: Optional[Any] = PatternDetector(atr_period=14) if _PATTERN_AVAILABLE else None
-        self.event_intel: Optional[Any] = EventIntel() if _EVENT_INTEL_AVAILABLE else None
+        self.event_intel: Optional[Any] = EventIntel(cfg={}, log_dir=os.path.join(_PROJECT_ROOT, 'logs')) if _EVENT_INTEL_AVAILABLE else None
 
         # Per-symbol short regime history for stability + hysteresis
         self._regime_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=12))

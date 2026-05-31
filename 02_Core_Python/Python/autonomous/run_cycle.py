@@ -1084,13 +1084,35 @@ class PipelineOrchestrator:
             backtest_ok = self.state.get("stages", {}).get("backtest_court", {}).get("ok", False)
             walkforward_ok = self.state.get("stages", {}).get("walk_forward", {}).get("ok", False)
             baseline_ok = self.state.get("stages", {}).get("baseline_comparison", {}).get("ok", False)
+            overnight_ok = self.state.get("stages", {}).get("overnight_validation", {}).get("ok", False)
 
-            if backtest_ok and walkforward_ok and baseline_ok:
+            # Optional stages — warn but don't block
+            profitability_ok = self.state.get("stages", {}).get("profitability_analysis", {}).get("ok", False)
+            simulations_ok = self.state.get("stages", {}).get("symbol_simulations", {}).get("ok", False)
+
+            required = {
+                "backtest_court": backtest_ok,
+                "walk_forward": walkforward_ok,
+                "baseline_comparison": baseline_ok,
+                "overnight_validation": overnight_ok,
+            }
+            optional = {
+                "profitability_analysis": profitability_ok,
+                "symbol_simulations": simulations_ok,
+            }
+
+            failing_required = [k for k, v in required.items() if not v]
+            failing_optional = [k for k, v in optional.items() if not v]
+
+            if not failing_required:
                 decision = "demo_canary"
             else:
                 decision = "reject"
                 ok = False
-                issues.append("Upstream validation stages did not all pass")
+                issues.append(f"Required validation stages did not all pass: {', '.join(failing_required)}")
+
+            if failing_optional:
+                issues.append(f"Optional stages did not pass (not blocking): {', '.join(failing_optional)}")
 
             _write_report(
                 "registry/PROMOTION_DECISION.json",
@@ -1103,6 +1125,11 @@ class PipelineOrchestrator:
                         "backtest": backtest_ok,
                         "walk_forward": walkforward_ok,
                         "baseline": baseline_ok,
+                        "overnight_validation": overnight_ok,
+                    },
+                    "optional": {
+                        "profitability_analysis": profitability_ok,
+                        "symbol_simulations": simulations_ok,
                     },
                 }, indent=2),
             )
