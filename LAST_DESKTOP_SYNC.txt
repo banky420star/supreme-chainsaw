@@ -1,0 +1,19 @@
+Desktop clean copy last updated: 2026-05-28T18:01:22
+Source working tree: C:\supreme-chainsaw
+
+Major content brought forward in this sync:
+  - Dual PPO architecture (Decision PPO + ExecutionAgent)
+    * TradeDecision rich spec (lot/TP/SL/trail/partials/full-close)
+    * DecisionHead + 18-dim DecisionSpec in drl/trading_env
+    * Full Execution layer with MQL5 command bridge
+  - Multi-timeframe (1m+5m+15m+1h) + best_features_per_symbol standard
+  - data_feed.py kwarg fix for clean MTF runs
+  - Latest handoff_watcher, promoter, harness, supervisor (decision_ppo default)
+  - New architecture docs (DECISION_EXECUTION_ARCHITECTURE.md, DECISION_PPO.md)
+  - Enhanced training pipeline + MTF support
+  - Dreamer (world model) + Rainforest / Random Forest (regime detector + ensemble)
+    * Full dreamer_agent / dreamer_components / dreamer_policy
+    * rainforest_detector + train_rainforest + reports
+  - All recent launcher / script / mql5 / config updates from 2026-05-28 swarm
+
+Exclusions applied: logs/, models/, runtime/, venvs, __pycache__, node_modules, artifacts, large binaries, *.log, etc.

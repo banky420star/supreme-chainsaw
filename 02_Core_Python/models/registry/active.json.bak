@@ -1,0 +1,52 @@
+{
+  "champion": null,
+  "canary": null,
+  "symbols": {
+    "BTCUSDm": {
+      "champion": null,
+      "canary": null,
+      "canary_policy": {},
+      "canary_state": {},
+      "champion_bundle_id": null,
+      "canary_bundle_id": null,
+      "champion_history": []
+    },
+    "XAUUSDm": {
+      "champion": null,
+      "canary": null,
+      "canary_policy": {},
+      "canary_state": {},
+      "champion_bundle_id": null,
+      "canary_bundle_id": null,
+      "champion_history": []
+    },
+    "EURUSDm": {
+      "champion": null,
+      "canary": null,
+      "canary_policy": {},
+      "canary_state": {},
+      "champion_bundle_id": null,
+      "canary_bundle_id": null,
+      "champion_history": []
+    },
+    "GBPUSDm": {
+      "champion": null,
+      "canary": null,
+      "canary_policy": {},
+      "canary_state": {},
+      "champion_bundle_id": null,
+      "canary_bundle_id": null,
+      "champion_history": []
+    }
+  },
+  "champion_bundle_id": null,
+  "canary_bundle_id": null,
+  "canary_policy": {},
+  "canary_state": {},
+  "champion_history": [],
+  "registry_metadata": {
+    "updated_at": "2026-05-31T07:07:13.076374+00:00",
+    "champion_metadata": {},
+    "canary_metadata": {}
+  }
+}

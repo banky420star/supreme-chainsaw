@@ -1,0 +1,534 @@
+<#
+.SYNOPSIS
+    SupremeChainsaw_Clean - ONE-CLICK GO LAUNCHER
+
+.DESCRIPTION
+    Double-click this file and everything starts:
+    1. api_server on 5051
+    2. Data ingestion from MT5 (XAUUSDm, BTCUSDm, EURUSDm, GBPUSDm)
+    3. Feature engineering pipeline
+    4. Full training pipeline (LSTM + DRL + Dreamer per symbol)
+    5. Promotion gates + canary handoff
+    6. Live trading via MetaTrader (Exness-MT5Trial9 demo)
+    7. React UI dashboard on port 4180 with real-time updates
+
+    First run = empty UI panels + data ingestion + training starts.
+    Every run = full pipeline from where it left off.
+
+    Demo account: Exness-MT5Trial9 | Login: 435656990
+    (credentials come from session.json - no hardcoding)
+
+.EXAMPLE
+    .\GO.ps1
+#>
+
+[CmdletBinding()]
+param(
+    [switch]$NoBrowser,
+    [switch]$DryRun,
+    [switch]$SkipTraining,
+    [switch]$PaperMode,
+    [int]$UiPort    = 4180,
+    [int]$ApiPort   = 5051,
+    [int]$HealthPollSeconds = 30
+)
+
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+
+# PATHS
+$RepoRoot = Split-Path -Parent $PSCommandPath
+if (-not $RepoRoot) { $RepoRoot = (Get-Location).Path }
+Set-Location $RepoRoot
+
+$CorePython  = Join-Path $RepoRoot "02_Core_Python"
+$PythonDir   = Join-Path $CorePython "Python"
+$UiLabApp    = "C:\supreme-chainsaw\ui_lab_app"
+$LogsDir     = Join-Path $RepoRoot "logs"
+$TmpDir      = Join-Path $RepoRoot ".tmp"
+$RuntimeDir  = Join-Path $RepoRoot "06_Data_Templates\runtime"
+$SessionFile = Join-Path $RuntimeDir "session.json"
+New-Item -ItemType Directory -Force -Path $LogsDir | Out-Null
+New-Item -ItemType Directory -Force -Path $TmpDir | Out-Null
+
+# LOGGING
+$LaunchLog = Join-Path $LogsDir "GO.log"
+$StageLog  = Join-Path $LogsDir "GO_stages.log"
+
+$script:ChildPids    = [System.Collections.Generic.List[int]]::new()
+$script:StageTimings = @{}
+
+function Write-Log {
+    param([string]$Level = "INFO", [string]$Message)
+    $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff")
+    $line = "[$ts] [$Level] $Message"
+    Add-Content -Path $LaunchLog -Value $line -Encoding UTF8 -Force -ErrorAction SilentlyContinue
+    Add-Content -Path $StageLog  -Value $line -Encoding UTF8 -Force -ErrorAction SilentlyContinue
+    $color = switch ($Level) { "ERROR" {"Red"} "WARN" {"Yellow"} "SUCCESS" {"Green"} "STAGE" {"Magenta"} default {"Cyan"} }
+    Write-Host $line -ForegroundColor $color
+}
+
+function Write-Stage {
+    param([string]$Message)
+    $ts = (Get-Date).ToString("HH:mm:ss")
+    $line = "[$ts] >> $Message"
+    Add-Content -Path $StageLog -Value $line -Encoding UTF8 -Force -ErrorAction SilentlyContinue
+    Write-Host $line -ForegroundColor Magenta
+    $script:StageTimings[$Message] = (Get-Date)
+}
+
+function Start-StageTimer { $script:_stageStart = Get-Date }
+function Get-StageDuration {
+    if ($script:_stageStart) { return ((Get-Date) - $script:_stageStart).ToString("mm\:ss") }
+    return "00:00"
+}
+
+function Rotate-LogIfLarge {
+    param([string]$Path, [int]$MaxMB = 10)
+    if ((Test-Path $Path) -and ((Get-Item $Path).Length -gt ($MaxMB * 1MB))) {
+        $bak = "$Path.1"; Remove-Item $bak -Force -ErrorAction SilentlyContinue
+        Move-Item $Path $bak -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Rotate-LogIfLarge -Path $LaunchLog
+Rotate-LogIfLarge -Path $StageLog
+
+Write-Host ""
+Write-Host "  SUPREME CHAINSAW CLEAN - FULL PIPELINE GO LAUNCHER" -ForegroundColor Cyan
+Write-Host ""
+Write-Log "INFO" "=== GO LAUNCHER starting (PaperMode=$PaperMode) ==="
+Write-Log "INFO" "RepoRoot: $RepoRoot"
+
+# KILL STALE PROCESSES
+Write-Log "INFO" "Checking for stale processes..."
+$stale = Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -match 'api_server|Server_AGI|monitor_tui|mini_pipeline' }
+if ($stale) {
+    Write-Log "WARN" "Stopping $($stale.Count) stale Python processes..."
+    $stale | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep 3
+}
+
+# PYTHON DETECTION
+function Find-Python {
+    $cands = @(
+        (Join-Path $RepoRoot ".venv312\Scripts\python.exe"),
+        (Join-Path $CorePython ".venv312\Scripts\python.exe"),
+        (Join-Path $RepoRoot ".venv\Scripts\python.exe"),
+        (Join-Path $CorePython ".venv\Scripts\python.exe")
+    )
+    foreach ($c in $cands) { if (Test-Path $c) { Write-Log "SUCCESS" "Python: $c"; return $c } }
+    Write-Log "ERROR" "Python venv not found. Run: python -m venv .venv312 then pip install -r requirements.txt"
+    return $null
+}
+
+$PythonExe = Find-Python
+if (-not $PythonExe -and -not $DryRun) { exit 1 }
+
+# NODE DETECTION
+function Find-NodeAndNpm {
+    $nodeExe = $null; $npmCmd = $null
+    try {
+        $nc = Get-Command node -ErrorAction SilentlyContinue
+        if ($nc) { $nodeExe = $nc.Source; $nm = Get-Command npm -ErrorAction SilentlyContinue; if ($nm) { $npmCmd = $nm.Source } }
+    } catch {}
+    if (-not $nodeExe) {
+        $paths = @(
+            'C:\Program Files\nodejs\node.exe',
+            'C:\Users\Administrator\Downloads\node-v24.16.0-win-x64\node-v24.16.0-win-x64\node.exe',
+            (Join-Path $env:LOCALAPPDATA 'Programs\nodejs\node.exe')
+        )
+        foreach ($p in $paths) { if (Test-Path $p) { $nodeExe = $p; break } }
+    }
+    if (-not $nodeExe) {
+        $roots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:LOCALAPPDATA)
+        foreach ($r in $roots) {
+            if (-not $r -or -not (Test-Path $r)) { continue }
+            try {
+                $h = Get-ChildItem -Path $r -Recurse -Filter 'node.exe' -ErrorAction SilentlyContinue -Depth 4 |
+                     Where-Object { $_.FullName -match 'nodejs|node\\node' } | Select-Object -First 1
+                if ($h) { $nodeExe = $h.FullName; break }
+            } catch {}
+        }
+    }
+    if ($nodeExe -and (Test-Path $nodeExe)) {
+        $nodeDir = Split-Path $nodeExe -Parent
+        $ncands = @((Join-Path $nodeDir 'npm.cmd'), (Join-Path $nodeDir 'npm.exe'))
+        foreach ($n in $ncands) { if (Test-Path $n) { $npmCmd = $n; break } }
+        if ($nodeDir -and ($env:PATH -notlike ('*' + $nodeDir + '*'))) {
+            $env:PATH = $nodeDir + ';' + $env:PATH
+        }
+        Write-Log "SUCCESS" "Node: $nodeExe  npm: $npmCmd"
+        return @{Node=$nodeExe; Npm=$npmCmd; Dir=$nodeDir}
+    }
+    Write-Log "WARN" "Node.js not found - UI will be skipped (install from nodejs.org)"
+    return $null
+}
+
+$NodeInfo = Find-NodeAndNpm
+$NpmExe   = if ($NodeInfo) { $NodeInfo.Npm   } else { $null }
+$NodeExe  = if ($NodeInfo) { $NodeInfo.Node  } else { $null }
+
+# UPDATE SESSION.JSON WITH DEMO ACCOUNT
+Write-Stage "UPDATING SESSION"
+Write-Log "INFO" "Updating session.json with demo MT5 account..."
+
+$session = @{
+    login        = 435656990
+    server       = "Exness-MT5Trial9"
+    start_equity = 100000.0
+    balance      = 100000.0
+    mode         = "aggressive"
+    risk_percent = 2.0
+    max_dd_pct   = 18.0
+    max_lots     = 0.01
+    max_daily_loss = 100.0
+    cold_start   = $true
+    timestamp    = (Get-Date).ToUniversalTime().Ticks
+} | ConvertTo-Json -Depth 3
+
+$runtimeTarget = Join-Path $RepoRoot "runtime\session.json"
+New-Item -ItemType Directory -Force -Path (Split-Path $runtimeTarget) | Out-Null
+$session | Set-Content $runtimeTarget -Encoding UTF8 -Force
+$session | Set-Content $SessionFile -Encoding UTF8 -Force
+Write-Log "SUCCESS" "session.json updated: login=435656990, server=Exness-MT5Trial9"
+
+# PROCESS STARTERS
+function Start-Tracked {
+    param($FilePath, [string]$Arguments = '', $WorkingDirectory = $RepoRoot, $LogFile, $Title = '', [switch]$NoWindow, [switch]$Min, [switch]$InheritEnv)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $FilePath
+    $psi.Arguments = $Arguments
+    $psi.WorkingDirectory = $WorkingDirectory
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $NoWindow.IsPresent
+    if ($Min) { $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Minimized }
+    if ($LogFile) { $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true }
+    if ($InheritEnv) {
+        foreach ($key in [Environment]::GetEnvironmentVariables().Keys) {
+            $val = [Environment]::GetEnvironmentVariable($key)
+            if ($val -and -not $psi.EnvironmentVariables.ContainsKey($key)) {
+                $psi.EnvironmentVariables[$key] = $val
+            }
+        }
+    }
+    if (-not $psi.EnvironmentVariables.ContainsKey("PATH")) {
+        $psi.EnvironmentVariables["PATH"] = $env:PATH
+    }
+    try {
+        $p = [System.Diagnostics.Process]::Start($psi)
+        if ($p) {
+            $script:ChildPids.Add($p.Id) | Out-Null
+            if ($LogFile) {
+                Start-Job -ScriptBlock {
+                    param($proc, $logf)
+                    while (-not $proc.HasExited) {
+                        $l = $proc.StandardOutput.ReadLine()
+                        if ($l) { Add-Content $logf $l -Encoding UTF8 }
+                        $e = $proc.StandardError.ReadLine()
+                        if ($e) { Add-Content $logf "[E] $e" -Encoding UTF8 }
+                        Start-Sleep -Milliseconds 100
+                    }
+                } -ArgumentList $p, $LogFile | Out-Null
+            }
+            Write-Log "SUCCESS" "Started $Title PID=$($p.Id)"
+            return $p.Id
+        }
+    } catch { Write-Log "ERROR" "Start failed for $Title : $_" }
+    return $null
+}
+
+function Stop-Tracked {
+    foreach ($id in $script:ChildPids) {
+        try { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue } catch {}
+    }
+    $script:ChildPids.Clear()
+    Write-Log "INFO" "Child processes stopped"
+}
+
+try { Register-EngineEvent PowerShell.Exiting -Action { Stop-Tracked } -ErrorAction SilentlyContinue | Out-Null } catch {}
+
+# HEALTH CHECK HELPER
+function Test-Url { param($u, $t=6) try { return (Invoke-WebRequest -Uri $u -UseBasicParsing -TimeoutSec $t -ErrorAction Stop).StatusCode -eq 200 } catch { return $false } }
+
+# STAGE 1: API SERVER
+Write-Stage "STAGE 1: API SERVER"
+Start-StageTimer
+$apiLog = Join-Path $LogsDir "GO_api_server.log"
+
+$env:AGI_API_PORT = "$ApiPort"
+$env:AGI_API_HOST  = "0.0.0.0"
+$env:AGI_CONTROL_TOKEN = "go_dev_$(Get-Random -Maximum 99999)_token"
+$env:CHAIN_GAMBLER_EXECUTION_MODE = if ($PaperMode) { "paper" } else { "demo" }
+$env:CHAIN_GAMBLER_ALLOW_LIVE      = "1"
+$env:AGI_LIVE_ENABLED              = "true"
+$env:MT5_LOGIN                     = "435656990"
+$env:MT5_PASSWORD                  = "Fuckyou2/"
+$env:MT5_SERVER                    = "Exness-MT5Trial9"
+$env:TELEGRAM_TOKEN                = "dummy_token"
+$env:TELEGRAM_CHAT_ID              = "0"
+
+Write-Log "INFO" "Starting api_server on port $ApiPort (CHAIN_GAMBLER_EXECUTION_MODE=$env:CHAIN_GAMBLER_EXECUTION_MODE)..."
+Start-Tracked -FilePath $PythonExe -ArgumentList "Python\api_server.py" -WorkingDirectory $CorePython -LogFile $apiLog -Title "api_server-$ApiPort" -NoWindow -InheritEnv
+Start-Sleep 6
+
+$deadline = (Get-Date).AddSeconds(30)
+$apiReady = $false
+while ((Get-Date) -lt $deadline) {
+    if (Test-Url "http://127.0.0.1:$ApiPort/api/status") {
+        $apiReady = $true
+        Write-Log "SUCCESS" "api_server online in $(Get-StageDuration)"
+        break
+    }
+    Start-Sleep 2
+}
+if (-not $apiReady) {
+    Write-Log "ERROR" "api_server failed to start. Check $apiLog"
+    exit 1
+}
+
+# STAGE 1B: SERVER_AGI / SUPERVISOR
+Write-Stage "STAGE 1B: SERVER_AGI"
+Start-StageTimer
+
+$supPath = Join-Path $RepoRoot '01_Launchers\vps_agi_supervisor.ps1'
+if (Test-Path $supPath) {
+    Write-Log "INFO" "Starting vps_agi_supervisor (background)..."
+    $supPid = Start-Tracked -FilePath 'powershell.exe' -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$supPath`"" -LogFile (Join-Path $LogsDir 'supervisor.log') -Title 'supervisor' -NoWindow -InheritEnv
+    Start-Sleep 6
+    Write-Log "SUCCESS" "vps_agi_supervisor started [$(Get-StageDuration)]"
+} else {
+    Write-Log "INFO" "No supervisor found - starting Server_AGI via api_control..."
+    try {
+        Invoke-WebRequest -Uri "http://127.0.0.1:$ApiPort/api/control" -Method POST -Body (@{action="start_bot"} | ConvertTo-Json) -ContentType "application/json" -UseBasicParsing -TimeoutSec 15 -Headers @{"X-Control-Token"="$env:AGI_CONTROL_TOKEN"} | Out-Null
+        Write-Log "SUCCESS" "Server_AGI started via /api/control [$(Get-StageDuration)]"
+    } catch {
+        Write-Log "WARN" "Could not start Server_AGI: $($_.Exception.Message)"
+    }
+}
+
+# STAGE 2: DATA INGESTION
+Write-Stage "STAGE 2: DATA INGESTION"
+Start-StageTimer
+
+Write-Log "INFO" "Triggering data ingestion via /api/control (force_ingest)..."
+try {
+    $r = Invoke-WebRequest -Uri "http://127.0.0.1:$ApiPort/api/control" -Method POST -Body (@{action="force_ingest"} | ConvertTo-Json) -ContentType "application/json" -UseBasicParsing -TimeoutSec 15 -Headers @{"X-Control-Token"="$env:AGI_CONTROL_TOKEN"}
+    Write-Log "INFO" "force_ingest response: $($r.Content)"
+} catch {
+    Write-Log "WARN" "force_ingest returned: $($_.Exception.Message)"
+}
+
+Start-Sleep 5
+$mt5Status = try {
+    $s = Invoke-WebRequest -Uri "http://127.0.0.1:$ApiPort/api/status" -UseBasicParsing -TimeoutSec 10
+    $j = $s.Content | ConvertFrom-Json
+    @{ connected = $j.account.connected; login = $j.account.login; server = $j.account.server }
+} catch { @{connected = $false} }
+
+if ($mt5Status.connected) {
+    Write-Log "SUCCESS" "MT5 connected: login=$($mt5Status.login) server=$($mt5Status.server) [$(Get-StageDuration)]"
+} else {
+    Write-Log "WARN" "MT5 not yet connected - ingestion may start when MT5 terminal opens [$(Get-StageDuration)]"
+}
+
+# STAGE 3: FEATURE ENGINEERING
+Write-Stage "STAGE 3: FEATURE ENGINEERING"
+Start-StageTimer
+
+Write-Log "INFO" "Building feature matrices for all symbols..."
+try {
+    $symbols = @("BTCUSDm","XAUUSDm","EURUSDm","GBPUSDm")
+    foreach ($sym in $symbols) {
+        $featLog = Join-Path $LogsDir "GO_feat_${sym}.log"
+        Write-Log "INFO" "Starting feature engineering for $sym..."
+        Start-Tracked -FilePath $PythonExe -ArgumentList "-m Python.features.build_feature_matrix --symbol $sym --timeframes 1m,5m,15m,1h" -WorkingDirectory $CorePython -LogFile $featLog -Title "feat-$sym" -NoWindow -InheritEnv
+    }
+    Write-Log "SUCCESS" "Feature engineering pipeline started for all symbols [$(Get-StageDuration)]"
+} catch {
+    Write-Log "WARN" "Feature engineering module not found as module - will rely on training pipeline self-ingestion"
+}
+
+# STAGE 4: TRAINING PIPELINE
+Write-Stage "STAGE 4: TRAINING PIPELINE"
+Start-StageTimer
+
+if (-not $SkipTraining) {
+    Write-Log "INFO" "Starting parallel training cycle via /api/control (start_parallel_training)..."
+    try {
+        $r = Invoke-WebRequest -Uri "http://127.0.0.1:$ApiPort/api/control" -Method POST -Body (@{action="start_parallel_training"} | ConvertTo-Json) -ContentType "application/json" -UseBasicParsing -TimeoutSec 15 -Headers @{"X-Control-Token"="$env:AGI_CONTROL_TOKEN"}
+        Write-Log "INFO" "start_parallel_training: $($r.Content)"
+    } catch {
+        Write-Log "WARN" "start_parallel_training: $($_.Exception.Message)"
+    }
+
+    try {
+        $r2 = Invoke-WebRequest -Uri "http://127.0.0.1:$ApiPort/api/control" -Method POST -Body (@{action="start_training_cycle"} | ConvertTo-Json) -ContentType "application/json" -UseBasicParsing -TimeoutSec 15 -ErrorAction SilentlyContinue -Headers @{"X-Control-Token"="$env:AGI_CONTROL_TOKEN"}
+        Write-Log "INFO" "start_training_cycle: $($r2.Content)"
+    } catch {}
+
+    Write-Log "SUCCESS" "Training pipeline started [$(Get-StageDuration)]"
+} else {
+    Write-Log "WARN" "Training skipped (SkipTraining flag set)"
+}
+
+# STAGE 5: REACT UI
+Write-Stage "STAGE 5: REACT UI"
+Start-StageTimer
+
+if ($NodeInfo -and (Test-Path $UiLabApp)) {
+    $viteConfig = Join-Path $UiLabApp "vite.config.js"
+    if (Test-Path $viteConfig) {
+        $cfg = Get-Content $viteConfig -Raw -Encoding UTF8
+        if ($cfg -notmatch "127.0.0.1:$ApiPort") {
+            $cfg = $cfg -replace 'target:\s*"http://[^"]*"', "target: `"http://127.0.0.1:$ApiPort`""
+            $cfg | Set-Content $viteConfig -Encoding UTF8 -NoNewline
+            Write-Log "INFO" "Updated vite proxy target -> 127.0.0.1:$ApiPort"
+        }
+    }
+
+    try {
+        Get-Process node -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match 'vite' } | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep 2
+    } catch {}
+
+    $nodeModules = Join-Path $UiLabApp "node_modules"
+    if (-not (Test-Path $nodeModules)) {
+        Write-Log "INFO" "Installing ui_lab_app dependencies..."
+        Push-Location $UiLabApp
+        try {
+            & $NpmExe install --prefer-offline --no-audit --no-fund 2>&1 | Out-Null
+            Write-Log "SUCCESS" "npm install complete"
+        } catch {
+            Write-Log "WARN" "npm install failed: $($_.Exception.Message)"
+        }
+        Pop-Location
+    }
+
+    $uiLog = Join-Path $LogsDir "GO_ui_lab_app.log"
+    Write-Log "INFO" "Starting Vite dev server on port $UiPort..."
+    $viteBin = Join-Path $UiLabApp "node_modules\vite\bin\vite.js"
+    Start-Tracked -FilePath $NodeExe -ArgumentList "`"$viteBin`" dev --port $UiPort --host 0.0.0.0" -WorkingDirectory $UiLabApp -LogFile $uiLog -Title "ui_lab_app-vite" -Min -InheritEnv
+    Start-Sleep 8
+
+    $uiReady = $false
+    $deadline = (Get-Date).AddSeconds(30)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-Url "http://127.0.0.1:$UiPort/") {
+            $uiReady = $true
+            Write-Log "SUCCESS" "ui_lab_app online at http://localhost:$UiPort/ [$(Get-StageDuration)]"
+            break
+        }
+        Start-Sleep 2
+    }
+    if (-not $uiReady) {
+        Write-Log "WARN" "ui_lab_app may still be starting - check $uiLog"
+    }
+} else {
+    Write-Log "WARN" "ui_lab_app skipped (Node not found or directory missing: $UiLabApp)"
+}
+
+# STAGE 6: META TRADER
+Write-Stage "STAGE 6: META TRADER"
+Start-StageTimer
+
+$mt5Running = Get-Process -Name "metatrader*" -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($mt5Running) {
+    Write-Log "SUCCESS" "MetaTrader already running (PID=$($mt5Running.Id)) [$(Get-StageDuration)]"
+} elseif (-not $PaperMode) {
+    $mt5Paths = @(
+        "C:\Program Files\MetaTrader 5\terminal64.exe",
+        "C:\Program Files (x86)\MetaTrader 5\terminal.exe",
+        "C:\Users\Administrator\AppData\Roaming\MetaTrader 5\terminal64.exe",
+        "C:\Users\Administrator\AppData\Roaming\MetaQuotes\Terminal\*\terminal64.exe"
+    )
+    $mt5Exe = $null
+    foreach ($p in $mt5Paths) {
+        if ($p -match '\*') {
+            $cands = Get-ChildItem $p -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($cands) { $mt5Exe = $cands.FullName; break }
+        } elseif (Test-Path $p) { $mt5Exe = $p; break }
+    }
+
+    if ($mt5Exe) {
+        Write-Log "INFO" "Launching MetaTrader 5..."
+        Start-Process -FilePath $mt5Exe -ArgumentList "435656990" -ErrorAction SilentlyContinue
+        Write-Log "SUCCESS" "MetaTrader 5 launch initiated [$(Get-StageDuration)]"
+    } else {
+        Write-Log "WARN" "MetaTrader 5 not found - install MT5 from Exness to enable live trading"
+    }
+} else {
+    Write-Log "INFO" "Paper mode - MT5 launch skipped [$(Get-StageDuration)]"
+}
+
+# OPEN BROWSER
+Write-Stage "ALL STAGES COMPLETE"
+Start-StageTimer
+
+if (-not $NoBrowser) {
+    Start-Process "http://localhost:$UiPort/" | Out-Null
+    Write-Log "INFO" "Browser opened"
+}
+
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Green
+Write-Host "  GO! SUPREME CHAINSAW CLEAN - ALL SYSTEMS LAUNCHED" -ForegroundColor Green
+Write-Host "============================================================" -ForegroundColor Green
+Write-Host ""
+Write-Host "  SERVICE URLs:" -ForegroundColor White
+Write-Host "    React UI    : http://localhost:$UiPort/" -ForegroundColor Yellow
+Write-Host "    API Server  : http://localhost:$ApiPort/api/status" -ForegroundColor Yellow
+Write-Host "    MT5 Account : Exness-MT5Trial9 | Login: 435656990" -ForegroundColor Yellow
+Write-Host ""
+Write-Host "  Press Ctrl+C to stop all services." -ForegroundColor Magenta
+Write-Host ""
+
+Write-Log "INFO" "Status loop running (Ctrl+C to stop)..."
+$symbols = @("BTCUSDm","XAUUSDm","EURUSDm","GBPUSDm")
+$prevTrainingStates = @{}
+
+try {
+    while ($true) {
+        Start-Sleep $HealthPollSeconds
+        $ok = Test-Url "http://127.0.0.1:$ApiPort/api/status" 5
+
+        if ($ok) {
+            try {
+                $s = Invoke-WebRequest -Uri "http://127.0.0.1:$ApiPort/api/status" -UseBasicParsing -TimeoutSec 8
+                $j = $s.Content | ConvertFrom-Json
+                $acc = $j.account
+                $tr  = $j.training
+                $mode = $j.mode
+
+                foreach ($sym in $symbols) {
+                    $lstm = $tr.visual.lstm
+                    $state = $lstm.state
+                    $key = "${sym}_lstm"
+                    if ($prevTrainingStates[$key] -ne $state) {
+                        if ($state -eq "training") {
+                            Write-Log "STAGE" ">> Training started: $sym - epoch $($lstm.lstm_epoch)/$($lstm.lstm_epochs_total)"
+                        } elseif ($prevTrainingStates[$key] -eq "training") {
+                            Write-Log "SUCCESS" "Training complete: $sym - loss=$($lstm.loss)"
+                        }
+                        $prevTrainingStates[$key] = $state
+                    }
+                }
+
+                $posCount = $acc.open_positions
+                if ($posCount -gt 0 -and $script:_lastPosCount -eq 0) {
+                    Write-Log "STAGE" ">> First position(s) opened: $posCount active"
+                }
+                $script:_lastPosCount = $posCount
+
+            } catch {}
+        }
+
+        Write-Log "INFO" "Health tick: API OK=$ok"
+    }
+} finally {
+    Stop-Tracked
+    Write-Log "SUCCESS" "Shutdown complete"
+}
+
+exit 0

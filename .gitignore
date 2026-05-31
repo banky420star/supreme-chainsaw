@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.venv*/
+.env
+venv/
+env/
+
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build outputs
+dist/
+build/
+*.exe
+
+# Logs
+logs/
+*.log
+
+# Runtime data
+runtime/
+.tmp/
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db
+nul
+NUL
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# PID files
+.pids/
+
+# Git
+.git/
+
+# Data
+*.csv
+*.jsonl
+*.pickle
+*.h5
+*.pt
+*.pth
+
+# Keep config samples
+!config.yaml.example

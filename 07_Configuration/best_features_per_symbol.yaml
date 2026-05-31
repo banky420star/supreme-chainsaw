@@ -1,0 +1,61 @@
+﻿# Best known feature parameters per symbol for the multi-timeframe pipeline
+# (1m + 5m + 15m + 1h)
+#
+# These were discovered via systematic micro-adjustment search on recent data.
+# Format is designed to be loaded by the training pipeline and feature builders.
+
+symbols:
+  XAUUSDm:
+    sma_fast: 12
+    sma_slow: 40
+    ema_fast: 8
+    ema_slow: 21
+    rsi_period: 21
+    atr_period: 10
+    higher_tf_vol_lookback: 30
+    comment: "Found via micro-adjustment search on 10k 1m bars (May 2026). Best R2 lift vs baseline."
+
+  # Defaults for other symbols (can be overridden after per-symbol searches)
+  BTCUSDm:
+    sma_fast: 20
+    sma_slow: 50
+    ema_fast: 12
+    ema_slow: 26
+    rsi_period: 14
+    atr_period: 14
+    higher_tf_vol_lookback: 50
+    comment: "Baseline parameters. Run dedicated search when more data is available."
+
+  EURUSDm:
+    sma_fast: 20
+    sma_slow: 50
+    ema_fast: 12
+    ema_slow: 26
+    rsi_period: 14
+    atr_period: 14
+    higher_tf_vol_lookback: 50
+    comment: "Baseline parameters. Run dedicated search when more data is available."
+
+  # Add more symbols here as searches are completed
+
+multi_timeframe:
+  timeframes: ["1m", "5m", "15m", "1h"]
+  base_timeframe: "1m"
+  context_timeframes: ["5m", "15m", "1h"]
+
+search:
+  # Default search spaces for different model types
+  lstm:
+    seq_len: [30, 60, 90, 120]
+    hidden_size: [64, 128, 192, 256]
+    num_layers: [1, 2]
+    dropout: [0.1, 0.2, 0.3]
+    lr: [1e-3, 5e-4, 1e-4]
+    batch_size: [32, 64]
+    epochs_short_search: 20
+
+  ppo:
+    # Example - expand as needed
+    learning_rate: [3e-5, 1e-4, 3e-4]
+    n_steps: [4096, 8192]
+    target_kl: [0.03, 0.05, 0.08]

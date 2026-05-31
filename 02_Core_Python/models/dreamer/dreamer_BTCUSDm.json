@@ -1,0 +1,9 @@
+{
+  "symbol": "BTCUSDm",
+  "feature_version": "ultimate_150",
+  "window_size": 32,
+  "obs_dim": 5249,
+  "steps": 1000,
+  "period": "90d",
+  "interval": "M5"
+}

@@ -1,0 +1,18 @@
+
+  SUPREME CHAINSAW CLEAN - FULL PIPELINE GO LAUNCHER
+
+[2026-05-31 01:57:11.841] [INFO] === GO LAUNCHER starting (PaperMode=False) ===
+[2026-05-31 01:57:11.873] [INFO] RepoRoot: C:\Users\Administrator\Desktop\SupremeChainsaw_Clean
+[2026-05-31 01:57:11.873] [INFO] Checking for stale processes...
+[2026-05-31 01:57:12.170] [WARN] Stopping 2 stale Python processes...
+[2026-05-31 01:57:15.232] [SUCCESS] Python: C:\Users\Administrator\Desktop\SupremeChainsaw_Clean\.venv312\Scripts\python.exe
+[2026-05-31 01:57:15.358] [SUCCESS] Node: C:\Users\Administrator\Downloads\node-v24.16.0-win-x64\node-v24.16.0-win-x64\node.exe  npm: C:\Users\Administrator\Downloads\node-v24.16.0-win-x64\node-v24.16.0-win-x64\npm.cmd
+[01:57:15] >> UPDATING SESSION
+[2026-05-31 01:57:15.373] [INFO] Updating session.json with demo MT5 account...
+[2026-05-31 01:57:15.405] [SUCCESS] session.json updated: login=435656990, server=Exness-MT5Trial9
+[01:57:15] >> STAGE 1: API SERVER
+[2026-05-31 01:57:15.421] [INFO] Starting api_server on port 5051 (CHAIN_GAMBLER_EXECUTION_MODE=demo)...
+[2026-05-31 01:57:15.723] [SUCCESS] Started api_server-5051 PID=5456
+5456
+[2026-05-31 01:57:54.091] [ERROR] api_server failed to start. Check C:\Users\Administrator\Desktop\SupremeChainsaw_Clean\logs\GO_api_server.log
+[2026-05-31 01:57:54.122] [INFO] Child processes stopped

@@ -1,0 +1,142 @@
+# Chain Gambler main config (created for first real MT5 training)
+# Secrets via ENV vars only. Never commit real passwords/tokens.
+# Copied/adapted from config.yaml.example for immediate use with Exness trial.
+
+trading:
+  symbols: &id001
+  - BTCUSDm
+  - XAUUSDm
+  - EURUSDm
+  - GBPUSDm
+  timeframe: M5
+  risk_percent: 1.0
+  max_drawdown: 10.0
+  confidence_threshold: 0.85
+  magic_number: 505
+  initial_balance: 10000.0
+
+risk:
+  max_daily_loss: 1000
+  max_daily_trades: 500
+  max_daily_trades_per_symbol: 50
+  max_daily_losing_trades_per_symbol: 10
+  max_lots: 1.0
+  supervisor:
+    enabled: true
+    max_daily_loss: 1000
+    max_drawdown_pct: 8.0
+    max_symbol_exposure: 0.35
+    max_total_exposure: 1.2
+    max_open_positions: 6
+    max_positions_per_symbol: 3
+    min_trade_interval_sec: 45
+    max_spread_bps: 25.0
+
+telegram:
+  # Use ENV refs. For training runs that hit live_mode checks, set
+  # TELEGRAM_TOKEN and TELEGRAM_CHAT_ID in the shell (can be dummies like "skipped" / "0" if alerts not needed).
+  token: ENV:TELEGRAM_TOKEN
+  chat_id: ENV:TELEGRAM_CHAT_ID
+
+event_intel:
+  enabled: true
+  poll_sec: 60
+  pre_event_min: 60
+  post_event_min: 30
+  news_hold_min: 20
+  max_events: 200
+
+drl:
+  total_timesteps: 150000
+  per_symbol: true
+  period: 90d
+  interval: M5
+  candles_per_symbol: 80000
+  eval_period: 120d
+  model_path: models/ppo_trading.zip
+  feature_version: ultimate_150
+  data_source: mt5
+  optuna_trials: 0
+  optuna_timesteps: 10000
+  dreamer:
+    enabled: true
+    train_in_cycle: true
+    steps: 5000
+    window: 64
+    feature_version: ultimate_150
+    symbols: *id001
+  ensemble:
+    enabled: false
+    min_votes: 2
+    agreement_threshold: 0.5
+  reward:
+    version: v2_risk_adjusted
+    # NEW (Reward Scale & Signal Improvement): optional scale factors for training stability in v5/v6+ runs.
+    # penalty_scale < 1.0 or reward_scale enable lighter early-training profiles / magnitude control.
+    # Defaults to 1.0 (hardened) if omitted. Use AGI_* env vars for launcher control (takes precedence).
+    # These affect ONLY the training-time reward signal to PPO (stability vs "do nothing" collapse).
+    # Post-alignment gates + backtests use realized equity/PnL curves (unaffected; hardened costs/slippage always simulated).
+    reward_scale: 1.0
+    penalty_scale: 1.0
+    weights:
+      growth: 8.0
+      payoff: 2.0
+      sharpe_bonus: 1.0
+      drawdown_penalty: 3.0
+      cost_penalty: 5.0
+      churn_penalty: 0.5
+      memory_expectancy_bonus: 0.5
+      loss_streak_penalty: 0.4
+
+training:
+  lstm_epochs: 20
+  per_symbol: true
+  lstm_period: 90d
+  lstm_interval: M5
+  lstm_candles: 80000
+  feature_version: ultimate_150
+  data_source: mt5
+
+evaluation:
+  max_drawdown: 0.1
+  min_sharpe: 0.3
+  min_return: 0.015
+  score_margin: 0.3
+  min_steps_per_symbol: 600
+  min_pass_rate: 0.8
+  return_margin: 0.0
+  sharpe_margin: 0.05
+  drawdown_margin: 0.0
+  forward_windows:
+  - 60d
+  - 90d
+  - 120d
+  min_forward_win_rate: 0.67
+
+registry:
+  ensemble:
+    history_limit: 3
+  canary_policy:
+    default:
+      min_trades: 30
+      min_realized_pnl: 0.0
+      max_drawdown: 0.12
+      min_runtime_minutes: 45
+    per_symbol:
+      EURUSDm:
+        max_drawdown: 0.15
+        min_trades: 40
+      BTCUSDm:
+        max_drawdown: 0.08
+        min_trades: 60
+
+data:
+  source: mt5
+
+mt5:
+  login: ENV:MT5_LOGIN
+  password: ENV:MT5_PASSWORD
+  server: ENV:MT5_SERVER
+
+cycle:
+  skip_completed_training: false
